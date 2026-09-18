@@ -1,0 +1,2 @@
+This is a perfectly ordinary text file.
+Nothing malicious in here, promise.
