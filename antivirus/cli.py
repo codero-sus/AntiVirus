@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Optional
 
 from . import __version__
+from .behavior import analyze_file as behavior_analyze_file
+from .behavior import looks_executable as behavior_looks_executable
 from .config import Config
 from .monitor import DirectoryWatcher
 from .output import BOLD, CYAN, GREEN, RED, SEVERITY_COLOR, YELLOW, paint
@@ -37,6 +39,8 @@ def _build(args):
     config.signatures_file = sig_path
     if getattr(args, "max_size", None):
         config.max_file_size = args.max_size
+    if getattr(args, "no_behavior", False):
+        config.behavior_enabled = False
     config.resolve_paths(Path.cwd())
     db = SignatureDB(config.signatures_file)
     scanner = Scanner(config, db, threads=getattr(args, "threads", "auto"))
@@ -225,6 +229,45 @@ def cmd_sig(args) -> int:
     return 0
 
 
+# ----------------------------------------------------------------- behavior
+def cmd_behavior(args) -> int:
+    config, db, scanner, quarantine = _build(args)
+    path = Path(args.file)
+    if not path.is_file():
+        print(paint(f"error: no such file: {path}", RED), file=sys.stderr)
+        return 2
+    try:
+        st = path.lstat()
+        with open(path, "rb") as fh:
+            content = fh.read(config.behavior_max_size)
+    except OSError as exc:
+        print(paint(f"error: {exc}", RED), file=sys.stderr)
+        return 2
+
+    if not behavior_looks_executable(path, content):
+        print(f"No behavioural analysis applicable: {path} does not look "
+              "executable (no script extension, no shebang, not a PE/ELF).")
+        return 0
+    findings = behavior_analyze_file(path, st, content)
+    if args.json:
+        print(json.dumps({"file": str(path),
+                          "findings": [f.to_dict() for f in findings]}, indent=2))
+    else:
+        bar = "=" * 62
+        print()
+        print(paint(bar, BOLD))
+        print(paint(f" Behavioural analysis of {path}", BOLD))
+        print(paint(bar, BOLD))
+        if not findings:
+            print(paint("  No behavioural indicators found.", GREEN))
+        for f in findings:
+            color = SEVERITY_COLOR.get(f.severity, YELLOW)
+            print(f"  {paint(f'[{f.severity.upper()}]', color)} {f.name}")
+            print(f"             {f.message}")
+        print(paint(bar, BOLD))
+    return 0 if not findings else 1
+
+
 # ------------------------------------------------------------------ report
 def cmd_report(args) -> int:
     config, db, scanner, quarantine = _build(args)
@@ -276,6 +319,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--threads", default="auto", metavar="N",
                    help="worker threads for directory scans: auto (default), "
                         "a number, or 1/0 for fully sequential")
+    p.add_argument("--no-behavior", action="store_true",
+                   help="disable behavioural analysis of executable-looking files")
     p.add_argument("--json", action="store_true", help="machine readable output")
 
     p = sub.add_parser("monitor", help="watch a directory and scan new/changed files")
@@ -285,6 +330,8 @@ def build_parser() -> argparse.ArgumentParser:
                    default="detect", help="what to do with threats")
     p.add_argument("--interval", type=float, default=2.0,
                    help="poll interval in seconds (default 2)")
+    p.add_argument("--no-behavior", action="store_true",
+                   help="disable behavioural analysis of executable-looking files")
 
     p = sub.add_parser("quarantine", help="list, restore or purge quarantined files")
     _common_options(p)
@@ -310,6 +357,15 @@ def build_parser() -> argparse.ArgumentParser:
     pa.add_argument("--pattern", default="",
                     help="regular expression matched against raw file bytes")
 
+    p = sub.add_parser(
+        "behavior",
+        help="static behavioural analysis (what does a file do?)")
+    bsub = p.add_subparsers(dest="baction", required=True)
+    pa = bsub.add_parser("analyze", help="analyse one file")
+    _common_options(pa)
+    pa.add_argument("file", help="file to analyse")
+    pa.add_argument("--json", action="store_true", help="machine readable output")
+
     sub.add_parser("selftest",
                    help="run the built-in self test (harmless EICAR string)")
 
@@ -328,6 +384,7 @@ _COMMANDS = {
     "monitor": cmd_monitor,
     "quarantine": cmd_quarantine,
     "sig": cmd_sig,
+    "behavior": cmd_behavior,
     "selftest": lambda args: run_selftest(),
     "report": cmd_report,
 }

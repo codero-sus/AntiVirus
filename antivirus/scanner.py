@@ -24,18 +24,24 @@ Efficiency notes
 from __future__ import annotations
 
 import hashlib
-import math
 import os
 import re
 import stat
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
+from .behavior import analyze_file as behavior_analyze_file
+from .behavior import looks_executable as behavior_looks_executable
 from .config import Config
+from .models import (  # noqa: F401  (re-exported for backwards compatibility)
+    Finding,
+    shannon_entropy,
+    shannon_entropy_counts,
+)
 from .signatures import Signature, SignatureDB
 from .utils import md5_new
 
@@ -43,22 +49,6 @@ LogFn = Callable[[Path, str], None]
 
 #: A heuristic entropy verdict is only made from samples of at least this size.
 _MIN_ENTROPY_SAMPLE = 16 * 1024
-
-
-@dataclass
-class Finding:
-    """One problem found in one file."""
-
-    path: str
-    kind: str          # "signature-hash" | "signature-pattern" | "heuristic"
-    name: str
-    severity: str
-    message: str
-    sha256: str = ""
-    size: int = 0
-
-    def to_dict(self) -> dict:
-        return asdict(self)
 
 
 @dataclass
@@ -102,20 +92,6 @@ class ScanResult:
             "findings": [f.to_dict() for f in self.findings],
             "clean": self.clean,
         }
-
-
-def shannon_entropy_counts(counts: "Counter", total: int) -> float:
-    """Shannon entropy (bits/byte) from an existing byte histogram."""
-    if total <= 0:
-        return 0.0
-    return -sum((c / total) * math.log2(c / total) for c in counts.values())
-
-
-def shannon_entropy(data: bytes) -> float:
-    """Shannon entropy of *data* in bits per byte (0 .. 8)."""
-    if not data:
-        return 0.0
-    return shannon_entropy_counts(Counter(data), len(data))
 
 
 def _is_under(path: Path, dirs: Tuple[Path, ...]) -> bool:
@@ -211,7 +187,13 @@ class Scanner:
         result = ScanResult(target=str(path), started_at=time.time())
         self._sync_patterns()
         if path.is_file():
-            files: List[Tuple[Path, Optional[os.stat_result]]] = [(path, None)]
+            try:
+                st: Optional[os.stat_result] = path.lstat()
+            except OSError as exc:
+                result.errors.append(f"{path}: {exc}")
+                result.finished_at = time.time()
+                return result
+            files: List[Tuple[Path, Optional[os.stat_result]]] = [(path, st)]
         elif path.is_dir():
             files = []
             protected = (self.config.quarantine_dir.resolve(),
@@ -236,7 +218,7 @@ class Scanner:
             self._scan_files_parallel(files, result, workers)
         else:
             for p, st in files:
-                self._scan_file(p, result, known_size=None if st is None else st.st_size)
+                self._scan_file(p, result, st=st)
 
         if len(result.findings) > 1:
             result.findings.sort(key=lambda f: (f.path, f.kind))
@@ -269,7 +251,7 @@ class Scanner:
         def work(item: Tuple[Path, Optional[os.stat_result]]) -> ScanResult:
             p, st = item
             local = ScanResult(target=str(p), started_at=0.0)
-            self._scan_file(p, local, known_size=None if st is None else st.st_size)
+            self._scan_file(p, local, st=st)
             return local
 
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="av-scan") as pool:
@@ -330,15 +312,14 @@ class Scanner:
         return hits
 
     def _scan_file(self, path: Path, result: ScanResult,
-                   known_size: Optional[int] = None) -> None:
-        if known_size is None:
+                   st: Optional[os.stat_result] = None) -> None:
+        if st is None:
             try:
-                size = path.stat().st_size
+                st = path.lstat()
             except OSError as exc:
                 result.errors.append(f"{path}: {exc}")
                 return
-        else:
-            size = known_size
+        size = st.st_size
 
         if size > self.config.max_file_size:
             result.files_skipped += 1
@@ -346,7 +327,8 @@ class Scanner:
             return
 
         try:
-            sha256, md5, partial, pattern_hits, entropy = self._stream_file(path, size)
+            sha256, md5, partial, pattern_hits, entropy, content = \
+                self._stream_file(path, size)
         except OSError as exc:
             result.errors.append(f"{path}: {exc}")
             return
@@ -393,6 +375,16 @@ class Scanner:
                 size=size,
             ))
 
+        # Layer 2.5 – behavioural analysis (what the file appears to do).
+        # Only files that look executable are examined; the content was
+        # already buffered during the single read pass above.
+        if (
+            self.config.behavior_enabled
+            and content is not None
+            and behavior_looks_executable(path, content)
+        ):
+            local.extend(behavior_analyze_file(path, st, content))
+
         # Layer 3 – heuristics (only if this file has no definite hit yet).
         if not local and entropy is not None and entropy >= self.config.entropy_threshold:
             local.append(Finding(
@@ -413,18 +405,23 @@ class Scanner:
     def _stream_file(self, path: Path, size: int):
         """Read the file **once**, computing everything in one pass.
 
-        Returns ``(sha256, md5, partial, pattern_hits, entropy_or_None)``.
+        Returns ``(sha256, md5, partial, pattern_hits, entropy_or_None,
+        content_or_None)`` – *content* is kept in memory only for files up
+        to ``behavior_max_size`` so the behavioural layer needs no extra
+        disk reads.
         """
         cfg = self.config
         sha = hashlib.sha256()
         md5 = md5_new()
         need_entropy = size >= cfg.entropy_min_size
+        buffer_content = size <= cfg.behavior_max_size
         counts: Optional["Counter"] = Counter() if need_entropy else None
         sampled = 0
         hits: List[Signature] = []
         remaining = list(self._patterns)
         tail = b""
         overlap = self._overlap
+        content = b""
         read = 0
         with open(path, "rb") as fh:
             while read < size:
@@ -434,6 +431,8 @@ class Scanner:
                 read += len(chunk)
                 sha.update(chunk)
                 md5.update(chunk)
+                if buffer_content:
+                    content += chunk
                 if remaining:
                     buf = tail + chunk
                     matched = self._match_patterns(buf)
@@ -450,4 +449,11 @@ class Scanner:
         entropy = None
         if counts is not None and sampled >= _MIN_ENTROPY_SAMPLE:
             entropy = shannon_entropy_counts(counts, sampled)
-        return sha.hexdigest(), md5.hexdigest(), read < size, hits, entropy
+        return (
+            sha.hexdigest(),
+            md5.hexdigest(),
+            read < size,
+            hits,
+            entropy,
+            content if buffer_content else None,
+        )

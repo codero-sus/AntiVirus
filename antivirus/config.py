@@ -30,6 +30,10 @@ class Config:
     hash_chunk_size: int = 1024 * 1024          # 1 MiB reads while hashing
     pattern_chunk_size: int = 1024 * 1024       # 1 MiB reads while pattern searching
 
+    # Behavioural analysis (what a file appears to do – static, never executed).
+    behavior_enabled: bool = True
+    behavior_max_size: int = 2 * 1024 * 1024    # only analyse files up to 2 MiB
+
     # Heuristics.
     entropy_threshold: float = 7.5              # bits/byte
     entropy_min_size: int = 256 * 1024          # only test files >= 256 KiB

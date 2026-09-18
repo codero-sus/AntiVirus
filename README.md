@@ -12,12 +12,24 @@ watches folders for new/changed files, and writes JSON + text reports.
 
 ## Features
 
-- **Three detection layers**
+- **Signature detection**
   1. *Hash* — SHA-256 (plus MD5) of each file vs. the signature database
   2. *Pattern* — regular expressions matched against raw file bytes
      (catches renamed/wrapped variants)
-  3. *Heuristic* — Shannon-entropy check that flags large packed/encrypted
-     files
+- **Behavioural detection** (static — nothing is ever executed):
+  * *Python* — AST analysis: `eval`/`exec` on non-constant input,
+    `subprocess(..., shell=True)`, `os.system`, sockets to hardcoded
+    addresses, dynamic imports, base64 payload blobs
+  * *Shell / PowerShell / Batch* — pipe-to-shell downloads, reverse shells,
+    crypto-mining C2 endpoints, LOLBin downloaders (certutil/mshta/bitsadmin),
+    persistence (cron / services / shell rc), encoded payloads
+  * *PE binaries* — import-table analysis (process-injection API sets,
+    download+execute combinations, registry persistence, timestamp
+    tampering) plus per-section entropy and packer section names
+  * *ELF binaries* — high-entropy loadable segments
+  * *File-system* — setuid/setgid executables
+- **Static heuristic** — Shannon-entropy check that flags large
+  packed/encrypted files
 - **Quarantine** — infected files are moved to a sandboxed directory with a
   JSON manifest; list, restore or purge them later
 - **Directory monitor** — polls a tree and scans every new/changed file
@@ -81,6 +93,15 @@ python3 -m antivirus scan samples/          # -> detects eicar-test.txt
 python3 -m antivirus scan samples/ --action quarantine
 ```
 
+`samples/behavior/` contains inert scripts and a code-less PE that
+demonstrate the behavioural layer:
+
+```bash
+python3 -m antivirus scan samples/behavior
+python3 -m antivirus behavior analyze samples/behavior/pipe-shell.sh
+python3 -m antivirus behavior analyze samples/behavior/suspicious.exe
+```
+
 ## How detection works
 
 For every regular file (symlinks, build dirs and VCS metadata are skipped):
@@ -94,9 +115,38 @@ For every regular file (symlinks, build dirs and VCS metadata are skipped):
 2. If a digest matches a signature, the file is reported as a **definite**
    threat.
 3. Otherwise pattern hits are reported.
-4. If still nothing matched, the **heuristic** verdict is made from the
+4. If the file *looks executable* (script extension, shebang, or PE/ELF
+   magic), the **behavioural layer** analyses what it appears to do:
+   Python sources are parsed with `ast` (never executed), shell/PowerShell/
+   batch scripts are checked against indicator regexes, PE import tables
+   are inspected for dangerous API combinations, and binaries are scanned
+   for reverse-shell / C2 byte markers. Files up to 2 MiB are analysed
+   (the content was already buffered during the single read pass).
+5. If still nothing matched, the **heuristic** verdict is made from the
    already-collected histogram: ≥ 7.5 bits/byte on files ≥ 256 KiB is
    reported as "may be packed or encrypted".
+
+### Behavioural indicators (selection)
+
+| Severity | Indicator | Layer |
+| --- | --- | --- |
+| high | `eval`/`exec` on non-constant (fetched/decoded) input | Python AST |
+| high | `socket.connect()` to a hardcoded address | Python AST |
+| high | pipe-to-shell: `curl/wget … \| sh`, `base64 -d \| sh` | Shell |
+| high | reverse shell: `/dev/tcp`, `nc -e`, `pty.spawn` | Shell / Python |
+| high | PowerShell `IEX` + download, `-ExecutionPolicy Bypass` | PowerShell |
+| high | LOLBin downloaders: `certutil -urlcache`, `mshta http`, `bitsadmin` | Batch / binary IOC |
+| high | PE process-injection API set (VirtualAllocEx + WriteProcessMemory + CreateRemoteThread) | PE imports |
+| high | PE imports both download **and** execute APIs | PE imports |
+| medium | persistence: cron / systemctl / shell rc / registry (`RegSetValue*`) | Shell / PE |
+| medium | crypto-mining pool endpoint `stratum+tcp://` | Shell / binary IOC |
+| medium | setuid executable | file-system |
+| medium | high-entropy PE section / packer section name (UPX0…) | PE sections |
+| low | `base64.b64decode`/`pickle.loads`/`CryptDecrypt` payload handling | Python / PE |
+
+Everything in `samples/behavior/` is **inert** demo material (the sample
+`.exe` is a code-less, hand-assembled PE whose import table advertises
+dangerous APIs – it can never execute).
 
 ## Efficiency
 
@@ -140,8 +190,9 @@ original path, timestamp and reason recorded in `quarantine/manifest.json`.
 
 | Command | Description |
 | --- | --- |
-| `scan TARGET [--action detect\|quarantine\|delete] [--threads N] [--json]` | Scan a file or directory tree (`--threads`: auto, N, or 1) |
-| `monitor TARGET [--action ...] [--interval 2]` | Watch a directory, scan new/changed files |
+| `scan TARGET [--action detect\|quarantine\|delete] [--threads N] [--no-behavior] [--json]` | Scan a file or directory tree (`--threads`: auto, N, or 1) |
+| `monitor TARGET [--action ...] [--interval 2] [--no-behavior]` | Watch a directory, scan new/changed files |
+| `behavior analyze FILE [--json]` | Show what one file appears to do (static behavioural analysis) |
 | `quarantine list` | Show everything that is quarantined |
 | `quarantine restore ID` | Restore a quarantined file (prefix ok) |
 | `quarantine purge ID` | Permanently delete a quarantined file |
@@ -161,7 +212,11 @@ antivirus/
 ├── __main__.py      # python3 -m antivirus
 ├── cli.py           # argparse CLI + console output
 ├── config.py        # all tunables in one dataclass
-├── scanner.py       # hashing, pattern + heuristic detection, tree walk
+├── models.py        # Finding dataclass + entropy helpers
+├── behavior.py      # behavioural analysis (Python AST, shell/PS/batch,
+│                    #   PE/ELF structure, binary IOCs, SUID)
+├── samples.py       # builder for the inert demo samples (incl. fake PE)
+├── scanner.py       # single-pass hashing, patterns, behaviour, heuristics
 ├── signatures.py    # JSON signature database (load/add/save)
 ├── quarantine.py    # quarantine store with manifest, restore, purge
 ├── monitor.py       # polling directory watcher
@@ -173,7 +228,8 @@ data/
 └── signatures.json  # bundled signature database (EICAR test string)
 samples/
 ├── eicar-test.txt   # the standard 68-byte harmless AV test string
-└── clean.txt
+├── clean.txt
+└── behavior/        # inert behavioural demo samples (scripts + fake PE)
 tests/
 └── test_antivirus.py
 ```
