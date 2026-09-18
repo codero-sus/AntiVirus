@@ -3,11 +3,16 @@
 A deliberate, dependency-free stand-in for inotify / watchdog based monitors:
 every *interval* seconds a snapshot of the watched tree is compared with the
 previous one and each new/changed file is scanned (and acted upon).
+
+Efficiency: the snapshot walk is a single ``os.scandir`` pass where every
+entry is ``lstat``-ed exactly once (results are cached by ``DirEntry``), and
+bursts of changed files are scanned in parallel.
 """
 from __future__ import annotations
 
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -18,6 +23,9 @@ from .scanner import Scanner, walk_files
 LogFn = Callable[[str, str], None]
 
 _LEVEL_COLOR = {"ok": "32", "alert": "31", "error": "31", "warn": "33", "info": "36"}
+
+#: Changed files above this number are scanned in parallel.
+_PARALLEL_MIN = 4
 
 
 class DirectoryWatcher:
@@ -72,28 +80,34 @@ class DirectoryWatcher:
             changed, removed = self.poll(root)
             for path in removed:
                 self.log("info", f"removed : {path}")
-            for path in changed:
-                self._handle(path)
+            if changed:
+                self._handle(changed)
 
     # ------------------------------------------------------------ internals
     def _snapshot(self, root: Path) -> Dict[str, Tuple[float, int]]:
         config: Config = self.scanner.config
         protected = (config.quarantine_dir.resolve(), config.report_dir.resolve())
         state: Dict[str, Tuple[float, int]] = {}
-        for path in walk_files(root, config.exclude_dirs, protected):
-            try:
-                st = path.stat()
-                state[str(path)] = (st.st_mtime, st.st_size)
-            except OSError:
-                pass
+
+        def _record(p: Path, st) -> None:
+            state[str(p)] = (st.st_mtime, st.st_size)
+
+        for _ in walk_files(root, config.exclude_dirs, protected, on_file=_record):
+            pass
         return state
 
-    def _handle(self, path: Path) -> None:
-        try:
-            findings = self.scanner.scan_file(path)
-        except OSError as exc:
-            self.log("error", f"scan failed: {path} ({exc})")
-            return
+    def _handle(self, paths: List[Path]) -> None:
+        """Scan the changed files (in parallel for bursts), then act on them."""
+        if len(paths) >= _PARALLEL_MIN:
+            with ThreadPoolExecutor(max_workers=min(8, len(paths)),
+                                    thread_name_prefix="av-watch") as pool:
+                results = list(pool.map(self.scanner.scan_file, paths, chunksize=1))
+        else:
+            results = [self.scanner.scan_file(p) for p in paths]
+        for path, findings in zip(paths, results):
+            self._act(path, findings)
+
+    def _act(self, path: Path, findings: List) -> None:
         if not findings:
             self.log("ok", f"clean   : {path}")
             return

@@ -13,4 +13,4 @@ The project ships with the standard, *harmless* EICAR test string so you can
 verify that detection works without touching any real malware.
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"

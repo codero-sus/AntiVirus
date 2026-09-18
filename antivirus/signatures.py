@@ -31,13 +31,18 @@ class Signature:
 
     @property
     def compiled(self) -> Optional["re.Pattern[bytes]"]:
-        """The pattern compiled for binary matching, or ``None``."""
-        if not self.pattern:
-            return None
-        try:
-            return re.compile(self.pattern.encode("utf-8"))
-        except re.error:
-            return None
+        """The pattern compiled for binary matching, or ``None`` (cached)."""
+        cache = getattr(self, "_compiled_cache", "missing")
+        if cache == "missing":
+            if not self.pattern:
+                cache = None
+            else:
+                try:
+                    cache = re.compile(self.pattern.encode("utf-8"))
+                except re.error:
+                    cache = False
+            self._compiled_cache = cache
+        return None if cache is False else cache
 
 
 class SignatureDB:

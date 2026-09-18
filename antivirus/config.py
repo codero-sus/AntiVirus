@@ -33,7 +33,9 @@ class Config:
     # Heuristics.
     entropy_threshold: float = 7.5              # bits/byte
     entropy_min_size: int = 256 * 1024          # only test files >= 256 KiB
-    entropy_sample_size: int = 2 * 1024 * 1024  # at most 2 MiB sampled
+    # 256 KiB of samples is statistically enough to estimate byte entropy
+    # within ~0.01 bits/byte, and keeps the in-pass histogram cheap.
+    entropy_sample_size: int = 256 * 1024
 
     # Directory names that are never walked.
     exclude_dirs: tuple = DEFAULT_EXCLUDE_DIRS

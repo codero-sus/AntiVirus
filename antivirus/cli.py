@@ -39,7 +39,7 @@ def _build(args):
         config.max_file_size = args.max_size
     config.resolve_paths(Path.cwd())
     db = SignatureDB(config.signatures_file)
-    scanner = Scanner(config, db)
+    scanner = Scanner(config, db, threads=getattr(args, "threads", "auto"))
     quarantine = Quarantine(config.quarantine_dir)
     return config, db, scanner, quarantine
 
@@ -94,21 +94,23 @@ def cmd_scan(args) -> int:
 
     writer = ReportWriter(config.report_dir)
     report_path = writer.save(result, action=args.action, actions_taken=notes)
+    workers = scanner._workers()
 
     if args.json:
         data = result.to_dict()
         data["action"] = args.action
         data["actions_taken"] = notes
+        data["threads"] = workers
         data["report"] = str(report_path)
         print(json.dumps(data, indent=2, ensure_ascii=False))
     else:
-        _print_scan_summary(result, args.action, notes, report_path)
+        _print_scan_summary(result, args.action, notes, report_path, workers)
 
     return 0 if result.clean else 1
 
 
 def _print_scan_summary(result: ScanResult, action: str, notes: dict,
-                        report_path: Path) -> None:
+                        report_path: Path, workers: int = 1) -> None:
     bar = "=" * 62
     print()
     print(paint(bar, BOLD))
@@ -118,6 +120,7 @@ def _print_scan_summary(result: ScanResult, action: str, notes: dict,
     print(f" Files scanned:  {result.files_scanned} ({human_size(result.bytes_scanned)})")
     print(f" Skipped:        {result.files_skipped}")
     print(f" Errors:         {len(result.errors)}")
+    print(f" Threads:        {workers} ({'parallel' if workers > 1 else 'sequential'})")
     print(f" Duration:       {result.elapsed:.2f} s")
     print()
     if result.findings:
@@ -270,6 +273,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("target", help="file or directory to scan")
     p.add_argument("--action", choices=("detect", "quarantine", "delete"),
                    default="detect", help="what to do with threats")
+    p.add_argument("--threads", default="auto", metavar="N",
+                   help="worker threads for directory scans: auto (default), "
+                        "a number, or 1/0 for fully sequential")
     p.add_argument("--json", action="store_true", help="machine readable output")
 
     p = sub.add_parser("monitor", help="watch a directory and scan new/changed files")

@@ -103,6 +103,91 @@ class ScannerTests(unittest.TestCase):
         self.assertTrue(result.errors)
 
 
+class EfficiencyTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+
+        path = Path(tempfile.mkdtemp(prefix="av-eff-"))
+        self.addCleanup(lambda: shutil.rmtree(path, ignore_errors=True))
+        self.app = App(path)
+
+    def _populate(self, base: Path) -> None:
+        for i in range(30):
+            (base / f"file-{i:03d}.txt").write_text(f"content {i}\n" * 20)
+        (base / "infected.bin").write_bytes(b"\x00" * 32 + EICAR + b"\x00" * 32)
+
+    def test_parallel_matches_serial(self):
+        base = self.app.config.quarantine_dir.parent
+        self._populate(base)
+        serial = self.app.scanner.scan_path(base)  # threads default -> auto
+        self.app.scanner.threads = 1
+        one = self.app.scanner.scan_path(base)
+        self.app.scanner.threads = 8
+        parallel = self.app.scanner.scan_path(base)
+        for res in (serial, one, parallel):
+            # 30 ordinary + infected.bin + signatures.json copied in by App()
+            self.assertEqual(res.files_scanned, 32)
+            # infected.bin is EICAR with padding -> hash differs, pattern hits
+            self.assertEqual(
+                sorted((f.path, f.kind) for f in res.findings),
+                [(str(base / "infected.bin"), "signature-pattern")],
+            )
+            self.assertEqual(res.bytes_scanned, serial.bytes_scanned)
+
+    def test_heuristic_not_suppressed_after_earlier_finding(self):
+        # Regression: the heuristic layer used to be gated on the
+        # tree-wide findings list, so any earlier threat silently
+        # disabled heuristics for every later file in a directory scan.
+        import random
+
+        base = self.app.config.quarantine_dir.parent
+        (base / "a-infected.txt").write_bytes(EICAR)           # sorts first
+        (base / "z-packed.bin").write_bytes(                   # sorts last
+            random.Random(1).randbytes(300 * 1024))
+        self.app.scanner.threads = 1  # sequential – the bug's scenario
+        result = self.app.scanner.scan_path(base)
+        kinds = {(f.path.rsplit("/", 1)[-1], f.kind) for f in result.findings}
+        self.assertIn(("a-infected.txt", "signature-hash"), kinds)
+        self.assertIn(("z-packed.bin", "heuristic"), kinds)
+
+    def test_workers_parsing(self):
+        scanner = self.app.scanner
+        self.assertEqual(scanner._workers(), scanner._workers())  # stable
+        scanner.threads = 1
+        self.assertEqual(scanner._workers(), 1)
+        scanner.threads = 0
+        self.assertEqual(scanner._workers(), 1)
+        scanner.threads = "4"
+        self.assertEqual(scanner._workers(), 4)
+        scanner.threads = "bogus"
+        self.assertEqual(scanner._workers(), 1)
+
+    def test_combined_regex_matches_multiple_patterns(self):
+        db = self.app.db
+        db.add(Signature(id="P1", name="P1", category="test", severity="low",
+                         pattern=b"MARKER-ALPHA-111".decode()))
+        db.add(Signature(id="P2", name="P2", category="test", severity="low",
+                         pattern=b"MARKER-BETA-222".decode()))
+        f = self.app.config.quarantine_dir.parent / "both.txt"
+        f.write_text("x MARKER-ALPHA-111 y MARKER-BETA-222 z\n")
+        findings = self.app.scanner.scan_file(f)
+        self.assertEqual(sorted(x.name for x in findings), ["P1", "P2"])
+
+    def test_combined_regex_fallback_on_bad_combined(self):
+        # Two patterns that cannot be merged (clashing internal group names)
+        # must fall back to per-pattern matching without errors.
+        db = self.app.db
+        db.add(Signature(id="C1", name="C1", category="test", severity="low",
+                         pattern=r"(?P<x>a)"))
+        db.add(Signature(id="C2", name="C2", category="test", severity="low",
+                         pattern=r"(?P<x>b)"))
+        self.app.scanner._sync_patterns()
+        f = self.app.config.quarantine_dir.parent / "c.txt"
+        f.write_text("a b\n")
+        findings = self.app.scanner.scan_file(f)
+        self.assertEqual(sorted(x.name for x in findings), ["C1", "C2"])
+
+
 class QuarantineTests(unittest.TestCase):
     def setUp(self):
         import tempfile

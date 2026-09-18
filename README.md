@@ -85,16 +85,52 @@ python3 -m antivirus scan samples/ --action quarantine
 
 For every regular file (symlinks, build dirs and VCS metadata are skipped):
 
-1. The file is streamed in 1 MiB chunks through **SHA-256** and **MD5**.
-   Files larger than `max_file_size` (512 MiB) are skipped.
+1. The file is read from disk **exactly once**, streamed in 1 MiB chunks.
+   In that single pass the engine computes **SHA-256** and **MD5**, runs
+   the **pattern** signatures (with an overlap window so patterns can't
+   hide at chunk boundaries) and collects a 256 KiB byte histogram for
+   the entropy heuristic. Files larger than `max_file_size` (512 MiB)
+   are skipped.
 2. If a digest matches a signature, the file is reported as a **definite**
-   threat and scanning of that file stops.
-3. Otherwise the file is read again in chunks (with an overlap window so
-   patterns can't hide at chunk boundaries) and tested against every
-   **pattern** signature.
-4. If still nothing matched, the **heuristic** layer computes the Shannon
-   entropy of up to a 2 MiB sample; ≥ 7.5 bits/byte on files ≥ 256 KiB is
+   threat.
+3. Otherwise pattern hits are reported.
+4. If still nothing matched, the **heuristic** verdict is made from the
+   already-collected histogram: ≥ 7.5 bits/byte on files ≥ 256 KiB is
    reported as "may be packed or encrypted".
+
+## Efficiency
+
+The engine is built around one rule: *touch each file once*.
+
+- **Single-pass I/O** – hashing, pattern matching and entropy sampling all
+  happen while the file is read once (the previous design re-read files
+  2–3 times).
+- **One regex for all patterns** – every pattern signature is merged into a
+  single compiled alternation, so each 1 MiB buffer is scanned once instead
+  of once per signature. (If patterns can't be merged – e.g. clashing
+  internal group names – it transparently falls back to per-pattern scans.)
+- **One `lstat` per directory entry** – the tree walk is a single
+  `os.scandir` pass; the stat result is reused by the scanner and by the
+  monitor's snapshot, so nothing is re-stated.
+- **Parallel directory scans** – files are scanned in a thread pool
+  (`hashlib` releases the GIL while hashing). Use `scan --threads auto`
+  (default), `--threads N`, or `--threads 1` for sequential.
+- **Cheap monitor polling** – the watcher reuses the same single-`lstat`
+  walk and scans bursts of changed files in parallel.
+- **Cached signatures** – compiled regexes and hash indexes are cached and
+  only rebuilt when the signature database changes.
+
+Measured on a 2 500-file / 266 MiB tree (2-core box, warm page cache):
+
+| Engine | Wall time | Threats found |
+| --- | --- | --- |
+| v1.0 (2–3 passes per file, sequential) | 0.97 s | 1 of 13* |
+| v1.1 sequential (`--threads 1`) | 0.95 s | 13 of 13 |
+| v1.1 auto (`--threads auto` → 4 workers) | **0.78 s** | 13 of 13 |
+
+\* v1.0 had a latent bug: the heuristic layer was gated on the tree-wide
+findings list, so the first threat silently disabled heuristics for every
+later file in a directory scan. Fixed in v1.1.
 
 Quarantine keeps the file under an id like
 `275a021bbfb6-20260918-120000-a1b2c3` inside `quarantine/files/`, with the
@@ -104,7 +140,7 @@ original path, timestamp and reason recorded in `quarantine/manifest.json`.
 
 | Command | Description |
 | --- | --- |
-| `scan TARGET [--action detect\|quarantine\|delete] [--json]` | Scan a file or directory tree |
+| `scan TARGET [--action detect\|quarantine\|delete] [--threads N] [--json]` | Scan a file or directory tree (`--threads`: auto, N, or 1) |
 | `monitor TARGET [--action ...] [--interval 2]` | Watch a directory, scan new/changed files |
 | `quarantine list` | Show everything that is quarantined |
 | `quarantine restore ID` | Restore a quarantined file (prefix ok) |

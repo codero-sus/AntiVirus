@@ -9,7 +9,17 @@ Detection layers
 3. **Heuristic** – a Shannon-entropy check flags large, high-entropy files
    that look packed or encrypted.
 
-Layers 2 and 3 are skipped once layer 1 produced a definite match.
+Efficiency notes
+----------------
+* A file is read from disk **once**: hashing, pattern matching and the
+  entropy sample are all computed in a single streaming pass.
+* All pattern signatures are merged into **one** compiled alternation, so
+  each 1 MiB buffer is scanned once instead of once per signature.
+* Every directory entry is ``lstat``-ed exactly once (``os.scandir``).
+* Directory scans run in parallel threads (``hashlib`` releases the GIL
+  while hashing) – see ``Scanner(..., threads=...)`` / ``scan --threads``.
+* Compiled regexes and the signature indexes are cached and only rebuilt
+  when the database version changes.
 """
 from __future__ import annotations
 
@@ -20,15 +30,19 @@ import re
 import stat
 import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Callable, Iterator, List, Optional, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
 from .config import Config
 from .signatures import Signature, SignatureDB
 from .utils import md5_new
 
 LogFn = Callable[[Path, str], None]
+
+#: A heuristic entropy verdict is only made from samples of at least this size.
+_MIN_ENTROPY_SAMPLE = 16 * 1024
 
 
 @dataclass
@@ -90,13 +104,18 @@ class ScanResult:
         }
 
 
+def shannon_entropy_counts(counts: "Counter", total: int) -> float:
+    """Shannon entropy (bits/byte) from an existing byte histogram."""
+    if total <= 0:
+        return 0.0
+    return -sum((c / total) * math.log2(c / total) for c in counts.values())
+
+
 def shannon_entropy(data: bytes) -> float:
     """Shannon entropy of *data* in bits per byte (0 .. 8)."""
     if not data:
         return 0.0
-    counts = Counter(data)
-    total = len(data)
-    return -sum((c / total) * math.log2(c / total) for c in counts.values())
+    return shannon_entropy_counts(Counter(data), len(data))
 
 
 def _is_under(path: Path, dirs: Tuple[Path, ...]) -> bool:
@@ -112,51 +131,76 @@ def walk_files(
     exclude_dirs,
     protected: Tuple[Path, ...] = (),
     on_skip: Optional[LogFn] = None,
+    on_file: Optional[Callable[[Path, os.stat_result], None]] = None,
 ) -> Iterator[Path]:
-    """Yield regular files under *root* in a deterministic order.
+    """Walk *root* with ``os.scandir``, yielding regular files deterministically.
 
-    Symlinks and non-regular files are skipped (and reported via *on_skip*),
-    directory names in *exclude_dirs* are pruned, and nothing under
-    *protected* (e.g. the quarantine itself) is ever visited.
+    Each entry is ``lstat``-ed exactly once (the result is cached by
+    ``DirEntry``). ``on_skip(path, reason)`` reports symlinks / special
+    files; ``on_file(path, lstat_result)`` hands the caller the already
+    fetched stat so it never has to stat the file again.
     """
     exclude = set(exclude_dirs)
+    resolve_cache: Dict[str, Path] = {}
 
-    def _skip(child: Path, reason: str) -> None:
-        if on_skip is not None:
-            on_skip(child, reason)
-
-    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
-        keep = []
-        for name in dirnames:
-            child = Path(dirpath) / name
-            if name in exclude:
-                continue
-            if _is_under(child, protected):
-                continue
-            keep.append(name)
-        dirnames[:] = sorted(keep)
-        for name in sorted(filenames):
-            child = Path(dirpath) / name
+    def _under(p: Path) -> bool:
+        key = str(p)
+        r = resolve_cache.get(key)
+        if r is None:
             try:
-                if child.is_symlink():
-                    _skip(child, "symlink")
-                    continue
-                if not stat.S_ISREG(child.lstat().st_mode):
-                    _skip(child, "not a regular file")
-                    continue
+                r = p.resolve()
+            except OSError:
+                r = p
+            resolve_cache[key] = r
+        return any(r == d or d in r.parents for d in protected)
+
+    def _skip(p: Path, reason: str) -> None:
+        if on_skip is not None:
+            on_skip(p, reason)
+
+    stack: List[Path] = [Path(root)]
+    while stack:
+        current = stack.pop()
+        try:
+            entries = list(os.scandir(current))
+        except OSError:
+            continue
+        dirs: List[Path] = []
+        files: List[Tuple[Path, os.stat_result]] = []
+        for entry in entries:
+            try:
+                st = entry.stat(follow_symlinks=False)
             except OSError as exc:
-                _skip(child, str(exc))
+                _skip(Path(entry.path), str(exc))
                 continue
-            yield child
+            mode = st.st_mode
+            if stat.S_ISLNK(mode):
+                _skip(Path(entry.path), "symlink")
+            elif stat.S_ISDIR(mode):
+                if entry.name not in exclude and not _under(Path(entry.path)):
+                    dirs.append(Path(entry.path))
+            elif stat.S_ISREG(mode):
+                files.append((Path(entry.path), st))
+            else:
+                _skip(Path(entry.path), "not a regular file")
+        files.sort(key=lambda item: item[0].name)
+        for p, st in files:
+            if on_file is not None:
+                on_file(p, st)
+            yield p
+        stack.extend(reversed(sorted(dirs)))
 
 
 class Scanner:
     """Runs the three detection layers over files and directory trees."""
 
-    def __init__(self, config: Config, db: SignatureDB) -> None:
+    def __init__(self, config: Config, db: SignatureDB, threads: "str | int" = "auto") -> None:
         self.config = config
         self.db = db
+        self.threads = threads
         self._patterns: List[Tuple[Signature, "re.Pattern[bytes]"]] = []
+        self._combined: Optional["re.Pattern[bytes]"] = None
+        self._name_to_sig: Dict[str, Signature] = {}
         self._overlap = 64
         self._cached_version: Optional[int] = None
 
@@ -167,12 +211,35 @@ class Scanner:
         result = ScanResult(target=str(path), started_at=time.time())
         self._sync_patterns()
         if path.is_file():
-            self._scan_file(path, result)
+            files: List[Tuple[Path, Optional[os.stat_result]]] = [(path, None)]
         elif path.is_dir():
-            for file_path in self._iter_files(path, result):
-                self._scan_file(file_path, result)
+            files = []
+            protected = (self.config.quarantine_dir.resolve(),
+                         self.config.report_dir.resolve())
+
+            def _skipped(child: Path, reason: str) -> None:
+                result.files_skipped += 1
+
+            def _record(p: Path, st: os.stat_result) -> None:
+                files.append((p, st))
+
+            for _ in walk_files(path, self.config.exclude_dirs, protected,
+                                on_skip=_skipped, on_file=_record):
+                pass
         else:
             result.errors.append(f"{path}: not a regular file or directory")
+            result.finished_at = time.time()
+            return result
+
+        workers = self._workers()
+        if len(files) > 1 and workers > 1:
+            self._scan_files_parallel(files, result, workers)
+        else:
+            for p, st in files:
+                self._scan_file(p, result, known_size=None if st is None else st.st_size)
+
+        if len(result.findings) > 1:
+            result.findings.sort(key=lambda f: (f.path, f.kind))
         result.finished_at = time.time()
         return result
 
@@ -184,51 +251,116 @@ class Scanner:
         result.finished_at = time.time()
         return result.findings
 
+    # ------------------------------------------------------------ threading
+    def _workers(self) -> int:
+        """Resolve the configured worker count (1 = fully sequential)."""
+        t = self.threads
+        if t in (0, 1, "off", "0", "1", False, None):
+            return 1
+        if t == "auto":
+            return min(8, max(1, (os.cpu_count() or 1) * 2))
+        try:
+            return max(1, int(t))
+        except (TypeError, ValueError):
+            return 1
+
+    def _scan_files_parallel(self, files: List[Tuple[Path, Optional[os.stat_result]]],
+                             result: ScanResult, workers: int) -> None:
+        def work(item: Tuple[Path, Optional[os.stat_result]]) -> ScanResult:
+            p, st = item
+            local = ScanResult(target=str(p), started_at=0.0)
+            self._scan_file(p, local, known_size=None if st is None else st.st_size)
+            return local
+
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="av-scan") as pool:
+            for local in pool.map(work, files, chunksize=16):
+                result.files_scanned += local.files_scanned
+                result.files_skipped += local.files_skipped
+                result.bytes_scanned += local.bytes_scanned
+                if local.errors:
+                    result.errors.extend(local.errors)
+                if local.findings:
+                    result.findings.extend(local.findings)
+
     # ------------------------------------------------------------ internals
     def _sync_patterns(self) -> None:
-        """Rebuild compiled patterns when the signature DB changed."""
+        """Rebuild the merged pattern regex when the signature DB changed."""
         if self._cached_version == self.db.version:
             return
         self._patterns = []
+        self._name_to_sig = {}
+        self._combined = None
         for sig in self.db.list():
             compiled = sig.compiled
             if compiled is not None:
                 self._patterns.append((sig, compiled))
+        if self._patterns:
+            parts = []
+            for i, (sig, _rx) in enumerate(self._patterns):
+                name = f"av_sig_{i}"
+                self._name_to_sig[name] = sig
+                parts.append(f"(?P<{name}>{sig.pattern})")
+            try:
+                self._combined = re.compile("|".join(parts).encode("utf-8"))
+            except re.error:
+                self._combined = None  # fall back to per-pattern searches
         self._overlap = max((len(s.pattern) for s, _ in self._patterns), default=0) * 3 + 64
         self._cached_version = self.db.version
 
-    def _iter_files(self, root: Path, result: ScanResult) -> Iterator[Path]:
-        config = self.config
-        protected = (config.quarantine_dir.resolve(), config.report_dir.resolve())
+    def _match_patterns(self, buf: bytes) -> List[Signature]:
+        """Which signatures match *buf* – one combined pass per chunk."""
+        hits: List[Signature] = []
+        if self._combined is not None:
+            for m in self._combined.finditer(buf):
+                name = m.lastgroup
+                sig = None
+                if name is not None and name in self._name_to_sig and m.group(name) is not None:
+                    sig = self._name_to_sig[name]
+                else:  # lastgroup may be an internal group of the user pattern
+                    for n, s in self._name_to_sig.items():
+                        if m.group(n) is not None:
+                            sig = s
+                            break
+                if sig is not None and sig not in hits:
+                    hits.append(sig)
+        else:
+            for sig, rx in self._patterns:
+                if rx.search(buf) and sig not in hits:
+                    hits.append(sig)
+        return hits
 
-        def _skipped(child: Path, reason: str) -> None:
-            result.files_skipped += 1
-
-        for file_path in walk_files(root, config.exclude_dirs, protected, on_skip=_skipped):
-            yield file_path
-
-    def _scan_file(self, path: Path, result: ScanResult) -> None:
-        try:
-            size = path.stat().st_size
-        except OSError as exc:
-            result.errors.append(f"{path}: {exc}")
-            return
+    def _scan_file(self, path: Path, result: ScanResult,
+                   known_size: Optional[int] = None) -> None:
+        if known_size is None:
+            try:
+                size = path.stat().st_size
+            except OSError as exc:
+                result.errors.append(f"{path}: {exc}")
+                return
+        else:
+            size = known_size
 
         if size > self.config.max_file_size:
             result.files_skipped += 1
             result.errors.append(f"{path}: skipped ({size} bytes > max_file_size)")
             return
 
-        result.files_scanned += 1
-        result.bytes_scanned += size
-
         try:
-            sha256, md5, partial = self._hash_file(path, size)
+            sha256, md5, partial, pattern_hits, entropy = self._stream_file(path, size)
         except OSError as exc:
             result.errors.append(f"{path}: {exc}")
             return
 
-        # Layer 1 – exact hash match.
+        result.files_scanned += 1
+        result.bytes_scanned += size
+
+        # NOTE: verdicts are collected in a *per-file* list.  The heuristic
+        # guard must never look at ``result.findings`` – that list is shared
+        # by the whole tree scan, so findings from earlier files would
+        # silently suppress heuristics for every later file.
+        local: List[Finding] = []
+
+        # Layer 1 – exact hash match (definite).
         if not partial:
             signature = self.db.by_sha256(sha256)
             if signature is None:
@@ -237,7 +369,7 @@ class Scanner:
                 message = f"Matches signature '{signature.id}'"
                 if signature.description:
                     message += f" ({signature.description})"
-                result.findings.append(Finding(
+                local.append(Finding(
                     path=str(path),
                     kind="signature-hash",
                     name=signature.name,
@@ -246,98 +378,76 @@ class Scanner:
                     sha256=sha256,
                     size=size,
                 ))
-                return  # definite match – no noisier layers needed
+                result.findings.extend(local)  # definite match – stop here
+                return
 
-        # Layer 2 – pattern match in the file body.
-        result.findings.extend(self._pattern_findings(path, sha256, size))
+        # Layer 2 – pattern matches found in the same pass.
+        for sig in pattern_hits:
+            local.append(Finding(
+                path=str(path),
+                kind="signature-pattern",
+                name=sig.name,
+                severity=sig.severity,
+                message=f"Pattern of signature '{sig.id}' found in file body",
+                sha256=sha256,
+                size=size,
+            ))
 
-        # Layer 3 – heuristics (only if nothing definite was found).
-        if not result.findings:
-            result.findings.extend(self._heuristic_findings(path, sha256, size))
-
-    def _hash_file(self, path: Path, size: int) -> Tuple[str, str, bool]:
-        """Stream the file through SHA-256 and MD5. Returns partial flag."""
-        sha = hashlib.sha256()
-        md5 = md5_new()
-        limit = min(size, self.config.max_file_size)
-        read = 0
-        with open(path, "rb") as fh:
-            while read < limit:
-                chunk = fh.read(self.config.hash_chunk_size)
-                if not chunk:
-                    break
-                sha.update(chunk)
-                md5.update(chunk)
-                read += len(chunk)
-        return sha.hexdigest(), md5.hexdigest(), read < size
-
-    def _pattern_findings(self, path: Path, sha256: str, size: int) -> List[Finding]:
-        findings: List[Finding] = []
-        pending = list(self._patterns)
-        if not pending or size == 0:
-            return findings
-        tail = b""
-        try:
-            with open(path, "rb") as fh:
-                while pending:
-                    chunk = fh.read(self.config.pattern_chunk_size)
-                    if not chunk:
-                        break
-                    buf = tail + chunk
-                    still = []
-                    for sig, regex in pending:
-                        if regex.search(buf):
-                            findings.append(Finding(
-                                path=str(path),
-                                kind="signature-pattern",
-                                name=sig.name,
-                                severity=sig.severity,
-                                message=f"Pattern of signature '{sig.id}' found in file body",
-                                sha256=sha256,
-                                size=size,
-                            ))
-                        else:
-                            still.append((sig, regex))
-                    pending = still
-                    tail = buf[-self._overlap:]
-        except OSError:
-            pass
-        return findings
-
-    def _heuristic_findings(self, path: Path, sha256: str, size: int) -> List[Finding]:
-        cfg = self.config
-        if size < cfg.entropy_min_size:
-            return []
-        sample = self._read_sample(path, cfg.entropy_sample_size)
-        if len(sample) < 16 * 1024:
-            return []
-        entropy = shannon_entropy(sample)
-        if entropy >= cfg.entropy_threshold:
-            return [Finding(
+        # Layer 3 – heuristics (only if this file has no definite hit yet).
+        if not local and entropy is not None and entropy >= self.config.entropy_threshold:
+            local.append(Finding(
                 path=str(path),
                 kind="heuristic",
                 name="High-Entropy",
                 severity="medium",
                 message=(
                     f"Shannon entropy {entropy:.2f} bits/byte "
-                    f"(threshold {cfg.entropy_threshold}); file may be packed or encrypted"
+                    f"(threshold {self.config.entropy_threshold}); file may be packed or encrypted"
                 ),
                 sha256=sha256,
                 size=size,
-            )]
-        return []
+            ))
 
-    def _read_sample(self, path: Path, limit: int) -> bytes:
-        parts: List[bytes] = []
-        total = 0
-        try:
-            with open(path, "rb") as fh:
-                while total < limit:
-                    chunk = fh.read(self.config.hash_chunk_size)
-                    if not chunk:
-                        break
-                    parts.append(chunk)
-                    total += len(chunk)
-        except OSError:
-            pass
-        return b"".join(parts)[:limit]
+        result.findings.extend(local)
+
+    def _stream_file(self, path: Path, size: int):
+        """Read the file **once**, computing everything in one pass.
+
+        Returns ``(sha256, md5, partial, pattern_hits, entropy_or_None)``.
+        """
+        cfg = self.config
+        sha = hashlib.sha256()
+        md5 = md5_new()
+        need_entropy = size >= cfg.entropy_min_size
+        counts: Optional["Counter"] = Counter() if need_entropy else None
+        sampled = 0
+        hits: List[Signature] = []
+        remaining = list(self._patterns)
+        tail = b""
+        overlap = self._overlap
+        read = 0
+        with open(path, "rb") as fh:
+            while read < size:
+                chunk = fh.read(cfg.hash_chunk_size)
+                if not chunk:
+                    break
+                read += len(chunk)
+                sha.update(chunk)
+                md5.update(chunk)
+                if remaining:
+                    buf = tail + chunk
+                    matched = self._match_patterns(buf)
+                    if matched:
+                        for sig in matched:
+                            if sig not in hits:
+                                hits.append(sig)
+                        remaining = [pr for pr in remaining if pr[0] not in hits]
+                    tail = buf[-overlap:] if remaining else b""
+                if counts is not None and sampled < cfg.entropy_sample_size:
+                    take = chunk[: cfg.entropy_sample_size - sampled]
+                    counts.update(take)
+                    sampled += len(take)
+        entropy = None
+        if counts is not None and sampled >= _MIN_ENTROPY_SAMPLE:
+            entropy = shannon_entropy_counts(counts, sampled)
+        return sha.hexdigest(), md5.hexdigest(), read < size, hits, entropy
