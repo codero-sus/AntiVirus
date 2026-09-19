@@ -6,14 +6,18 @@ Run with either:
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import shutil
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
 from antivirus.config import Config
+from antivirus.models import Finding
 from antivirus.quarantine import Quarantine
 from antivirus.report import ReportWriter, render_report
 from antivirus.scanner import ScanResult, Scanner, shannon_entropy
@@ -493,6 +497,48 @@ class PeDebugTests(unittest.TestCase):
         self.assertTrue(payload["valid"])
         self.assertIn("run_payload", payload["exports"])
         self.assertTrue(payload["indicators"])
+
+
+class GuiTests(unittest.TestCase):
+    """The GUI module must stay importable and honest without a display."""
+
+    def test_module_importable_and_helpers(self):
+        import antivirus.gui as g
+
+        self.assertTrue(hasattr(g, "run_gui"))
+        self.assertIsInstance(g.tk_available(), bool)
+        f = Finding(path="/tmp/x.exe", kind="behavior", name="T",
+                    severity="high", message="m", size=42)
+        self.assertEqual(g.finding_row(f),
+                         ("high", "T", "/tmp/x.exe", "behavior", "m"))
+        for sev in ("critical", "high", "medium", "low", "info"):
+            fg, bg = g.SEVERITY_COLORS[sev]
+            self.assertTrue(fg.startswith("#") and bg.startswith("#"))
+
+    def test_summarize(self):
+        import antivirus.gui as g
+
+        r = ScanResult(target="/x", started_at=time.time())
+        r.finished_at = time.time()
+        self.assertIn("CLEAN", g.summarize(r, {}))
+        r.findings.append(Finding(path="/x", kind="behavior", name="T",
+                                  severity="high", message="m"))
+        s = g.summarize(r, {"/x": "deleted"})
+        self.assertIn("INFECTED", s)
+        self.assertIn("action(s) taken", s)
+
+    def test_gui_command_degrades_gracefully_headless(self):
+        import antivirus.gui as g
+
+        if g.tk_available():
+            self.skipTest("tkinter present – the GUI would actually open")
+        from antivirus import cli
+
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            rc = cli.main(["gui"])
+        self.assertEqual(rc, 2)
+        self.assertIn("Tkinter", buf.getvalue())
 
 
 class MiscTests(unittest.TestCase):

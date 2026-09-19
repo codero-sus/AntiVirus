@@ -45,10 +45,18 @@ watches folders for new/changed files, and writes JSON + text reports.
 - **Signature editor** — add your own signatures from the CLI (hash or
   pattern)
 - **Self test** — built-in end-to-end test using the harmless EICAR string
+- **Graphical UI** — Tkinter desktop app (standard library, no extra
+  packages): pick a target, scan with live progress and a stop button,
+  review severity-coloured findings, and manage the quarantine
+  (`python3 -m antivirus gui`)
 
 ## Requirements
 
 - Python 3.9+ — that's it. No third-party packages.
+- For the **GUI** only: Tkinter, which ships with Python on Windows/macOS
+  and is packaged separately on Linux
+  (`sudo apt install python3-tk` / `sudo dnf install python3-tkinter`).
+  Without it, `antivirus gui` prints a hint and the CLI works unchanged.
 
 ## Quick start
 
@@ -78,6 +86,9 @@ python3 -m antivirus report show
 python3 -m antivirus sig show
 python3 -m antivirus sig add --id MY-LAB-1 --name "My lab marker" \
     --severity high --pattern "MY-UNIQUE-MARKER-1234"
+
+# 8. Use the graphical interface (needs Tkinter, see Requirements)
+python3 -m antivirus gui
 ```
 
 Optionally install the console script (same thing, nicer name):
@@ -214,6 +225,7 @@ original path, timestamp and reason recorded in `quarantine/manifest.json`.
 | `monitor TARGET [--action ...] [--interval 2] [--no-behavior]` | Watch a directory, scan new/changed files |
 | `behavior analyze FILE [--json]` | Show what one file appears to do (static behavioural analysis) |
 | `pe analyze FILE [--json]` | Full static PE dissection ("debug report") + red-flag indicators |
+| `gui` | Open the graphical user interface (Tkinter) |
 | `quarantine list` | Show everything that is quarantined |
 | `quarantine restore ID` | Restore a quarantined file (prefix ok) |
 | `quarantine purge ID` | Permanently delete a quarantined file |
@@ -232,6 +244,7 @@ antivirus/
 ├── __init__.py      # package metadata
 ├── __main__.py      # python3 -m antivirus
 ├── cli.py           # argparse CLI + console output
+├── gui.py           # Tkinter graphical interface (python3 -m antivirus gui)
 ├── config.py        # all tunables in one dataclass
 ├── models.py        # Finding dataclass + entropy helpers
 ├── behavior.py      # behavioural analysis (Python AST, shell/PS/batch,

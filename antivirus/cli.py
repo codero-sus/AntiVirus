@@ -13,6 +13,7 @@ from . import __version__
 from .behavior import analyze_file as behavior_analyze_file
 from .behavior import looks_executable as behavior_looks_executable
 from .config import Config
+from .gui import run_gui
 from .monitor import DirectoryWatcher
 from .pe import (
     SUBSYSTEM_NAMES,
@@ -431,6 +432,9 @@ def build_parser() -> argparse.ArgumentParser:
     pa.add_argument("file", help="file to analyse")
     pa.add_argument("--json", action="store_true", help="machine readable output")
 
+    sub.add_parser("gui",
+                   help="open the graphical user interface (Tkinter)")
+
     p = sub.add_parser("pe",
                        help="PE/.exe deep dissection (static 'debug report')")
     esub = p.add_subparsers(dest="eaction", required=True)
@@ -462,6 +466,7 @@ _COMMANDS = {
     "sig": cmd_sig,
     "behavior": cmd_behavior,
     "pe": cmd_pe,
+    "gui": lambda args: run_gui(),
     "selftest": lambda args: run_selftest(),
     "report": cmd_report,
 }
