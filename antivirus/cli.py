@@ -14,6 +14,12 @@ from .behavior import analyze_file as behavior_analyze_file
 from .behavior import looks_executable as behavior_looks_executable
 from .config import Config
 from .monitor import DirectoryWatcher
+from .pe import (
+    SUBSYSTEM_NAMES,
+    parse_pe,
+    pe_indicators,
+    render_pe_report,
+)
 from .output import BOLD, CYAN, GREEN, RED, SEVERITY_COLOR, YELLOW, paint
 from .quarantine import Quarantine
 from .report import ReportWriter, render_report
@@ -268,6 +274,65 @@ def cmd_behavior(args) -> int:
     return 0 if not findings else 1
 
 
+# ------------------------------------------------------------------------ pe
+def cmd_pe(args) -> int:
+    config, db, scanner, quarantine = _build(args)
+    path = Path(args.file)
+    if not path.is_file():
+        print(paint(f"error: no such file: {path}", RED), file=sys.stderr)
+        return 2
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        print(paint(f"error: {exc}", RED), file=sys.stderr)
+        return 2
+
+    info = parse_pe(data)
+    indicators = pe_indicators(info)
+    if args.json:
+        from .pe import _flag_names, _CHAR_FLAGS, _DLL_CHAR_FLAGS
+
+        payload = {
+            "file": str(path),
+            "valid": info.valid,
+            "error": info.error or None,
+            "machine": info.machine_name,
+            "is_64": info.is_64,
+            "characteristics": _flag_names(info.characteristics, _CHAR_FLAGS),
+            "dll_characteristics": _flag_names(info.dll_characteristics,
+                                               _DLL_CHAR_FLAGS),
+            "subsystem": SUBSYSTEM_NAMES.get(info.subsystem, info.subsystem),
+            "entry_point_rva": info.entry_point_rva,
+            "image_base": info.image_base,
+            "sections": [
+                {"name": s.name, "vrva": s.vrva, "vsize": s.vsize,
+                 "rawsize": s.rawsize, "rawptr": s.rawptr, "flags": s.flags,
+                 "entropy": s.entropy}
+                for s in info.sections
+            ],
+            "imports": info.imports,
+            "exports": info.exports,
+            "resources": [
+                {"type": r.type_name or r.type_id, "name_id": r.name_id,
+                 "size": r.size, "markers": r.markers}
+                for r in info.resources
+            ],
+            "relocations": {"blocks": info.reloc_blocks,
+                            "entries": info.reloc_entries},
+            "tls": info.has_tls,
+            "debug_dirs": info.debug_dirs,
+            "dotnet": info.is_dotnet,
+            "indicators": [
+                {"name": i.name, "severity": i.severity, "message": i.message}
+                for i in indicators
+            ],
+        }
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        print(render_pe_report(info, indicators))
+    return 0 if not indicators else 1
+
+
 # ------------------------------------------------------------------ report
 def cmd_report(args) -> int:
     config, db, scanner, quarantine = _build(args)
@@ -366,6 +431,17 @@ def build_parser() -> argparse.ArgumentParser:
     pa.add_argument("file", help="file to analyse")
     pa.add_argument("--json", action="store_true", help="machine readable output")
 
+    p = sub.add_parser("pe",
+                       help="PE/.exe deep dissection (static 'debug report')")
+    esub = p.add_subparsers(dest="eaction", required=True)
+    pa = esub.add_parser("analyze",
+                         help="dissect a PE image: headers, sections, imports, "
+                              "exports, resources, relocations, TLS, debug dirs")
+    _common_options(pa)
+    pa.add_argument("file", help="PE/.exe file to dissect")
+    pa.add_argument("--json", action="store_true",
+                    help="machine readable output")
+
     sub.add_parser("selftest",
                    help="run the built-in self test (harmless EICAR string)")
 
@@ -385,6 +461,7 @@ _COMMANDS = {
     "quarantine": cmd_quarantine,
     "sig": cmd_sig,
     "behavior": cmd_behavior,
+    "pe": cmd_pe,
     "selftest": lambda args: run_selftest(),
     "report": cmd_report,
 }

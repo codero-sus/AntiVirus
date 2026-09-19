@@ -369,7 +369,8 @@ class BehaviorTests(unittest.TestCase):
     def test_pe_benign_imports_clean(self):
         from antivirus.samples import BENIGN_PE_DLLS, build_sample_pe
 
-        self.assertEqual(self._behavior(self._scan("b.exe", build_sample_pe(BENIGN_PE_DLLS), mode="bytes")), [])
+        pe = build_sample_pe(BENIGN_PE_DLLS, reloc_rva=0x1010, debug_dir=True)
+        self.assertEqual(self._behavior(self._scan("b.exe", pe, mode="bytes")), [])
 
     def test_non_executable_document_not_analysed(self):
         # Same dangerous text, but in a .txt document -> not executable-looking.
@@ -399,6 +400,99 @@ class BehaviorTests(unittest.TestCase):
         # behaviour skipped (file > behaviour_max_size), hash layer still ran
         self.assertEqual(findings, [])
         self.assertGreater(big.stat().st_size, self.scanner.config.behavior_max_size)
+
+
+class PeDebugTests(unittest.TestCase):
+    """v1.3: static PE dissection (the 'debug report') + debug-derived indicators."""
+
+    def test_parse_fields_suspicious(self):
+        from antivirus.pe import parse_pe
+        from antivirus.samples import build_suspicious_pe
+
+        info = parse_pe(build_suspicious_pe())
+        self.assertTrue(info.valid)
+        self.assertFalse(info.is_64)
+        self.assertEqual(info.machine_name, "i386")
+        self.assertEqual(info.entry_point_rva, 0)
+        self.assertEqual(info.exports, ["run_payload"])
+        self.assertEqual(len(info.imports), 4)
+        self.assertIn("URLDownloadToFileA", info.imports.get("wininet.dll", []))
+        self.assertEqual(info.reloc_entries, 0)
+        self.assertEqual(info.debug_dirs, 0)
+        self.assertEqual(len(info.resources), 1)
+        self.assertIn("VBScript (WScript.Shell)", info.resources[0].markers)
+
+    def test_debug_indicators_suspicious(self):
+        from antivirus.pe import parse_pe, pe_indicators
+        from antivirus.samples import build_suspicious_pe
+
+        names = {i.name for i in pe_indicators(parse_pe(build_suspicious_pe()))}
+        for expected in (
+            "ASLR disabled",
+            "DEP (NX) disabled",
+            "No entry point",
+            "No base relocations",
+            "No debug information",
+            "PE imports: Process-injection API set (remote alloc + write + thread)",
+            "PE downloads AND executes code",
+        ):
+            self.assertIn(expected, names)
+        self.assertTrue(any("Embedded in resources: VBScript" in n for n in names))
+
+    def test_packed_indicators(self):
+        from antivirus.pe import parse_pe, pe_indicators
+        from antivirus.samples import build_packed_pe
+
+        names = {i.name for i in pe_indicators(parse_pe(build_packed_pe()))}
+        for expected in ("RELOCS_STRIPPED", "Known packer section name",
+                         "Packed/encrypted PE section", "No import table"):
+            self.assertIn(expected, names)
+
+    def test_clean_pe_zero_findings(self):
+        from antivirus.pe import parse_pe, pe_indicators
+        from antivirus.samples import build_clean_pe
+
+        info = parse_pe(build_clean_pe())
+        self.assertTrue(info.valid)
+        self.assertEqual(pe_indicators(info), [])
+
+    def test_pe32plus_imports(self):
+        from antivirus.pe import parse_pe
+        from antivirus.samples import SUSPICIOUS_PE_DLLS, _MACHINE_64, build_sample_pe
+
+        info = parse_pe(build_sample_pe(SUSPICIOUS_PE_DLLS, machine=_MACHINE_64))
+        self.assertTrue(info.valid)
+        self.assertTrue(info.is_64)
+        self.assertEqual(len(info.api_set), 7)
+
+    def test_malformed_pe_never_crashes(self):
+        from antivirus.pe import parse_pe, pe_indicators
+
+        for blob in (b"", b"MZ", b"MZ" + b"\0" * 40, b"not a PE file at all" * 10):
+            info = parse_pe(blob)
+            self.assertFalse(info.valid)
+            self.assertEqual(pe_indicators(info), [])
+
+    def test_cli_pe_analyze_json(self):
+        import contextlib
+        import json as _json
+        from io import StringIO
+
+        from antivirus import cli
+        from antivirus.samples import build_suspicious_pe
+
+        base = Path(tempfile.mkdtemp(prefix="av-pe-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        p = base / "s.exe"
+        p.write_bytes(build_suspicious_pe())
+        buf = StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = cli.main(["pe", "analyze", str(p), "--json"])
+        self.assertEqual(rc, 1)  # findings present -> non-zero exit
+        payload = _json.loads(buf.getvalue())
+        self.assertTrue(payload["valid"])
+        self.assertIn("run_payload", payload["exports"])
+        self.assertTrue(payload["indicators"])
 
 
 class MiscTests(unittest.TestCase):

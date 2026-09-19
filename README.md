@@ -26,6 +26,13 @@ watches folders for new/changed files, and writes JSON + text reports.
   * *PE binaries* — import-table analysis (process-injection API sets,
     download+execute combinations, registry persistence, timestamp
     tampering) plus per-section entropy and packer section names
+- **PE "debug report"** — a static dissection of `.exe` / PE images, like a
+  debugger's module view (headers, characteristics, sections + entropy,
+  imports, exports, resources, relocations, TLS, debug directories, .NET
+  marker) with **debug-derived indicators**: ASLR/DEP disabled, stripped
+  relocations, missing entry point, missing debug info, TLS callbacks,
+  missing/obfuscated import table, huge `.rsrc`, and script/LOLBin markers
+  hidden in embedded resources
   * *ELF binaries* — high-entropy loadable segments
   * *File-system* — setuid/setgid executables
 - **Static heuristic** — Shannon-entropy check that flags large
@@ -93,13 +100,19 @@ python3 -m antivirus scan samples/          # -> detects eicar-test.txt
 python3 -m antivirus scan samples/ --action quarantine
 ```
 
-`samples/behavior/` contains inert scripts and a code-less PE that
-demonstrate the behavioural layer:
+`samples/behavior/` contains inert scripts and code-less PE images that
+demonstrate the behavioural layer and the PE debug report:
 
 ```bash
 python3 -m antivirus scan samples/behavior
 python3 -m antivirus behavior analyze samples/behavior/pipe-shell.sh
 python3 -m antivirus behavior analyze samples/behavior/suspicious.exe
+
+# full static "debug report" of a PE image (headers, sections, imports,
+# exports, resources, relocations, TLS, debug dirs + red flags)
+python3 -m antivirus pe analyze samples/behavior/suspicious.exe
+python3 -m antivirus pe analyze samples/behavior/packed-upx.exe
+python3 -m antivirus pe analyze samples/behavior/clean.exe   # -> no findings
 ```
 
 ## How detection works
@@ -118,10 +131,13 @@ For every regular file (symlinks, build dirs and VCS metadata are skipped):
 4. If the file *looks executable* (script extension, shebang, or PE/ELF
    magic), the **behavioural layer** analyses what it appears to do:
    Python sources are parsed with `ast` (never executed), shell/PowerShell/
-   batch scripts are checked against indicator regexes, PE import tables
-   are inspected for dangerous API combinations, and binaries are scanned
-   for reverse-shell / C2 byte markers. Files up to 2 MiB are analysed
-   (the content was already buffered during the single read pass).
+   batch scripts are checked against indicator regexes, PE images are fully
+   dissected (headers, sections, imports, exports, resources, relocations,
+   TLS, debug directories) and checked for dangerous API combinations and
+   debugger-style red flags, and binaries are scanned for reverse-shell /
+   C2 byte markers. Files up to 2 MiB are analysed (the content was already
+   buffered during the single read pass). Run
+   `pe analyze FILE` for the full human-readable "debug report".
 5. If still nothing matched, the **heuristic** verdict is made from the
    already-collected histogram: ≥ 7.5 bits/byte on files ≥ 256 KiB is
    reported as "may be packed or encrypted".
@@ -138,10 +154,14 @@ For every regular file (symlinks, build dirs and VCS metadata are skipped):
 | high | LOLBin downloaders: `certutil -urlcache`, `mshta http`, `bitsadmin` | Batch / binary IOC |
 | high | PE process-injection API set (VirtualAllocEx + WriteProcessMemory + CreateRemoteThread) | PE imports |
 | high | PE imports both download **and** execute APIs | PE imports |
+| high | script/LOLBin markers embedded in PE resources (VBScript, PowerShell, `cmd.exe`, `mshta`, …) | PE debug |
 | medium | persistence: cron / systemctl / shell rc / registry (`RegSetValue*`) | Shell / PE |
 | medium | crypto-mining pool endpoint `stratum+tcp://` | Shell / binary IOC |
 | medium | setuid executable | file-system |
 | medium | high-entropy PE section / packer section name (UPX0…) | PE sections |
+| medium | PE with ASLR off (no `DYNAMIC_BASE`) or DEP off (no `NX_COMPATIBLE`) | PE debug |
+| medium | PE with relocations stripped / no base-relocation table, no entry point | PE debug |
+| low | PE without debug information, with TLS callbacks, no import table, or huge `.rsrc` | PE debug |
 | low | `base64.b64decode`/`pickle.loads`/`CryptDecrypt` payload handling | Python / PE |
 
 Everything in `samples/behavior/` is **inert** demo material (the sample
@@ -193,6 +213,7 @@ original path, timestamp and reason recorded in `quarantine/manifest.json`.
 | `scan TARGET [--action detect\|quarantine\|delete] [--threads N] [--no-behavior] [--json]` | Scan a file or directory tree (`--threads`: auto, N, or 1) |
 | `monitor TARGET [--action ...] [--interval 2] [--no-behavior]` | Watch a directory, scan new/changed files |
 | `behavior analyze FILE [--json]` | Show what one file appears to do (static behavioural analysis) |
+| `pe analyze FILE [--json]` | Full static PE dissection ("debug report") + red-flag indicators |
 | `quarantine list` | Show everything that is quarantined |
 | `quarantine restore ID` | Restore a quarantined file (prefix ok) |
 | `quarantine purge ID` | Permanently delete a quarantined file |
@@ -214,8 +235,9 @@ antivirus/
 ├── config.py        # all tunables in one dataclass
 ├── models.py        # Finding dataclass + entropy helpers
 ├── behavior.py      # behavioural analysis (Python AST, shell/PS/batch,
-│                    #   PE/ELF structure, binary IOCs, SUID)
-├── samples.py       # builder for the inert demo samples (incl. fake PE)
+│                    #   ELF structure, binary IOCs, SUID)
+├── pe.py            # PE32/PE32+ dissection ("debug report") + indicators
+├── samples.py       # builder for the inert demo samples (incl. fake PEs)
 ├── scanner.py       # single-pass hashing, patterns, behaviour, heuristics
 ├── signatures.py    # JSON signature database (load/add/save)
 ├── quarantine.py    # quarantine store with manifest, restore, purge

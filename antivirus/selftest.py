@@ -159,6 +159,26 @@ def run_selftest() -> int:
                   for f in findings),
               str(sorted({f.name for f in findings})))
 
+        # -- PE debug report ---------------------------------------------------------
+        from .pe import parse_pe, pe_indicators
+        from .samples import build_packed_pe, build_suspicious_pe
+
+        pe_info = parse_pe(build_suspicious_pe())
+        pe_inds = {i.name for i in pe_indicators(pe_info)}
+        check("pe debug: suspicious .exe dissected (ASLR off, no relocs, embedded script)",
+              pe_info.valid
+              and "ASLR disabled" in pe_inds
+              and "No base relocations" in pe_inds
+              and any("Embedded in resources" in n for n in pe_inds),
+              str(sorted(pe_inds)))
+
+        packed = parse_pe(build_packed_pe())
+        packed_inds = {i.name for i in pe_indicators(packed)}
+        check("pe debug: packed .exe (UPX0 + RELOCS_STRIPPED) detected",
+              "Known packer section name" in packed_inds
+              and "RELOCS_STRIPPED" in packed_inds,
+              str(sorted(packed_inds)))
+
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
