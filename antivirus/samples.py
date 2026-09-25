@@ -312,3 +312,28 @@ def build_clean_pe() -> bytes:
         reloc_rva=0x1010,
         debug_dir=True,
     )
+
+
+#: The standard, harmless EICAR antivirus test string (not malware).
+EICAR_TEST_STRING = (
+    "X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"
+)
+
+
+def build_zip_sample() -> bytes:
+    """``sneaky.zip`` – an inert archive demonstrating the archive layer:
+
+    * ``eicar-test.txt`` – the harmless EICAR test string (signature hit
+      inside the archive, reported as ``sneaky.zip!eicar-test.txt``);
+    * ``notes.txt`` – benign text;
+    * ``../outside.txt`` – a zip-slip entry name (path traversal flag).
+    """
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("eicar-test.txt", EICAR_TEST_STRING)
+        zf.writestr("notes.txt", "Just some harmless notes.\n")
+        zf.writestr("../outside.txt", "I should never be written outside.\n")
+    return buf.getvalue()

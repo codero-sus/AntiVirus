@@ -48,6 +48,14 @@ def _build(args):
         config.max_file_size = args.max_size
     if getattr(args, "no_behavior", False):
         config.behavior_enabled = False
+    if getattr(args, "fast", False):
+        config.fast_mode = True
+    if getattr(args, "no_cache", False):
+        config.cache_enabled = False
+    if getattr(args, "no_archives", False):
+        config.archives_enabled = False
+    if getattr(args, "exclude", None):
+        config.exclude_patterns = tuple(args.exclude)
     config.resolve_paths(Path.cwd())
     db = SignatureDB(config.signatures_file)
     scanner = Scanner(config, db, threads=getattr(args, "threads", "auto"))
@@ -128,7 +136,8 @@ def _print_scan_summary(result: ScanResult, action: str, notes: dict,
     print(paint(f" AntiVirus {__version__}", BOLD)
           + f"  |  scan of {result.target}  |  action: {action}")
     print(paint(bar, BOLD))
-    print(f" Files scanned:  {result.files_scanned} ({human_size(result.bytes_scanned)})")
+    cached = f"  [{result.files_cached} from scan cache]" if result.files_cached else ""
+    print(f" Files scanned:  {result.files_scanned}{cached}  ({human_size(result.bytes_scanned)})")
     print(f" Skipped:        {result.files_skipped}")
     print(f" Errors:         {len(result.errors)}")
     print(f" Threads:        {workers} ({'parallel' if workers > 1 else 'sequential'})")
@@ -215,6 +224,15 @@ def cmd_sig(args) -> int:
             print(f" {s.id:<22} {sev} {kind:<14} {s.name}")
             if s.description:
                 print(f" {'':<22} {s.description}")
+        return 0
+    if args.saction == "remove":
+        try:
+            removed = db.remove(args.id)
+        except KeyError as exc:
+            print(paint(f"error: {exc.args[0]}", RED), file=sys.stderr)
+            return 2
+        print(paint(f"Removed signature {removed.id!r} from {config.signatures_file}",
+                    GREEN))
         return 0
     # action: add
     sig = Signature(
@@ -387,6 +405,16 @@ def build_parser() -> argparse.ArgumentParser:
                         "a number, or 1/0 for fully sequential")
     p.add_argument("--no-behavior", action="store_true",
                    help="disable behavioural analysis of executable-looking files")
+    p.add_argument("--fast", action="store_true",
+                   help="fast mode: hash + pattern layers only (no behaviour, "
+                        "no entropy) – for quick rescans")
+    p.add_argument("--no-cache", action="store_true",
+                   help="ignore the scan cache and re-read every file")
+    p.add_argument("--no-archives", action="store_true",
+                   help="do not inspect the contents of ZIP archives")
+    p.add_argument("--exclude", action="append", default=None, metavar="GLOB",
+                   help="skip files whose name or relative path matches GLOB "
+                        "(repeatable), e.g. --exclude '*.log'")
     p.add_argument("--json", action="store_true", help="machine readable output")
 
     p = sub.add_parser("monitor", help="watch a directory and scan new/changed files")
@@ -398,6 +426,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="poll interval in seconds (default 2)")
     p.add_argument("--no-behavior", action="store_true",
                    help="disable behavioural analysis of executable-looking files")
+    p.add_argument("--no-archives", action="store_true",
+                   help="do not inspect the contents of ZIP archives")
+    p.add_argument("--exclude", action="append", default=None, metavar="GLOB",
+                   help="skip files whose name or relative path matches GLOB "
+                        "(repeatable), e.g. --exclude '*.log'")
 
     p = sub.add_parser("quarantine", help="list, restore or purge quarantined files")
     _common_options(p)
@@ -412,6 +445,8 @@ def build_parser() -> argparse.ArgumentParser:
     _common_options(p)
     ssub = p.add_subparsers(dest="saction", required=True)
     ssub.add_parser("show", help="list signatures")
+    pr = ssub.add_parser("remove", help="remove a signature by id")
+    pr.add_argument("id", help="signature id to remove")
     pa = ssub.add_parser("add", help="add a signature")
     pa.add_argument("--id", required=True, help="unique signature id")
     pa.add_argument("--name", required=True, help="human readable name")

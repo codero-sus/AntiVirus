@@ -24,10 +24,14 @@ real malware.
   clean.exe            well-formed code-less PE: benign imports, ASLR +
                        DEP on, entry point, relocations, debug info
                        -> no findings
+  sneaky.zip           archive: harmless EICAR test string hidden inside
+                       (sneaky.zip!eicar-test.txt) + a zip-slip entry name
+                       (../outside.txt)             -> archive findings
 
 Try it:
 
   python3 -m antivirus scan samples/behavior
+  python3 -m antivirus scan samples/behavior --fast
   python3 -m antivirus behavior analyze samples/behavior/pipe-shell.sh
   python3 -m antivirus pe analyze samples/behavior/suspicious.exe
   python3 -m antivirus pe analyze samples/behavior/packed-upx.exe

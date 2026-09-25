@@ -179,6 +179,34 @@ def run_selftest() -> int:
               and "RELOCS_STRIPPED" in packed_inds,
               str(sorted(packed_inds)))
 
+        # -- scan cache --------------------------------------------------------
+        tree = workdir / "cache-tree"
+        tree.mkdir()
+        (tree / "a.txt").write_text("clean\n")
+        (tree / "b.txt").write_text("still clean\n")
+        scanner.config.cache_dir = workdir / ".av-cache"
+        first = scanner.scan_path(tree)
+        second = scanner.scan_path(tree)
+        check("scan cache: unchanged files served from cache on rescan",
+              first.files_cached == 0 and second.files_cached == 2
+              and second.files_scanned == 2,
+              f"first={first.files_cached} second={second.files_cached}")
+
+        # -- archive scanning --------------------------------------------------
+        from .samples import build_zip_sample
+
+        zipf = workdir / "sneaky.zip"
+        zipf.write_bytes(build_zip_sample())
+        findings = scanner.scan_file(zipf)
+        names = {f.name for f in findings}
+        check("archive: EICAR entry found inside ZIP",
+              any("sneaky.zip!eicar-test.txt" in f.path and
+                  f.kind == "signature-hash" for f in findings),
+              str(sorted(names)))
+        check("archive: zip-slip entry name flagged",
+              "Archive path traversal (zip slip)" in names,
+              str(sorted(names)))
+
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 

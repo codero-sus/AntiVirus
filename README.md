@@ -35,6 +35,22 @@ watches folders for new/changed files, and writes JSON + text reports.
   hidden in embedded resources
   * *ELF binaries* — high-entropy loadable segments
   * *File-system* — setuid/setgid executables
+- **Archive scanning** — ZIP contents are inspected *in memory* (never
+  extracted to disk): every entry runs through the same signature /
+  behaviour / entropy layers and is reported as
+  `archive.zip!entry.py`; the layer also flags zip-slip entry names
+  (`../x`), encrypted entries, entry caps and an expansion budget that
+  stops zip bombs
+- **Scan cache** — a full scan records each file's verdict
+  (size + mtime + engine profile) in `.av-cache`; the next scan of
+  unchanged files skips disk reads entirely, so rescans are ~20× faster
+  (`--no-cache` to force a full re-read)
+- **Fast mode** — `--fast` runs the hash + pattern layers only (no
+  behaviour analysis, no entropy): a quick rescan for when you mostly
+  care about known-bad files
+- **Exclude patterns** — `--exclude GLOB` (repeatable) skips files whose
+  name or relative path matches, e.g. `--exclude '*.log' --exclude
+  'build/*'`
 - **Static heuristic** — Shannon-entropy check that flags large
   packed/encrypted files
 - **Quarantine** — infected files are moved to a sandboxed directory with a
@@ -66,6 +82,11 @@ python3 -m antivirus selftest
 
 # 2. Scan a directory (detect only — nothing is changed)
 python3 -m antivirus scan .
+
+# 2b. Scan again — unchanged files are served from the scan cache (~20× faster)
+python3 -m antivirus scan .
+python3 -m antivirus scan . --fast          # quick rescan: hash + pattern only
+python3 -m antivirus scan . --exclude '*.log'
 
 # 3. Scan and quarantine threats
 python3 -m antivirus scan . --action quarantine
@@ -149,9 +170,21 @@ For every regular file (symlinks, build dirs and VCS metadata are skipped):
    C2 byte markers. Files up to 2 MiB are analysed (the content was already
    buffered during the single read pass). Run
    `pe analyze FILE` for the full human-readable "debug report".
-5. If still nothing matched, the **heuristic** verdict is made from the
+5. If the file is a **ZIP archive** (up to 32 MiB), each entry is read into
+   memory and run through the same layers — a hit is reported as
+   `archive.zip!entry`; suspicious entry names (zip slip), encrypted
+   entries and total expansion beyond the 64 MiB budget are flagged.
+   Nothing is ever extracted to disk.
+6. If still nothing matched, the **heuristic** verdict is made from the
    already-collected histogram: ≥ 7.5 bits/byte on files ≥ 256 KiB is
    reported as "may be packed or encrypted".
+
+   **Scan cache:** before any of the above, a file whose size *and* mtime
+   are unchanged since the last scan (and whose engine profile – signature
+   DB version, behaviour/entropy/archive settings – is the same) reuses
+   its cached verdict without being read at all. The cache lives in
+   `.av-cache` (JSON, atomically written) and is bypassed with
+   `--no-cache`; `--fast` runs layers 1–2 only.
 
 ### Behavioural indicators (selection)
 
@@ -170,6 +203,9 @@ For every regular file (symlinks, build dirs and VCS metadata are skipped):
 | medium | crypto-mining pool endpoint `stratum+tcp://` | Shell / binary IOC |
 | medium | setuid executable | file-system |
 | medium | high-entropy PE section / packer section name (UPX0…) | PE sections |
+| medium | zip-slip entry name (`../x`, absolute) in a ZIP | archives |
+| medium | ZIP total expansion beyond the analysis budget (zip bomb) | archives |
+| low | password-protected ZIP entry | archives |
 | medium | PE with ASLR off (no `DYNAMIC_BASE`) or DEP off (no `NX_COMPATIBLE`) | PE debug |
 | medium | PE with relocations stripped / no base-relocation table, no entry point | PE debug |
 | low | PE without debug information, with TLS callbacks, no import table, or huge `.rsrc` | PE debug |
@@ -213,6 +249,20 @@ Measured on a 2 500-file / 266 MiB tree (2-core box, warm page cache):
 findings list, so the first threat silently disabled heuristics for every
 later file in a directory scan. Fixed in v1.1.
 
+**Scan cache (v1.5)** — measured on a fresh 1 202-file / 79 MiB tree
+(2-core box, Python 3.11):
+
+| Scan | Wall time | Files | Verdicts |
+| --- | --- | --- | --- |
+| cold full scan (builds the cache) | 4.16 s | 1 202 | 240 |
+| **warm rescan (cache hit on every file)** | **0.18 s** | 1 202 (1 202 from cache) | 240 |
+| cold `--fast` (hash + pattern only) | 3.04 s | 1 202 | 1 |
+
+A warm rescan is a **~23× speedup** with identical verdicts: unchanged
+files are never read from disk (size + mtime + engine-profile check), and
+the cache is automatically invalidated when a file changes or the
+signature database / engine settings differ.
+
 Quarantine keeps the file under an id like
 `275a021bbfb6-20260918-120000-a1b2c3` inside `quarantine/files/`, with the
 original path, timestamp and reason recorded in `quarantine/manifest.json`.
@@ -221,8 +271,8 @@ original path, timestamp and reason recorded in `quarantine/manifest.json`.
 
 | Command | Description |
 | --- | --- |
-| `scan TARGET [--action detect\|quarantine\|delete] [--threads N] [--no-behavior] [--json]` | Scan a file or directory tree (`--threads`: auto, N, or 1) |
-| `monitor TARGET [--action ...] [--interval 2] [--no-behavior]` | Watch a directory, scan new/changed files |
+| `scan TARGET [--action detect\|quarantine\|delete] [--threads N] [--no-behavior] [--fast] [--no-cache] [--no-archives] [--exclude GLOB] [--json]` | Scan a file or directory tree (`--threads`: auto, N, or 1; `--fast`: hash+pattern only; `--exclude` repeatable) |
+| `monitor TARGET [--action ...] [--interval 2] [--no-behavior] [--no-archives] [--exclude GLOB]` | Watch a directory, scan new/changed files |
 | `behavior analyze FILE [--json]` | Show what one file appears to do (static behavioural analysis) |
 | `pe analyze FILE [--json]` | Full static PE dissection ("debug report") + red-flag indicators |
 | `gui` | Open the graphical user interface (Tkinter) |
@@ -231,6 +281,7 @@ original path, timestamp and reason recorded in `quarantine/manifest.json`.
 | `quarantine purge ID` | Permanently delete a quarantined file |
 | `sig show` | List signatures in the database |
 | `sig add --id … --name … [--sha256/--md5/--pattern …]` | Add a signature |
+| `sig remove ID` | Remove a signature from the database |
 | `selftest` | Run the built-in end-to-end self test |
 | `report list` / `report show [FILE]` | Inspect saved reports |
 
@@ -247,6 +298,7 @@ antivirus/
 ├── gui.py           # Tkinter graphical interface (python3 -m antivirus gui)
 ├── config.py        # all tunables in one dataclass
 ├── models.py        # Finding dataclass + entropy helpers
+├── cache.py         # scan cache (fast rescans of unchanged files)
 ├── behavior.py      # behavioural analysis (Python AST, shell/PS/batch,
 │                    #   ELF structure, binary IOCs, SUID)
 ├── pe.py            # PE32/PE32+ dissection ("debug report") + indicators

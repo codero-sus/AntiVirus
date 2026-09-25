@@ -87,6 +87,19 @@ class SignatureDB:
         return list(self.signatures)
 
     # ---------------------------------------------------------------- mutate
+    def remove(self, sig_id: str, save: bool = True) -> Signature:
+        """Remove the signature with *sig_id* (case-insensitive); returns it."""
+        lowered = sig_id.lower()
+        for i, sig in enumerate(self.signatures):
+            if sig.id.lower() == lowered:
+                removed = self.signatures.pop(i)
+                self._reindex()
+                self.version += 1
+                if save:
+                    self.save()
+                return removed
+        raise KeyError(f"no signature with id {sig_id!r}")
+
     def add(self, signature: Signature, save: bool = True) -> None:
         if signature.severity not in VALID_SEVERITIES:
             raise ValueError(f"severity must be one of {VALID_SEVERITIES}")
