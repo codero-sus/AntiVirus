@@ -63,6 +63,10 @@ class Config:
     # name and its path relative to the scan root.
     exclude_patterns: tuple = ()
 
+    # Incremental scan cutoff: files with mtime < since_ts are skipped
+    # (and counted as skipped). 0.0 = no cutoff.
+    since_ts: float = 0.0
+
     @property
     def exclude_dir_set(self) -> set:
         return set(self.exclude_dirs)

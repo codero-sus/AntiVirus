@@ -92,7 +92,8 @@ class DirectoryWatcher:
         def _record(p: Path, st) -> None:
             state[str(p)] = (st.st_mtime, st.st_size)
 
-        for _ in walk_files(root, config.exclude_dirs, protected, on_file=_record):
+        for _ in walk_files(root, config.exclude_dirs, protected,
+                            on_file=_record, min_mtime=config.since_ts):
             pass
         return state
 

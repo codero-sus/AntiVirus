@@ -759,5 +759,317 @@ class MiscTests(unittest.TestCase):
         self.assertIn("CLEAN", text)
 
 
+class ElfTests(unittest.TestCase):
+    """v1.6: ELF import-table analysis (mirror of the PE layer)."""
+
+    def setUp(self):
+        base = Path(tempfile.mkdtemp(prefix="av-elf-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        self.base = base
+
+    def test_suspicious_elf_import_indicators(self):
+        from antivirus.behavior import analyze_file
+        from antivirus.samples import build_suspicious_elf
+
+        blob = build_suspicious_elf()
+        p = self.base / "susp.elf"
+        p.write_bytes(blob)
+        findings = analyze_file(p, p.lstat(), blob)
+        elf = [f for f in findings if f.name.startswith("ELF imports")]
+        self.assertTrue(elf)
+        self.assertIn("high", [f.severity for f in elf])
+
+    def test_clean_elf_has_no_import_indicators(self):
+        from antivirus.behavior import analyze_file
+        from antivirus.samples import build_clean_elf
+
+        blob = build_clean_elf()
+        p = self.base / "clean.elf"
+        p.write_bytes(blob)
+        findings = analyze_file(p, p.lstat(), blob)
+        self.assertEqual([f for f in findings if f.name.startswith("ELF imports")], [])
+
+    def test_elf32_and_elf64_symbols(self):
+        from antivirus.behavior import elf_imports
+        from antivirus.samples import (
+            SUSPICIOUS_ELF_SYMBOLS,
+            build_clean_elf,
+            build_sample_elf,
+        )
+
+        self.assertEqual(elf_imports(build_sample_elf(SUSPICIOUS_ELF_SYMBOLS)),
+                         set(SUSPICIOUS_ELF_SYMBOLS))
+        self.assertEqual(elf_imports(build_sample_elf(SUSPICIOUS_ELF_SYMBOLS,
+                                                      elf64=True, machine=0x3E)),
+                         set(SUSPICIOUS_ELF_SYMBOLS))
+        clean = elf_imports(build_clean_elf())
+        self.assertEqual(clean, {"printf", "exit", "write", "malloc", "strlen"})
+
+    def test_elf_imports_never_crashes_on_garbage(self):
+        from antivirus.behavior import elf_imports
+
+        self.assertEqual(elf_imports(b""), set())
+        self.assertEqual(elf_imports(b"\x7fELF" + os.urandom(200)), set())
+        self.assertEqual(elf_imports(b"\x7fELF" * 10), set())
+
+
+class TarArchiveTests(unittest.TestCase):
+    """v1.6: TAR / GZIP contents analysed in memory (tar-slip detection)."""
+
+    def setUp(self):
+        base = Path(tempfile.mkdtemp(prefix="av-tar-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        self.base = base
+        self.app = App(base)
+        self.app.scanner.config.cache_enabled = False
+
+    def _scan(self, blob: bytes, name: str):
+        p = self.base / name
+        p.write_bytes(blob)
+        return self.app.scanner.scan_path(p)
+
+    def test_tar_gzip_members_scanned(self):
+        from antivirus.samples import build_tar_sample
+
+        result = self._scan(build_tar_sample(), "sneaky.tar.gz")
+        self.assertTrue(any(f.kind == "signature-hash" and
+                            f.path.endswith("sneaky.tar.gz!eicar-test.txt")
+                            for f in result.findings))
+        self.assertTrue(any(f.name == "Archive path traversal (tar slip)"
+                            for f in result.findings))
+
+    def test_benign_tar_is_clean(self):
+        import io
+        import tarfile
+
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w") as tf:
+            tf.addfile(tarfile.TarInfo("notes.txt"),
+                       io.BytesIO(b"all good\n"))
+        result = self._scan(buf.getvalue(), "benign.tar")
+        self.assertEqual(result.findings, [])
+
+    def test_gzip_plain_payload(self):
+        import gzip
+
+        p = self.base / "blob.gz"
+        p.write_bytes(gzip.compress(EICAR))
+        result = self.app.scanner.scan_path(p)
+        self.assertTrue(any(f.kind == "signature-hash" and
+                            f.path.endswith("blob.gz!member")
+                            for f in result.findings))
+
+    def test_tar_entry_cap(self):
+        import io
+        import tarfile
+
+        self.app.scanner.config.archive_entries_max = 16
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w") as tf:
+            for i in range(40):
+                ti = tarfile.TarInfo(f"f{i:03d}.txt")
+                data = b"x" * 8
+                ti.size = len(data)
+                tf.addfile(ti, io.BytesIO(data))
+        result = self._scan(buf.getvalue(), "many.tar")
+        self.assertTrue(any(f.name == "Archive entry limit exceeded"
+                            for f in result.findings))
+
+    def test_corrupt_gzip_never_crashes(self):
+        import gzip
+
+        full = gzip.compress(b"payload " * 50)
+        p = self.base / "bad.gz"
+        p.write_bytes(full[: len(full) // 2])  # truncated stream
+        result = self.app.scanner.scan_path(p)
+        self.assertEqual(result.findings, [])
+
+
+class SinceTests(unittest.TestCase):
+    """v1.6: --since incremental scan (mtime cutoff in walk_files)."""
+
+    def test_since_skips_older_files(self):
+        base = Path(tempfile.mkdtemp(prefix="av-since-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        app = App(base)
+        app.scanner.config.cache_enabled = False
+
+        d = base / "files"
+        d.mkdir()
+        (d / "old.txt").write_text("old")
+        (d / "new.txt").write_text("new")
+        old = time.time() - 3600
+        os.utime(d / "old.txt", (old, old))
+
+        app.scanner.config.since_ts = time.time() - 600
+        result = app.scanner.scan_path(d)
+        self.assertEqual(result.files_scanned, 1)
+        self.assertEqual(result.files_skipped, 1)
+
+    def test_since_not_set_scans_everything(self):
+        base = Path(tempfile.mkdtemp(prefix="av-since0-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        app = App(base)
+        app.scanner.config.cache_enabled = False
+        d = base / "files"
+        d.mkdir()
+        for i in range(3):
+            (d / f"f{i}.txt").write_text("x")
+        result = app.scanner.scan_path(d)
+        self.assertEqual(result.files_scanned, 3)
+        self.assertEqual(result.files_skipped, 0)
+
+
+class HashCommandTests(unittest.TestCase):
+    """v1.6: `antivirus hash` prints sha256/md5/sha1."""
+
+    def test_hash_cli_output(self):
+        import hashlib
+
+        from antivirus.cli import main
+
+        base = Path(tempfile.mkdtemp(prefix="av-hash-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        f = base / "f.bin"
+        blob = os.urandom(64)
+        f.write_bytes(blob)
+
+        old_cwd = os.getcwd()
+        os.chdir(base)
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = main(["hash", str(f)])
+        finally:
+            os.chdir(old_cwd)
+        out = buf.getvalue()
+        self.assertEqual(rc, 0)
+        self.assertIn(hashlib.sha256(blob).hexdigest(), out)
+        self.assertIn(hashlib.md5(blob).hexdigest(), out)
+        self.assertIn(hashlib.sha1(blob).hexdigest(), out)
+
+    def test_hash_cli_json(self):
+        import hashlib
+
+        from antivirus.cli import main
+
+        base = Path(tempfile.mkdtemp(prefix="av-hashj-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        f = base / "f.bin"
+        blob = os.urandom(64)
+        f.write_bytes(blob)
+
+        old_cwd = os.getcwd()
+        os.chdir(base)
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = main(["hash", str(f), "--json"])
+        finally:
+            os.chdir(old_cwd)
+        self.assertEqual(rc, 0)
+        data = json.loads(buf.getvalue())
+        self.assertEqual(data[0]["sha256"], hashlib.sha256(blob).hexdigest())
+        self.assertEqual(data[0]["size"], len(blob))
+
+
+class ReportDiffTests(unittest.TestCase):
+    """v1.6: `report diff` shows what is new / what was cleared."""
+
+    def _write_report(self, d: Path, findings) -> Path:
+        d.mkdir(parents=True, exist_ok=True)
+        p = d / f"scan-{int(time.time() * 1000)}.json"
+        p.write_text(json.dumps({"target": "x", "clean": not findings,
+                                 "findings": findings}))
+        return p
+
+    def test_diff_reports_pure_function(self):
+        from antivirus.report import diff_reports
+
+        a = {"path": "a", "name": "A", "severity": "high"}
+        b = {"path": "b", "name": "B", "severity": "medium"}
+        diff = diff_reports({"findings": [a]}, {"findings": [a, b]})
+        self.assertEqual(diff["new"], [b])
+        self.assertEqual(diff["cleared"], [])
+        self.assertEqual(diff["unchanged"], [a])
+        diff = diff_reports({"findings": [a, b]}, {"findings": [b]})
+        self.assertEqual(diff["new"], [])
+        self.assertEqual(diff["cleared"], [a])
+
+    def test_report_diff_cli(self):
+        from antivirus.cli import main
+
+        base = Path(tempfile.mkdtemp(prefix="av-diff-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        rep = base / "reports"
+        old_f = {"path": "x", "name": "OldSig", "severity": "high"}
+        new_f = {"path": "y", "name": "NewSig", "severity": "medium"}
+        old = self._write_report(rep, [old_f])
+        time.sleep(0.01)
+        new = self._write_report(rep, [new_f])
+
+        old_cwd = os.getcwd()
+        os.chdir(base)
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = main(["report", "diff", "--report-dir", str(rep),
+                           str(old), str(new)])
+        finally:
+            os.chdir(old_cwd)
+        out = buf.getvalue()
+        self.assertEqual(rc, 1)  # new threats exist
+        self.assertIn("NewSig", out)
+        self.assertIn("OldSig", out)  # in the cleared section
+
+
+class SigImportExportTests(unittest.TestCase):
+    """v1.6: `sig export` / `sig import` move databases between files."""
+
+    def test_roundtrip_and_duplicate_skip(self):
+        from antivirus.cli import main
+
+        base = Path(tempfile.mkdtemp(prefix="av-sigio-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        db1 = base / "db1.json"
+        db2 = base / "db2.json"
+        export = base / "out.json"
+        db1.write_text(json.dumps({"signatures": []}) + "\n")
+        shutil.copyfile(BUNDLED_DB, db2)  # db2 starts with the bundled EICAR sig
+
+        old_cwd = os.getcwd()
+        os.chdir(base)
+        try:
+            def run(*argv):
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = main(list(argv))
+                return rc, buf.getvalue()
+
+            rc, _ = run("sig", "--signatures", str(db1), "add",
+                        "--id", "T-1", "--name", "One", "--pattern", "alpha")
+            self.assertEqual(rc, 0)
+            rc, out = run("sig", "--signatures", str(db1), "export", str(export))
+            self.assertEqual(rc, 0)
+            self.assertTrue(export.exists())
+            data = json.loads(export.read_text())
+            self.assertEqual(len(data["signatures"]), 1)
+
+            # db2 starts as a copy of the bundled DB (the App fixture does
+            # that); import must add T-1 and skip it on the second pass.
+            rc, out = run("sig", "--signatures", str(db2), "import", str(export))
+            self.assertEqual(rc, 0)
+            self.assertIn("Imported 1", out)
+            rc, out = run("sig", "--signatures", str(db2), "import", str(export))
+            self.assertEqual(rc, 0)
+            self.assertIn("1 already present", out)
+
+            rc, out = run("sig", "--signatures", str(db2), "show")
+            self.assertEqual(rc, 0)
+            self.assertIn("T-1", out)
+        finally:
+            os.chdir(old_cwd)
+
+
 if __name__ == "__main__":
     unittest.main()

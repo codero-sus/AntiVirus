@@ -207,6 +207,32 @@ def run_selftest() -> int:
               "Archive path traversal (zip slip)" in names,
               str(sorted(names)))
 
+        # -- ELF import analysis (v1.6) --------------------------------------
+        from .samples import build_suspicious_elf
+
+        elf = workdir / "suspicious.elf"
+        elf.write_bytes(build_suspicious_elf())
+        findings = scanner.scan_file(elf)
+        check("elf: suspicious import table detected (system/execve/popen)",
+              any(f.kind == "behavior" and f.name.startswith("ELF imports")
+                  and f.severity == "high" for f in findings),
+              str(sorted({f.name for f in findings})))
+
+        # -- tar / gzip archive scanning (v1.6) ------------------------------
+        from .samples import build_tar_sample
+
+        tgz = workdir / "sneaky.tar.gz"
+        tgz.write_bytes(build_tar_sample())
+        findings = scanner.scan_file(tgz)
+        names = {f.name for f in findings}
+        check("archive: EICAR entry found inside TAR.GZ",
+              any("sneaky.tar.gz!eicar-test.txt" in f.path and
+                  f.kind == "signature-hash" for f in findings),
+              str(sorted(names)))
+        check("archive: tar-slip entry name flagged",
+              "Archive path traversal (tar slip)" in names,
+              str(sorted(names)))
+
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 

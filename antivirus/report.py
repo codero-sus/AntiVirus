@@ -81,3 +81,28 @@ class ReportWriter:
     def latest(self) -> Optional[Path]:
         files = sorted(self.report_dir.glob("scan-*.json"))
         return files[-1] if files else None
+
+    def all_reports(self) -> List[Path]:
+        """All saved reports, oldest first (sorted by mtime)."""
+        files = sorted(self.report_dir.glob("scan-*.json"),
+                       key=lambda f: f.stat().st_mtime)
+        return files
+
+
+def diff_reports(old: Dict, new: Dict) -> Dict[str, List[Dict]]:
+    """Compare two saved scan-report documents (JSON dicts).
+
+    Findings are keyed by ``(path, name, severity)``. Returns
+    ``{"new": [...], "cleared": [...], "unchanged": [...]}`` where *new*
+    are findings only present in *new* and *cleared* only in *old*.
+    """
+    def _key(f: Dict):
+        return (f.get("path"), f.get("name"), f.get("severity"))
+
+    old_map = {_key(f): f for f in old.get("findings", [])}
+    new_map = {_key(f): f for f in new.get("findings", [])}
+    return {
+        "new": [new_map[k] for k in new_map if k not in old_map],
+        "cleared": [old_map[k] for k in old_map if k not in new_map],
+        "unchanged": [new_map[k] for k in new_map if k in old_map],
+    }

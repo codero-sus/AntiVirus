@@ -320,6 +320,149 @@ def analyze_elf(data: bytes) -> List[Indicator]:
                     ))
     except (struct.error, IndexError):
         pass
+    out.extend(elf_import_indicators(data))
+    return out
+
+
+# ELF import-table analysis (the mirror of the PE import rules): which
+# foreign symbols does the binary ask the dynamic linker to resolve?
+_ELF_DANGEROUS_API_RULES: List[Tuple[set, int, str, str]] = [
+    (
+        {"system", "execve", "execv", "execvp", "popen", "popen2"},
+        2, "high",
+        "ELF process-execution API set (system/execve/popen)",
+    ),
+    (
+        {"dlopen", "dlsym", "dlclose", "dlopen64"},
+        2, "medium",
+        "ELF dynamic library loading APIs (dlopen/dlsym)",
+    ),
+    (
+        {"socket", "connect", "send", "recv", "bind", "listen", "accept"},
+        3, "medium",
+        "ELF raw network socket APIs",
+    ),
+    (
+        {"ptrace"},
+        1, "medium",
+        "ELF ptrace import (debugging / anti-analysis)",
+    ),
+    (
+        {"chroot", "chdir", "unlink", "unlinkat", "rename"},
+        3, "low",
+        "ELF file-system manipulation APIs",
+    ),
+]
+
+
+def elf_imports(data: bytes) -> set:
+    """Imported (undefined) dynamic symbols of an ELF file, or empty set."""
+    symbols: set = set()
+    try:
+        if len(data) < 0x40 or data[:4] != b"\x7fELF":
+            return symbols
+        is64 = data[4] == 2
+        endian = ">" if data[5] == 2 else "<"
+        if is64:
+            e_shoff = struct.unpack_from(endian + "Q", data, 0x28)[0]
+            e_shentsize, e_shnum, e_shstrndx = struct.unpack_from(
+                endian + "HHH", data, 0x3A)
+            # ELF64_Shdr field offsets (64 bytes; 6 pad bytes after sh_flags)
+            F_OFF, F_SIZE, F_ENT = 24, 32, 56
+            sym_size = 24
+            # Elf64_Sym: name(I)@0 info(B)@4 other(B)@5 shndx(H)@6 value(Q)@8
+            sym_name_f, sym_name_off = "I", 0
+            sym_shndx_off = 6
+        else:
+            e_shoff = struct.unpack_from(endian + "I", data, 0x20)[0]
+            e_shentsize, e_shnum, e_shstrndx = struct.unpack_from(
+                endian + "HHH", data, 0x2E)
+            F_OFF, F_SIZE, F_ENT = 16, 20, 36
+            sym_size = 16
+            sym_name_f, sym_name_off = "I", 0
+            sym_shndx_off = 14  # st_shndx (st_info/st_other are @12/@13)
+        if e_shoff == 0 or e_shentsize == 0 or e_shnum > 512:
+            return symbols
+
+        def sec(i: int) -> Optional[int]:
+            base = e_shoff + i * e_shentsize
+            if base + e_shentsize > len(data):
+                return None
+            return base
+
+        def field(base: int, fmt: str, off: int) -> int:
+            return struct.unpack_from(endian + fmt, data, base + off)[0]
+
+        shstr_base = sec(e_shstrndx)
+        if shstr_base is None:
+            return symbols
+        shstr_sec_off = field(shstr_base, "Q" if is64 else "I", F_OFF)
+        shstr_sec_size = field(shstr_base, "Q" if is64 else "I", F_SIZE)
+        shstrtab = data[shstr_sec_off:shstr_sec_off + shstr_sec_size] \
+            if shstr_sec_off < len(data) else b""
+
+        def sec_name(i: int) -> str:
+            base = sec(i)
+            if base is None:
+                return ""
+            n = field(base, "I", 0)
+            if n >= len(shstrtab):
+                return ""
+            end = shstrtab.find(b"\0", n)
+            return shstrtab[n:end if end != -1 else len(shstrtab)].decode(
+                "ascii", "replace")
+
+        dynsym_i = dynstr_i = None
+        for i in range(e_shnum):
+            nm = sec_name(i)
+            if nm == ".dynsym":
+                dynsym_i = i
+            elif nm == ".dynstr":
+                dynstr_i = i
+        if dynsym_i is None or dynstr_i is None:
+            return symbols
+
+        ds_base = sec(dynsym_i)
+        dt_base = sec(dynstr_i)
+        if ds_base is None or dt_base is None:
+            return symbols
+        dynstr_off = field(dt_base, "Q" if is64 else "I", F_OFF)
+        dynstr_size = field(dt_base, "Q" if is64 else "I", F_SIZE)
+        dynsym_off = field(ds_base, "Q" if is64 else "I", F_OFF)
+        dynsym_size = field(ds_base, "Q" if is64 else "I", F_SIZE)
+        n_syms = min(dynsym_size // sym_size, 8192)
+        for j in range(n_syms):
+            b = dynsym_off + j * sym_size
+            if b + sym_size > len(data):
+                break
+            st_name = field(b, sym_name_f, sym_name_off)
+            st_shndx = field(b, "H", sym_shndx_off)
+            if st_name == 0 or st_name >= dynstr_size or st_shndx != 0:
+                continue  # not an imported (SHN_UNDEF) symbol
+            end = data.find(b"\0", dynstr_off + st_name)
+            sym = data[dynstr_off + st_name:
+                       end if end != -1 else dynstr_off + dynstr_size].decode(
+                           "ascii", "replace")
+            if sym:
+                symbols.add(sym)
+    except (struct.error, IndexError):
+        pass
+    return symbols
+
+
+def elf_import_indicators(data: bytes) -> List[Indicator]:
+    """Red flags derived from an ELF import table (like the PE layer)."""
+    symbols = elf_imports(data)
+    if not symbols:
+        return []
+    out: List[Indicator] = []
+    for api_set, minimum, sev, msg in _ELF_DANGEROUS_API_RULES:
+        hit = api_set & symbols
+        if len(hit) >= minimum:
+            out.append(Indicator(
+                f"ELF imports: {msg}", sev,
+                "imports " + ", ".join(sorted(hit)),
+            ))
     return out
 
 

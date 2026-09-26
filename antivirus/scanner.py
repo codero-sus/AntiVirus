@@ -24,12 +24,16 @@ Efficiency notes
 from __future__ import annotations
 
 import fnmatch
+import gzip
 import hashlib
+import io
 import os
 import re
 import stat
+import tarfile
 import time
 import zipfile
+import zlib
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -117,6 +121,7 @@ def walk_files(
     on_skip: Optional[LogFn] = None,
     on_file: Optional[Callable[[Path, os.stat_result], None]] = None,
     exclude_patterns: Tuple[str, ...] = (),
+    min_mtime: float = 0.0,
 ) -> Iterator[Path]:
     """Walk *root* with ``os.scandir``, yielding regular files deterministically.
 
@@ -125,7 +130,8 @@ def walk_files(
     files; ``on_file(path, lstat_result)`` hands the caller the already
     fetched stat so it never has to stat the file again.
     ``exclude_patterns`` are fnmatch globs matched against the file name and
-    the path relative to *root*.
+    the path relative to *root*. ``min_mtime`` (a *--since* cutoff, unix
+    time) skips files not modified since then.
     """
     exclude = set(exclude_dirs)
     patterns = [p for p in exclude_patterns if p]
@@ -183,6 +189,8 @@ def walk_files(
                     _skip(Path(entry.path), "protected")
                 elif _excluded(Path(entry.path)):
                     _skip(Path(entry.path), "excluded by pattern")
+                elif min_mtime and st.st_mtime < min_mtime:
+                    _skip(Path(entry.path), "older than --since")
                 else:
                     files.append((Path(entry.path), st))
             else:
@@ -246,7 +254,8 @@ class Scanner:
 
             for _ in walk_files(path, self.config.exclude_dirs, protected,
                                 on_skip=_skipped, on_file=_record,
-                                exclude_patterns=self.config.exclude_patterns):
+                                exclude_patterns=self.config.exclude_patterns,
+                                min_mtime=self.config.since_ts):
                 pass
         else:
             result.errors.append(f"{path}: not a regular file or directory")
@@ -478,14 +487,14 @@ class Scanner:
         ):
             local.extend(behavior_analyze_file(path, st, content))
 
-        # Layer 2.75 – archive contents (ZIP entries, analysed in memory).
+        # Layer 2.75 – archive contents (ZIP / TAR / GZIP, in memory only).
         if (
             self.config.archives_enabled
             and size <= self.config.archive_max_size
         ):
-            head = content[:4] if content is not None else self._peek_bytes(path, 4)
-            if head == b"PK\x03\x04":
-                local.extend(self._scan_zip(path, size))
+            head = content[:262] if content is not None else \
+                self._peek_bytes(path, 262)
+            local.extend(self._scan_archives(path, head))
 
         # Layer 3 – heuristics (only if this file has no definite hit yet).
         if (
@@ -582,7 +591,17 @@ class Scanner:
         return local
 
     # --------------------------------------------------------------- archives
-    def _scan_zip(self, path: Path, size: int) -> List[Finding]:
+    def _scan_archives(self, path: Path, head: bytes) -> List[Finding]:
+        """Format dispatch for the archive layer."""
+        if head[:4] == b"PK\x03\x04":
+            return self._scan_zip(path)
+        if head[:2] == b"\x1f\x8b":
+            return self._scan_gzip(path)
+        if len(head) >= 262 and head[257:262] == b"ustar":
+            return self._scan_tar(path)
+        return []
+
+    def _scan_zip(self, path: Path) -> List[Finding]:
         """Examine the entries of a ZIP archive (in memory, never extracted).
 
         Guards against the usual archive tricks: absolute/".." entry names
@@ -644,6 +663,94 @@ class Scanner:
                     continue
                 entries_read += len(data)
                 out.extend(self.scan_buffer(label, data))
+        return out
+
+    def _tar_member_flags(self, name: str) -> Optional[str]:
+        if name.startswith(("/", "\\")) or ".." in Path(name).parts:
+            return "Archive path traversal (tar slip)"
+        return None
+
+    def _scan_tar_members(self, tf: "tarfile.TarFile", base: str) -> List[Finding]:
+        """Shared member loop for file- and byte-backed tar archives."""
+        cfg = self.config
+        out: List[Finding] = []
+        entries_read = 0
+        for i, member in enumerate(tf.getmembers()):
+            if i >= cfg.archive_entries_max:
+                out.append(Finding(
+                    path=base, kind="archive",
+                    name="Archive entry limit exceeded", severity="medium",
+                    message=f"more than {cfg.archive_entries_max} entries",
+                ))
+                break
+            if not member.isfile():
+                continue
+            slip = self._tar_member_flags(member.name)
+            if slip is not None:
+                out.append(Finding(
+                    path=base, kind="archive", name=slip, severity="medium",
+                    message=f"entry {member.name!r} escapes the archive root",
+                ))
+                continue
+            if entries_read > cfg.archive_expansion_max:
+                out.append(Finding(
+                    path=base, kind="archive",
+                    name="Archive expansion limit exceeded", severity="medium",
+                    message="total entry size exceeds the analysis budget",
+                ))
+                break
+            try:
+                fh = tf.extractfile(member)
+                if fh is None:
+                    continue
+                want = cfg.archive_entry_max
+                if 0 <= member.size < want:
+                    want = member.size
+                data = fh.read(want)
+            except (tarfile.TarError, OSError, ValueError):
+                continue
+            if not data:
+                continue
+            entries_read += len(data)
+            out.extend(self.scan_buffer(f"{base}!{member.name}", data))
+        return out
+
+    def _scan_tar(self, path: Path) -> List[Finding]:
+        try:
+            tf = tarfile.open(str(path))
+        except (tarfile.TarError, OSError, ValueError):
+            return []
+        with tf:
+            return self._scan_tar_members(tf, str(path))
+
+    def _scan_tar_bytes(self, tar_bytes: bytes, base: str) -> List[Finding]:
+        try:
+            tf = tarfile.open(fileobj=io.BytesIO(tar_bytes))
+        except (tarfile.TarError, OSError, ValueError):
+            return []
+        with tf:
+            return self._scan_tar_members(tf, base)
+
+    def _scan_gzip(self, path: Path) -> List[Finding]:
+        """Scan a gzip stream: tar member(s), or the decompressed payload."""
+        cfg = self.config
+        out: List[Finding] = []
+        try:
+            with open(path, "rb") as fh:
+                inner = gzip.decompress(fh.read(cfg.archive_max_size))
+        except (OSError, EOFError, zlib.error):
+            return out
+        if len(inner) > cfg.archive_expansion_max:
+            out.append(Finding(
+                path=str(path), kind="archive",
+                name="Archive expansion limit exceeded", severity="medium",
+                message="decompressed content exceeds the analysis budget",
+            ))
+            return out
+        if len(inner) >= 262 and inner[257:262] == b"ustar":
+            return self._scan_tar_bytes(inner, str(path))
+        out.extend(self.scan_buffer(f"{path}!member",
+                                    inner[: cfg.archive_entry_max]))
         return out
 
     def _stream_file(self, path: Path, size: int):

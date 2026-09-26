@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import shutil
 import sys
@@ -23,7 +24,7 @@ from .pe import (
 )
 from .output import BOLD, CYAN, GREEN, RED, SEVERITY_COLOR, YELLOW, paint
 from .quarantine import Quarantine
-from .report import ReportWriter, render_report
+from .report import ReportWriter, diff_reports, render_report
 from .scanner import ScanResult, Scanner
 from .selftest import run_selftest
 from .signatures import Signature, SignatureDB, VALID_SEVERITIES
@@ -32,17 +33,42 @@ from .utils import human_size
 BUNDLED_SIGNATURES = Path(__file__).resolve().parent.parent / "data" / "signatures.json"
 
 
+def parse_since(text: str) -> float:
+    """Parse a *--since* duration (``30s``, ``30m``, ``2h``, ``1d``, ``1w``
+    or a bare number of seconds) into seconds. Raises ArgumentTypeError."""
+    t = text.strip().lower()
+    if not t:
+        raise argparse.ArgumentTypeError("--since needs a duration")
+    unit = t[-1]
+    units = {"s": 1.0, "m": 60.0, "h": 3600.0, "d": 86400.0, "w": 604800.0}
+    value = t[:-1] if unit in units else t
+    try:
+        seconds = float(value) * units.get(unit, 1.0)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid --since duration: {text!r}")
+    if seconds <= 0:
+        raise argparse.ArgumentTypeError("--since duration must be positive")
+    return seconds
+
+
 def _build(args):
     """Create config + collaborators from CLI arguments."""
     config = Config()
     config.quarantine_dir = Path(args.quarantine_dir)
     config.report_dir = Path(args.report_dir)
     sig_path = Path(args.signatures)
-    if not sig_path.exists() and BUNDLED_SIGNATURES.exists():
+    # A missing DB is fine for `sig import` (a fresh target database) –
+    # only the first-run fallback below may replace it.
+    if (
+        not sig_path.exists()
+        and getattr(args, "saction", None) != "import"
+        and BUNDLED_SIGNATURES.exists()
+    ):
         # First run from a directory without a DB: start from the bundled one.
         sig_path = Path.cwd() / "data" / "signatures.json"
-        sig_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(BUNDLED_SIGNATURES, sig_path)
+        if not sig_path.exists():
+            sig_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(BUNDLED_SIGNATURES, sig_path)
     config.signatures_file = sig_path
     if getattr(args, "max_size", None):
         config.max_file_size = args.max_size
@@ -56,6 +82,8 @@ def _build(args):
         config.archives_enabled = False
     if getattr(args, "exclude", None):
         config.exclude_patterns = tuple(args.exclude)
+    if getattr(args, "since", 0.0):
+        config.since_ts = time.time() - args.since
     config.resolve_paths(Path.cwd())
     db = SignatureDB(config.signatures_file)
     scanner = Scanner(config, db, threads=getattr(args, "threads", "auto"))
@@ -234,6 +262,67 @@ def cmd_sig(args) -> int:
         print(paint(f"Removed signature {removed.id!r} from {config.signatures_file}",
                     GREEN))
         return 0
+    if args.saction == "export":
+        out_path = Path(args.file)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        sigs = db.list()
+        out_path.write_text(json.dumps(
+            {"version": 1,
+             "updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+             "signatures": [
+                 {k: getattr(s, k) for k in
+                  ("id", "name", "category", "severity", "description",
+                   "sha256", "md5", "pattern")}
+                 for s in sigs
+             ]},
+            indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8")
+        print(paint(f"Exported {len(sigs)} signature(s) to {out_path}", GREEN))
+        return 0
+    if args.saction == "import":
+        in_path = Path(args.file)
+        if not in_path.exists():
+            print(paint(f"error: no such file: {in_path}", RED), file=sys.stderr)
+            return 2
+        try:
+            data = json.loads(in_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            print(paint(f"error: invalid JSON: {exc}", RED), file=sys.stderr)
+            return 2
+        items = data if isinstance(data, list) else data.get("signatures", [])
+        known = {s.id.lower() for s in db.list()}
+        added = skipped = failed = 0
+        for item in items:
+            try:
+                sig = Signature(
+                    id=item["id"],
+                    name=item.get("name", item["id"]),
+                    category=item.get("category", "custom"),
+                    severity=item.get("severity", "medium"),
+                    description=item.get("description", ""),
+                    sha256=(item.get("sha256") or "").lower(),
+                    md5=(item.get("md5") or "").lower(),
+                    pattern=item.get("pattern", "") or "",
+                )
+            except (KeyError, TypeError):
+                failed += 1
+                continue
+            if sig.id.lower() in known:
+                skipped += 1
+                continue
+            try:
+                db.add(sig, save=False)
+                known.add(sig.id.lower())
+                added += 1
+            except ValueError as exc:
+                failed += 1
+                print(paint(f" skipped {sig.id!r}: {exc}", YELLOW))
+        if added:
+            db.save()
+        print(paint(
+            f"Imported {added} signature(s) from {in_path} "
+            f"({skipped} already present, {failed} invalid)", GREEN))
+        return 0
     # action: add
     sig = Signature(
         id=args.id,
@@ -252,6 +341,47 @@ def cmd_sig(args) -> int:
         return 2
     print(paint(f"Added signature {sig.id!r} to {config.signatures_file}", GREEN))
     return 0
+
+
+# --------------------------------------------------------------------- hash
+def cmd_hash(args) -> int:
+    rows = []
+    ok = True
+    for name in args.files:
+        path = Path(name)
+        if not path.is_file():
+            print(paint(f"error: no such file: {name}", RED), file=sys.stderr)
+            ok = False
+            continue
+        sha256 = hashlib.sha256()
+        md5 = hashlib.md5()
+        sha1 = hashlib.sha1()
+        try:
+            with open(path, "rb") as fh:
+                while chunk := fh.read(1024 * 1024):
+                    sha256.update(chunk)
+                    md5.update(chunk)
+                    sha1.update(chunk)
+        except OSError as exc:
+            print(paint(f"error: {path}: {exc}", RED), file=sys.stderr)
+            ok = False
+            continue
+        rows.append({"file": name,
+                     "sha256": sha256.hexdigest(),
+                     "md5": md5.hexdigest(),
+                     "sha1": sha1.hexdigest(),
+                     "size": path.lstat().st_size})
+    if args.json:
+        print(json.dumps(rows, indent=2, ensure_ascii=False))
+    else:
+        for r in rows:
+            print(f"file:   {r['file']}")
+            print(f"sha256: {r['sha256']}")
+            print(f"md5:    {r['md5']}")
+            print(f"sha1:   {r['sha1']}")
+            print(f"size:   {r['size']} bytes")
+            print()
+    return 0 if ok else 2
 
 
 # ----------------------------------------------------------------- behavior
@@ -368,6 +498,8 @@ def cmd_report(args) -> int:
             print(f" {f.name}   {stamp}   {state:<8} "
                   f"{len(data.get('findings', []))} threat(s)   {data.get('target')}")
         return 0
+    if args.raction == "diff":
+        return _report_diff(config, args)
     # action: show
     if args.file:
         path = Path(args.file)
@@ -383,6 +515,67 @@ def cmd_report(args) -> int:
     data = json.loads(path.read_text(encoding="utf-8"))
     print(render_report(data))
     return 0
+
+
+def _load_report_file(config: Config, ref: Optional[str],
+                      default_index: int = -1) -> tuple:
+    """Resolve a report reference (explicit path, name in the report dir,
+    or None = Nth-newest saved report) to (path, data)."""
+    writer = ReportWriter(config.report_dir)
+    if ref:
+        path = Path(ref)
+        if not path.exists():
+            path = config.report_dir / ref
+        if not path.exists():
+            raise FileNotFoundError(f"no such report: {ref}")
+    else:
+        files = writer.all_reports()
+        if not files:
+            raise FileNotFoundError("no saved reports yet")
+        path = files[default_index]
+    return path, json.loads(path.read_text(encoding="utf-8"))
+
+
+def _report_diff(config: Config, args) -> int:
+    if not args.old and not args.new:
+        if len(ReportWriter(config.report_dir).all_reports()) < 2:
+            raise FileNotFoundError("diff needs at least two saved reports")
+    old_path, old = _load_report_file(config, args.old, default_index=-2)
+    new_path, new = _load_report_file(config, args.new, default_index=-1)
+    diff = diff_reports(old, new)
+    if args.json:
+        payload = {
+            "old": str(old_path), "new": str(new_path),
+            "old_target": old.get("target"), "new_target": new.get("target"),
+            "new": diff["new"], "cleared": diff["cleared"],
+            "unchanged_count": len(diff["unchanged"]),
+        }
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return 0 if not diff["new"] else 1
+
+    bar = "=" * 62
+    print()
+    print(paint(bar, BOLD))
+    print(paint(f" Report diff: {old_path.name}  ->  {new_path.name}", BOLD))
+    print(bar)
+    print(f"  old: {old.get('target')}  ({len(old.get('findings', []))} finding(s))")
+    print(f"  new: {new.get('target')}  ({len(new.get('findings', []))} finding(s))")
+    print()
+    if diff["new"]:
+        print(paint(f" NEW threats since {old_path.name}: {len(diff['new'])}", RED))
+        for f in diff["new"]:
+            sev = f.get("severity", "?").upper()
+            fc = SEVERITY_COLOR.get(f.get("severity", "info"), YELLOW)
+            print(f"  {paint(f'[{sev}]', fc)} {f.get('name')}   {f.get('path')}")
+        print()
+    if diff["cleared"]:
+        print(paint(f" Cleared (in old, not in new): {len(diff['cleared'])}", GREEN))
+        for f in diff["cleared"]:
+            print(f"  {f.get('name')}   {f.get('path')}")
+        print()
+    print(f" Unchanged: {len(diff['unchanged'])}")
+    print(bar)
+    return 0 if not diff["new"] else 1
 
 
 # --------------------------------------------------------------------- main
@@ -415,6 +608,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--exclude", action="append", default=None, metavar="GLOB",
                    help="skip files whose name or relative path matches GLOB "
                         "(repeatable), e.g. --exclude '*.log'")
+    p.add_argument("--since", type=parse_since, default=0.0, metavar="DURATION",
+                   help="only scan files modified within DURATION "
+                        "(30s / 30m / 2h / 1d / 1w / N seconds) – older "
+                        "files are skipped and counted as such")
     p.add_argument("--json", action="store_true", help="machine readable output")
 
     p = sub.add_parser("monitor", help="watch a directory and scan new/changed files")
@@ -431,6 +628,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--exclude", action="append", default=None, metavar="GLOB",
                    help="skip files whose name or relative path matches GLOB "
                         "(repeatable), e.g. --exclude '*.log'")
+    p.add_argument("--since", type=parse_since, default=0.0, metavar="DURATION",
+                   help="only track files modified within DURATION "
+                        "(30s / 30m / 2h / 1d / 1w / N seconds)")
 
     p = sub.add_parser("quarantine", help="list, restore or purge quarantined files")
     _common_options(p)
@@ -447,6 +647,10 @@ def build_parser() -> argparse.ArgumentParser:
     ssub.add_parser("show", help="list signatures")
     pr = ssub.add_parser("remove", help="remove a signature by id")
     pr.add_argument("id", help="signature id to remove")
+    pe = ssub.add_parser("export", help="export the database to a JSON file")
+    pe.add_argument("file", help="destination JSON file")
+    pi = ssub.add_parser("import", help="merge signatures from a JSON file")
+    pi.add_argument("file", help="JSON file (export format) to import from")
     pa = ssub.add_parser("add", help="add a signature")
     pa.add_argument("--id", required=True, help="unique signature id")
     pa.add_argument("--name", required=True, help="human readable name")
@@ -484,12 +688,29 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("selftest",
                    help="run the built-in self test (harmless EICAR string)")
 
-    p = sub.add_parser("report", help="list or show saved scan reports")
+    p = sub.add_parser("report", help="list, show or diff saved scan reports")
     _common_options(p)
     rsub = p.add_subparsers(dest="raction", required=True)
     rsub.add_parser("list", help="list saved reports")
     ps = rsub.add_parser("show", help="show a report (default: the latest)")
     ps.add_argument("file", nargs="?", help="report file or name in the report dir")
+    pd = rsub.add_parser(
+        "diff",
+        help="compare two reports (default: the two newest) and show what "
+             "is new / what was cleared")
+    pd.add_argument("old", nargs="?", default=None,
+                    help="older report (default: 2nd newest)")
+    pd.add_argument("new", nargs="?", default=None,
+                    help="newer report (default: the newest)")
+    _common_options(pd)
+    pd.add_argument("--json", action="store_true",
+                    help="machine readable output")
+
+    p = sub.add_parser("hash",
+                       help="print SHA-256 / MD5 / SHA-1 digests of files")
+    p.add_argument("files", nargs="+", help="file(s) to hash")
+    p.add_argument("--json", action="store_true",
+                   help="machine readable output")
 
     return parser
 
@@ -504,6 +725,7 @@ _COMMANDS = {
     "gui": lambda args: run_gui(),
     "selftest": lambda args: run_selftest(),
     "report": cmd_report,
+    "hash": cmd_hash,
 }
 
 

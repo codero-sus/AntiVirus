@@ -320,6 +320,116 @@ EICAR_TEST_STRING = (
 )
 
 
+_ELF_SHN_UNDEF = 0
+_ELF_ST_INFO = 0x11  # STB_GLOBAL << 4 | STT_FUNC
+
+
+def build_sample_elf(symbols: Tuple[str, ...], *, elf64: bool = False,
+                     machine: int = 3) -> bytes:
+    """Assemble a minimal, inert ELF with a dynamic symbol table.
+
+    The image has no code – only an ELF header, ``.dynstr``/``.dynsym`` and
+    a section-header table – but a real parser (and the behavioural layer)
+    sees a proper import table of *symbols*.
+    """
+    dynstr = b"\x00" + b"\x00".join(s.encode("ascii") for s in symbols) + b"\x00"
+    offsets: Dict[str, int] = {}
+    pos = 0
+    for s in symbols:
+        offsets[s] = pos + 1
+        pos += len(s) + 1
+    sym_size = 24 if elf64 else 16
+    dynsym = bytearray()
+    for s in symbols:
+        if elf64:  # Elf64_Sym: name(I) info(B) other(B) shndx(H) value(Q) size(Q)
+            dynsym += struct.pack("<IBBHQQ", offsets[s], _ELF_ST_INFO, 0,
+                                  _ELF_SHN_UNDEF, 0, 0)
+        else:      # Elf32_Sym: name(I) value(I) size(I) info(B) other(B) shndx(H)
+            dynsym += struct.pack("<IIIBBH", offsets[s], 0, 0, _ELF_ST_INFO,
+                                  0, _ELF_SHN_UNDEF)
+    shstrtab = b"\x00.dynstr\x00.dynsym\x00.shstrtab\x00"
+    o_dynstr, o_dynsym, o_shstr = 1, 9, 17
+
+    ehsize = 64 if elf64 else 52
+    shentsize = 64 if elf64 else 40
+    file = bytearray(ehsize)
+    file[0:4] = b"\x7fELF"
+    file[4] = 2 if elf64 else 1
+    file[5] = 1  # little-endian
+    file[6] = 1  # current version
+    if elf64:
+        struct.pack_into("<HHI", file, 16, 2, machine, 1)  # ET_EXEC, machine, v1
+        struct.pack_into("<Q", file, 40, 0)  # shoff patched below
+        struct.pack_into("<HHHHHH", file, 52, ehsize, 0, 0, shentsize, 4, 3)
+    else:
+        struct.pack_into("<HHIII", file, 16, 2, machine, 1, 0, 0)
+        struct.pack_into("<I", file, 32, 0)  # shoff patched below
+        struct.pack_into("<HHHHHH", file, 40, ehsize, 0, 0, shentsize, 4, 3)
+
+    off_dynstr = ehsize
+    off_dynsym = off_dynstr + len(dynstr)
+    off_shstr = off_dynsym + len(dynsym)
+    shoff = off_shstr + len(shstrtab)
+    file += dynstr + dynsym + shstrtab
+    if elf64:
+        struct.pack_into("<Q", file, 40, shoff)
+    else:
+        struct.pack_into("<I", file, 32, shoff)
+
+    # (name_off, type, offset, size, entsize); SHT_STRTAB=3, SHT_DYNSYM=11
+    secs = [
+        (0, 0, 0, 0, 0),
+        (o_dynstr, 3, off_dynstr, len(dynstr), 0),
+        (o_dynsym, 11, off_dynsym, len(dynsym), sym_size),
+        (o_shstr, 3, off_shstr, len(shstrtab), 0),
+    ]
+    for name_off, stype, off, size, entsize in secs:
+        if elf64:  # name(I) type(H) flags(I) 6pad addr(Q) off(Q) size(Q) …
+            file += struct.pack("<IHI6xQQQIIQQ", name_off, stype, 0, 0, off,
+                                size, 0, 0, 0, entsize)
+        else:
+            file += struct.pack("<IIIIIIIIII", name_off, stype, 0, 0, off,
+                                size, 0, 0, 0, entsize)
+    return bytes(file)
+
+
+#: Import sets for the bundled sample ELF images.
+SUSPICIOUS_ELF_SYMBOLS = ("system", "execve", "popen", "dlopen", "dlsym",
+                          "socket", "connect", "send")
+BENIGN_ELF_SYMBOLS = ("printf", "exit", "write", "malloc", "strlen")
+
+
+def build_suspicious_elf() -> bytes:
+    """Loader-style ELF: execution + dynamic-loading + socket imports."""
+    return build_sample_elf(SUSPICIOUS_ELF_SYMBOLS)
+
+
+def build_clean_elf() -> bytes:
+    """Harmless ELF: ordinary libc imports only – zero findings."""
+    return build_sample_elf(BENIGN_ELF_SYMBOLS)
+
+
+def build_tar_sample() -> bytes:
+    """``sneaky.tar.gz`` – gzip-compressed tar demonstrating the tar layer:
+    a harmless EICAR entry plus a tar-slip entry name (``../outside.txt``)."""
+    import gzip
+    import io
+    import tarfile
+
+    tar_buf = io.BytesIO()
+    with tarfile.open(fileobj=tar_buf, mode="w") as tf:
+        for name, content in (
+            ("eicar-test.txt", EICAR_TEST_STRING),
+            ("../outside.txt", "I should never be written outside.\n"),
+        ):
+            blob = content.encode("utf-8") if isinstance(content, str) else content
+            ti = tarfile.TarInfo(name)
+            ti.size = len(blob)
+            ti.mtime = 0
+            tf.addfile(ti, io.BytesIO(blob))
+    return gzip.compress(tar_buf.getvalue())
+
+
 def build_zip_sample() -> bytes:
     """``sneaky.zip`` – an inert archive demonstrating the archive layer:
 

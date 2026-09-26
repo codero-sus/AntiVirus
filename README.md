@@ -33,14 +33,29 @@ watches folders for new/changed files, and writes JSON + text reports.
   relocations, missing entry point, missing debug info, TLS callbacks,
   missing/obfuscated import table, huge `.rsrc`, and script/LOLBin markers
   hidden in embedded resources
-  * *ELF binaries* — high-entropy loadable segments
+  * *ELF binaries* — import-table analysis of `.dynsym` (ELF32 and ELF64:
+    process-execution API sets such as `system`/`execve`/`popen`, dynamic
+    library loading `dlopen`/`dlsym`, raw socket APIs, `ptrace`, and
+    file-manipulation sets) plus high-entropy loadable segments
   * *File-system* — setuid/setgid executables
-- **Archive scanning** — ZIP contents are inspected *in memory* (never
-  extracted to disk): every entry runs through the same signature /
-  behaviour / entropy layers and is reported as
-  `archive.zip!entry.py`; the layer also flags zip-slip entry names
-  (`../x`), encrypted entries, entry caps and an expansion budget that
-  stops zip bombs
+- **Archive scanning** — ZIP, TAR and GZIP (including `.tar.gz`) contents
+  are inspected *in memory* (never extracted to disk): every entry runs
+  through the same signature / behaviour / entropy layers and is reported
+  as `archive.tar.gz!entry.py`; the layer also flags path-traversal entry
+  names (zip-slip / tar-slip, `../x`), encrypted ZIP entries, entry caps
+  and an expansion budget that stops bombs
+- **Incremental scans** — `scan --since 2h` only scans files modified
+  within the given duration (`30s` / `30m` / `2h` / `1d` / `1w` / bare
+  seconds); older files are skipped and counted as such (also works with
+  `monitor`)
+- **Hash command** — `hash FILE…` prints SHA-256 / MD5 / SHA-1 digests and
+  the size of each file
+- **Report diff** — `report diff [OLD NEW]` compares two saved reports
+  (default: the two newest) and lists what is new, what was cleared, and
+  what is unchanged
+- **Signature import/export** — `sig export FILE` / `sig import FILE`
+  move a signature database to another machine; the import merges and
+  skips duplicate ids
 - **Scan cache** — a full scan records each file's verdict
   (size + mtime + engine profile) in `.av-cache`; the next scan of
   unchanged files skips disk reads entirely, so rescans are ~20× faster
@@ -166,15 +181,19 @@ For every regular file (symlinks, build dirs and VCS metadata are skipped):
    batch scripts are checked against indicator regexes, PE images are fully
    dissected (headers, sections, imports, exports, resources, relocations,
    TLS, debug directories) and checked for dangerous API combinations and
-   debugger-style red flags, and binaries are scanned for reverse-shell /
-   C2 byte markers. Files up to 2 MiB are analysed (the content was already
-   buffered during the single read pass). Run
-   `pe analyze FILE` for the full human-readable "debug report".
-5. If the file is a **ZIP archive** (up to 32 MiB), each entry is read into
-   memory and run through the same layers — a hit is reported as
-   `archive.zip!entry`; suspicious entry names (zip slip), encrypted
-   entries and total expansion beyond the 64 MiB budget are flagged.
-   Nothing is ever extracted to disk.
+   debugger-style red flags, ELF binaries have their dynamic import tables
+   (`.dynsym`, both 32- and 64-bit) walked for dangerous API sets, and
+   binaries are scanned for reverse-shell / C2 byte markers. Files up to
+   2 MiB are analysed (the content was already buffered during the single
+   read pass). Run `pe analyze FILE` for the full human-readable
+   "debug report".
+5. If the file is a **ZIP, TAR or GZIP archive** (up to 32 MiB), each
+   entry is read into memory and run through the same layers — a hit is
+   reported as `archive.zip!entry` / `archive.tar.gz!member`; suspicious
+   entry names (zip-slip / tar-slip), encrypted entries and total
+   expansion beyond the 64 MiB budget are flagged. Gzip streams are
+   decompressed in memory and, if they contain a TAR, are scanned member
+   by member. Nothing is ever extracted to disk.
 6. If still nothing matched, the **heuristic** verdict is made from the
    already-collected histogram: ≥ 7.5 bits/byte on files ≥ 256 KiB is
    reported as "may be packed or encrypted".
@@ -198,6 +217,9 @@ For every regular file (symlinks, build dirs and VCS metadata are skipped):
 | high | LOLBin downloaders: `certutil -urlcache`, `mshta http`, `bitsadmin` | Batch / binary IOC |
 | high | PE process-injection API set (VirtualAllocEx + WriteProcessMemory + CreateRemoteThread) | PE imports |
 | high | PE imports both download **and** execute APIs | PE imports |
+| high | ELF process-execution API set (`system`/`execve`/`popen`) | ELF imports |
+| medium | ELF dynamic library loading (`dlopen`/`dlsym`) or raw socket APIs | ELF imports |
+| medium | tar-slip entry name (`../x`, absolute) in a TAR/TAR.GZ | archives |
 | high | script/LOLBin markers embedded in PE resources (VBScript, PowerShell, `cmd.exe`, `mshta`, …) | PE debug |
 | medium | persistence: cron / systemctl / shell rc / registry (`RegSetValue*`) | Shell / PE |
 | medium | crypto-mining pool endpoint `stratum+tcp://` | Shell / binary IOC |
@@ -271,8 +293,9 @@ original path, timestamp and reason recorded in `quarantine/manifest.json`.
 
 | Command | Description |
 | --- | --- |
-| `scan TARGET [--action detect\|quarantine\|delete] [--threads N] [--no-behavior] [--fast] [--no-cache] [--no-archives] [--exclude GLOB] [--json]` | Scan a file or directory tree (`--threads`: auto, N, or 1; `--fast`: hash+pattern only; `--exclude` repeatable) |
-| `monitor TARGET [--action ...] [--interval 2] [--no-behavior] [--no-archives] [--exclude GLOB]` | Watch a directory, scan new/changed files |
+| `scan TARGET [--action detect\|quarantine\|delete] [--threads N] [--no-behavior] [--fast] [--no-cache] [--no-archives] [--exclude GLOB] [--since DURATION] [--json]` | Scan a file or directory tree (`--threads`: auto, N, or 1; `--fast`: hash+pattern only; `--exclude` repeatable; `--since 30m/2h/1d`: only recently modified files) |
+| `monitor TARGET [--action ...] [--interval 2] [--no-behavior] [--no-archives] [--exclude GLOB] [--since DURATION]` | Watch a directory, scan new/changed files |
+| `hash FILE… [--json]` | Print SHA-256 / MD5 / SHA-1 digests + size of each file |
 | `behavior analyze FILE [--json]` | Show what one file appears to do (static behavioural analysis) |
 | `pe analyze FILE [--json]` | Full static PE dissection ("debug report") + red-flag indicators |
 | `gui` | Open the graphical user interface (Tkinter) |
@@ -282,8 +305,11 @@ original path, timestamp and reason recorded in `quarantine/manifest.json`.
 | `sig show` | List signatures in the database |
 | `sig add --id … --name … [--sha256/--md5/--pattern …]` | Add a signature |
 | `sig remove ID` | Remove a signature from the database |
+| `sig export FILE` | Write the database to a JSON file |
+| `sig import FILE` | Merge signatures from a JSON file (skips duplicate ids) |
 | `selftest` | Run the built-in end-to-end self test |
 | `report list` / `report show [FILE]` | Inspect saved reports |
+| `report diff [OLD NEW] [--json]` | Compare two reports (default: the two newest): new / cleared / unchanged |
 
 Common options (most commands): `--signatures FILE`, `--quarantine-dir DIR`,
 `--report-dir DIR`, `--max-size BYTES`.
@@ -300,9 +326,10 @@ antivirus/
 ├── models.py        # Finding dataclass + entropy helpers
 ├── cache.py         # scan cache (fast rescans of unchanged files)
 ├── behavior.py      # behavioural analysis (Python AST, shell/PS/batch,
-│                    #   ELF structure, binary IOCs, SUID)
+│                    #   PE/ELF import tables, binary IOCs, SUID)
 ├── pe.py            # PE32/PE32+ dissection ("debug report") + indicators
-├── samples.py       # builder for the inert demo samples (incl. fake PEs)
+├── samples.py       # builder for the inert demo samples (fake PE/ELF,
+│                    #   sneaky ZIP/TAR.GZ)
 ├── scanner.py       # single-pass hashing, patterns, behaviour, heuristics
 ├── signatures.py    # JSON signature database (load/add/save)
 ├── quarantine.py    # quarantine store with manifest, restore, purge
@@ -338,7 +365,8 @@ python3 -m pytest -v
   [`watchdog`](https://pypi.org/project/watchdog/)/inotify events; the
   `_handle()` logic stays identical.
 - **Behaviour-based layers** — e.g. flag scripts that `exec` encoded blobs,
-  detect suspicious PE/ELF sections, scan inside ZIP/7z archives.
+  detect suspicious PE/ELF sections, scan inside 7z archives, or go beyond
+  static ELF/PE analysis (dynamic sandboxing).
 
 ## License
 
