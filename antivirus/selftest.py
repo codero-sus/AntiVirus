@@ -233,6 +233,56 @@ def run_selftest() -> int:
               "Archive path traversal (tar slip)" in names,
               str(sorted(names)))
 
+        # -- file integrity baseline (v1.7) ----------------------------------
+        from .integrity import (
+            CHANGED,
+            build_manifest,
+            compare_baseline,
+            file_sha256,
+        )
+
+        fim = workdir / "fim-tree"
+        fim.mkdir()
+        (fim / "keep.txt").write_text("same\n")
+        (fim / "edit.txt").write_text("before\n")
+        baseline = build_manifest(fim, config)
+        (fim / "edit.txt").write_text("AFTER\n")
+        current = {
+            p.name: {"sha256": file_sha256(p), "size": p.stat().st_size}
+            for p in fim.iterdir() if p.is_file()
+        }
+        fim_findings = compare_baseline(baseline, current)
+        check("integrity: changed file detected vs baseline",
+              any(f.name == CHANGED for f in fim_findings),
+              str(sorted({f.name for f in fim_findings})))
+
+        # -- web console health (v1.7) ----------------------------------------
+        import json as _json
+        import threading
+        import urllib.request
+        from http.server import ThreadingHTTPServer
+
+        from .web import WebApp, _Handler
+
+        web_app = WebApp(config, db, scanner, quarantine)
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        server.app = web_app
+        web_thread = threading.Thread(target=server.serve_forever,
+                                      daemon=True)
+        web_thread.start()
+        try:
+            with urllib.request.urlopen(
+                    f"http://127.0.0.1:{server.server_address[1]}/api/health",
+                    timeout=10) as resp:
+                health = _json.loads(resp.read())
+            check("web console: /api/health responds",
+                  health.get("ok") is True, str(health))
+        except Exception as exc:
+            check("web console: /api/health responds", False, str(exc))
+        finally:
+            server.shutdown()
+            server.server_close()
+
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 

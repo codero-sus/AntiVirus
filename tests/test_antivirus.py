@@ -1071,5 +1071,289 @@ class SigImportExportTests(unittest.TestCase):
             os.chdir(old_cwd)
 
 
+class IntegrityTests(unittest.TestCase):
+    """v1.7: manifest baselines + scan --baseline (file integrity)."""
+
+    def test_build_manifest_and_compare(self):
+        from antivirus.integrity import (
+            CHANGED,
+            MISSING,
+            NEW,
+            build_manifest,
+            compare_baseline,
+            save_manifest,
+            load_manifest,
+        )
+
+        base = Path(tempfile.mkdtemp(prefix="av-int-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        app = App(base)
+
+        d = base / "tree"
+        d.mkdir()
+        (d / "a.txt").write_text("one\n")
+        (d / "b.txt").write_text("two\n")
+        manifest = build_manifest(d, app.config)
+        self.assertEqual(set(manifest["files"]), {"a.txt", "b.txt"})
+
+        save_manifest(manifest, base / "b.json")
+        self.assertEqual(load_manifest(base / "b.json")["files"],
+                         manifest["files"])
+
+        # mutate the tree: change a, add c, delete b
+        (d / "a.txt").write_text("CHANGED\n")
+        (d / "c.txt").write_text("three\n")
+        (d / "b.txt").unlink()
+
+        app.scanner.config.cache_enabled = False
+        result = app.scanner.scan_path(d)
+        current = {str(Path(p).resolve().relative_to(d.resolve())): m
+                   for p, m in result.file_meta.items()}
+        findings = compare_baseline(manifest, current)
+        self.assertIn(CHANGED, {f.name for f in findings})
+        self.assertIn(MISSING, {f.name for f in findings})
+        self.assertIn(NEW, {f.name for f in findings})
+        self.assertEqual(sum(1 for f in findings if f.name == CHANGED), 1)
+
+    def test_cli_scan_baseline(self):
+        from antivirus.cli import main
+        from antivirus.integrity import (
+            CHANGED,
+            MISSING,
+            NEW,
+            build_manifest,
+            save_manifest,
+        )
+
+        base = Path(tempfile.mkdtemp(prefix="av-intcli-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        app = App(base)
+
+        d = base / "tree"
+        d.mkdir()
+        (d / "a.txt").write_text("one\n")
+        (d / "b.txt").write_text("two\n")
+        bfile = base / "b.json"
+        save_manifest(build_manifest(d, app.config), bfile)
+
+        (d / "a.txt").write_text("CHANGED\n")
+        (d / "c.txt").write_text("three\n")
+        (d / "b.txt").unlink()
+
+        old_cwd = os.getcwd()
+        os.chdir(base)
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = main(["scan", str(d), "--baseline", str(bfile),
+                           "--json"])
+        finally:
+            os.chdir(old_cwd)
+        data = json.loads(buf.getvalue())
+        names = {f["name"] for f in data["findings"]}
+        self.assertEqual(rc, 1)
+        self.assertIn(CHANGED, names)
+        self.assertIn(NEW, names)
+        self.assertIn(MISSING, names)
+
+
+class SamplesCommandTests(unittest.TestCase):
+    """v1.7: `antivirus samples` regenerates the inert demo tree."""
+
+    def test_samples_command_builds_scannable_tree(self):
+        from antivirus.cli import main
+
+        base = Path(tempfile.mkdtemp(prefix="av-samples-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        out = base / "out"
+
+        old_cwd = os.getcwd()
+        os.chdir(base)
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = main(["samples", str(out)])
+        finally:
+            os.chdir(old_cwd)
+        self.assertEqual(rc, 0)
+        for rel in ("eicar-test.txt", "clean.txt",
+                    "behavior/suspicious.exe", "behavior/clean.exe",
+                    "behavior/packed-upx.exe", "behavior/suspicious.elf",
+                    "behavior/clean.elf", "behavior/sneaky.zip",
+                    "behavior/sneaky.tar.gz", "behavior/dropper.bat"):
+            self.assertTrue((out / rel).exists(), rel)
+
+        app = App(base)
+        app.scanner.config.cache_enabled = False
+        result = app.scanner.scan_path(out)
+        names = {f.name for f in result.findings}
+        self.assertIn("EICAR-Test-File", names)
+        self.assertTrue(any("ELF imports" in n for n in names))
+        self.assertTrue(any("slip" in n for n in names))
+
+
+class ReportSummaryTests(unittest.TestCase):
+    """v1.7: `report summary` aggregates saved reports."""
+
+    def test_report_summary_output(self):
+        from antivirus.cli import main
+
+        base = Path(tempfile.mkdtemp(prefix="av-sum-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        rep = base / "reports"
+        rep.mkdir()
+        f1 = {"path": "x", "name": "SigA", "severity": "high"}
+        f2 = {"path": "y", "name": "SigA", "severity": "high"}
+        f3 = {"path": "z", "name": "SigB", "severity": "low"}
+        (rep / "scan-00000000-000000.json").write_text(json.dumps(
+            {"target": "t", "clean": False, "findings": [f1, f2]}))
+        (rep / "scan-00000000-000001.json").write_text(json.dumps(
+            {"target": "t", "clean": False, "findings": [f3]}))
+
+        old_cwd = os.getcwd()
+        os.chdir(base)
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = main(["report", "summary", "--report-dir", str(rep)])
+        finally:
+            os.chdir(old_cwd)
+        out = buf.getvalue()
+        self.assertEqual(rc, 0)
+        self.assertIn("2 report(s)", out)
+        self.assertIn("Total findings:   3", out)
+        self.assertIn("2  SigA", out)
+        self.assertIn("1  SigB", out)
+        self.assertIn("high: 2", out)
+        self.assertIn("low: 1", out)
+
+
+class WebConsoleTests(unittest.TestCase):
+    """v1.7: the stdlib web console (dashboard + JSON API)."""
+
+    def setUp(self):
+        base = Path(tempfile.mkdtemp(prefix="av-web-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        self.base = base
+        self.app_fixture = App(base)
+        self.app_fixture.scanner.config.cache_enabled = False
+
+        import threading
+        from http.server import ThreadingHTTPServer
+
+        from antivirus.web import WebApp, _Handler
+
+        app = WebApp(self.app_fixture.config, self.app_fixture.db,
+                     self.app_fixture.scanner, self.app_fixture.quarantine)
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        server.app = app
+        self.server = server
+        self.port = server.server_address[1]
+        self.thread = threading.Thread(target=server.serve_forever,
+                                       daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+    def _req(self, method, path, body=None):
+        import urllib.error
+        import urllib.request
+
+        data = None
+        headers = {}
+        if body is not None:
+            data = json.dumps(body).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}{path}", data=data,
+            headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(request, timeout=15) as resp:
+                return resp.status, json.loads(resp.read() or b"{}")
+        except urllib.error.HTTPError as exc:
+            return exc.code, json.loads(exc.read() or b"{}")
+
+    def test_health_and_page(self):
+        status, data = self._req("GET", "/api/health")
+        self.assertEqual(status, 200)
+        self.assertTrue(data["ok"])
+
+        import urllib.request
+
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{self.port}/", timeout=15) as resp:
+            html = resp.read().decode("utf-8")
+        self.assertIn("AntiVirus Web Console", html)
+
+    def test_scan_job_flow(self):
+        (self.base / "victim.txt").write_bytes(EICAR)
+        status, data = self._req("POST", "/api/scan", {"target": str(self.base)})
+        self.assertEqual(status, 200)
+        job = data["job"]
+        self.assertEqual(job["status"], "running")
+
+        detail = None
+        for _ in range(50):
+            time.sleep(0.2)
+            status, detail = self._req("GET", f"/api/jobs/{job['id']}")
+            if detail["job"]["status"] != "running":
+                break
+        self.assertEqual(status, 200)
+        self.assertEqual(detail["job"]["status"], "done")
+        result = detail["result"]
+        self.assertTrue(any(f["name"] == "EICAR-Test-File"
+                            for f in result["findings"]))
+
+    def test_signatures_api(self):
+        status, data = self._req("GET", "/api/signatures")
+        before = {s["id"] for s in data["signatures"]}
+
+        status, data = self._req(
+            "POST", "/api/signatures",
+            {"id": "WEB-T", "name": "WebT", "severity": "low",
+             "pattern": "WEBTPAYLOAD"})
+        self.assertEqual(status, 200)
+
+        status, data = self._req("GET", "/api/signatures")
+        self.assertIn("WEB-T", {s["id"] for s in data["signatures"]})
+
+        status, data = self._req("POST", "/api/signatures/remove",
+                                 {"id": "WEB-T"})
+        self.assertEqual(status, 200)
+        status, data = self._req("GET", "/api/signatures")
+        self.assertEqual({s["id"] for s in data["signatures"]}, before)
+
+        status, data = self._req("POST", "/api/signatures/remove",
+                                 {"id": "NO-SUCH"})
+        self.assertEqual(status, 404)
+
+    def test_quarantine_action_loop(self):
+        (self.base / "victim.txt").write_bytes(EICAR)
+        status, data = self._req("POST", "/api/scan",
+                                 {"target": str(self.base),
+                                  "action": "quarantine"})
+        self.assertEqual(status, 200)
+        job = data["job"]
+        for _ in range(50):
+            time.sleep(0.2)
+            status, detail = self._req("GET", f"/api/jobs/{job['id']}")
+            if detail["job"]["status"] != "running":
+                break
+        self.assertEqual(detail["job"]["status"], "done")
+        self.assertFalse((self.base / "victim.txt").exists())
+
+        status, data = self._req("GET", "/api/quarantine")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(data["items"]), 1)
+        qid = data["items"][0]["id"]
+
+        status, data = self._req("POST", "/api/quarantine/restore",
+                                 {"id": qid})
+        self.assertEqual(status, 200)
+        self.assertTrue((self.base / "victim.txt").exists())
+
+
 if __name__ == "__main__":
     unittest.main()

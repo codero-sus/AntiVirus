@@ -80,6 +80,18 @@ watches folders for new/changed files, and writes JSON + text reports.
   packages): pick a target, scan with live progress and a stop button,
   review severity-coloured findings, and manage the quarantine
   (`python3 -m antivirus gui`)
+- **Web console** — a browser UI + JSON API on the standard-library
+  `http.server` (no packages): scan jobs with live progress, results
+  table, quarantine manager and signature editor
+  (`python3 -m antivirus web --port 8420`)
+- **File-integrity baselines** — `manifest DIR` hashes a tree into a JSON
+  baseline; a later `scan DIR --baseline FILE` reports every file that
+  changed, appeared or disappeared (classic FIM)
+- **Sample generator** — `samples [DIR]` writes the full inert demo sample
+  tree (EICAR string, scripts, code-less PE/ELF images, sneaky archives)
+  anywhere, for testing the engine
+- **Report summary** — `report summary` aggregates all saved reports
+  (infected/clean counts, severity breakdown, top indicators)
 
 ## Requirements
 
@@ -293,7 +305,7 @@ original path, timestamp and reason recorded in `quarantine/manifest.json`.
 
 | Command | Description |
 | --- | --- |
-| `scan TARGET [--action detect\|quarantine\|delete] [--threads N] [--no-behavior] [--fast] [--no-cache] [--no-archives] [--exclude GLOB] [--since DURATION] [--json]` | Scan a file or directory tree (`--threads`: auto, N, or 1; `--fast`: hash+pattern only; `--exclude` repeatable; `--since 30m/2h/1d`: only recently modified files) |
+| `scan TARGET [--action detect\|quarantine\|delete] [--threads N] [--no-behavior] [--fast] [--no-cache] [--no-archives] [--exclude GLOB] [--since DURATION] [--baseline FILE] [--json]` | Scan a file or directory tree (`--threads`: auto, N, or 1; `--fast`: hash+pattern only; `--exclude` repeatable; `--since 30m/2h/1d`: only recently modified files; `--baseline`: integrity check vs a manifest) |
 | `monitor TARGET [--action ...] [--interval 2] [--no-behavior] [--no-archives] [--exclude GLOB] [--since DURATION]` | Watch a directory, scan new/changed files |
 | `hash FILE… [--json]` | Print SHA-256 / MD5 / SHA-1 digests + size of each file |
 | `behavior analyze FILE [--json]` | Show what one file appears to do (static behavioural analysis) |
@@ -310,9 +322,46 @@ original path, timestamp and reason recorded in `quarantine/manifest.json`.
 | `selftest` | Run the built-in end-to-end self test |
 | `report list` / `report show [FILE]` | Inspect saved reports |
 | `report diff [OLD NEW] [--json]` | Compare two reports (default: the two newest): new / cleared / unchanged |
+| `report summary` | Aggregate all saved reports (counts, severities, top indicators) |
+| `manifest TARGET [--out FILE]` | Build a file-integrity baseline (SHA-256 of every file) |
+| `samples [DIR]` | Write the inert demo sample tree (safe test material) |
+| `web [--host 0.0.0.0] [--port 8420]` | Open the web console (dashboard + JSON API) |
 
 Common options (most commands): `--signatures FILE`, `--quarantine-dir DIR`,
 `--report-dir DIR`, `--max-size BYTES`.
+
+## Web console
+
+```bash
+python3 -m antivirus web --port 8420
+# then open http://localhost:8420
+```
+
+The dashboard (single page, no external assets, dark theme) offers:
+
+- **Scan jobs** — target + action (detect / quarantine / delete), `--fast`
+  and `--since` options; each scan runs in a background thread and the UI
+  polls live progress (files / MiB / findings), then renders the
+  severity-coloured results table. Past jobs stay clickable in the job list.
+- **Quarantine manager** — list, restore or purge quarantined files.
+- **Signature editor** — add (pattern / sha256 / md5), inspect and remove
+  signatures; changes apply to the very next scan.
+
+JSON API (useful for scripting / your own front-end):
+
+| Endpoint | Method | Purpose |
+| --- | --- | --- |
+| `/api/health` | GET | engine status + version |
+| `/api/scan` | POST | start a job: `{"target", "action", "fast", "no_archives", "since"}` |
+| `/api/jobs` | GET | all jobs (summary) |
+| `/api/jobs/<id>` | GET | job progress + full result when done |
+| `/api/quarantine` | GET | quarantined items |
+| `/api/quarantine/restore` / `/api/quarantine/purge` | POST | `{"id"}` |
+| `/api/signatures` | GET / POST | list / add signatures |
+| `/api/signatures/remove` | POST | `{"id"}` |
+
+The console binds to `0.0.0.0` by default and has **no authentication** —
+it is a local tool, so only expose it on interfaces you trust.
 
 ## Project layout
 
@@ -328,13 +377,15 @@ antivirus/
 ├── behavior.py      # behavioural analysis (Python AST, shell/PS/batch,
 │                    #   PE/ELF import tables, binary IOCs, SUID)
 ├── pe.py            # PE32/PE32+ dissection ("debug report") + indicators
+├── integrity.py     # file-integrity baselines (manifest + diff)
 ├── samples.py       # builder for the inert demo samples (fake PE/ELF,
-│                    #   sneaky ZIP/TAR.GZ)
+│                    #   sneaky ZIP/TAR.GZ, `samples` tree)
 ├── scanner.py       # single-pass hashing, patterns, behaviour, heuristics
 ├── signatures.py    # JSON signature database (load/add/save)
 ├── quarantine.py    # quarantine store with manifest, restore, purge
 ├── monitor.py       # polling directory watcher
-├── report.py        # JSON + text report writer
+├── report.py        # JSON + text report writer, diff, summary
+├── web.py           # web console (dashboard + JSON API, http.server)
 ├── selftest.py      # built-in end-to-end self test
 ├── output.py        # tiny ANSI colour helper
 └── utils.py         # shared helpers

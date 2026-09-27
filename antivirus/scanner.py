@@ -74,6 +74,9 @@ class ScanResult:
     #: Per-file verdicts actually produced by this run (internal – used to
     #: feed the scan cache; not serialized by ``to_dict``).
     scanned_paths: Dict[str, List[Finding]] = field(default_factory=dict)
+    #: Per-file {path: {"sha256":…, "size":…}} for files hashed by this run
+    #: (internal – feeds the integrity baseline check; not serialized).
+    file_meta: Dict[str, Dict] = field(default_factory=dict)
 
     @property
     def elapsed(self) -> float:
@@ -217,15 +220,20 @@ class Scanner:
         self._cached_version: Optional[int] = None
 
     # ------------------------------------------------------------- public API
-    def scan_path(self, path: Path) -> ScanResult:
+    def scan_path(self, path: Path,
+                  result: Optional["ScanResult"] = None) -> ScanResult:
         """Scan a single file or an entire directory tree.
 
         When the scan cache is enabled, files whose size *and* mtime are
         unchanged (and whose engine profile matches) reuse their previous
         verdict without being read from disk at all.
+
+        *result* may be a pre-built ScanResult (its counters are then
+        updated in place – used by the web console for live progress).
         """
         path = Path(path)
-        result = ScanResult(target=str(path), started_at=time.time())
+        if result is None:
+            result = ScanResult(target=str(path), started_at=time.time())
         self._sync_patterns()
         cache: Optional[ScanCache] = None
         if self.config.cache_enabled:
@@ -362,6 +370,8 @@ class Scanner:
                     result.findings.extend(local.findings)
                 if local.scanned_paths:
                     result.scanned_paths.update(local.scanned_paths)
+                if local.file_meta:
+                    result.file_meta.update(local.file_meta)
 
     # ------------------------------------------------------------ internals
     def _sync_patterns(self) -> None:
@@ -433,6 +443,7 @@ class Scanner:
             return
 
         result.files_scanned += 1
+        result.file_meta[str(path)] = {"sha256": sha256, "size": size}
         result.bytes_scanned += size
 
         # NOTE: verdicts are collected in a *per-file* list.  The heuristic

@@ -8,7 +8,7 @@ import shutil
 import sys
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 
 from . import __version__
 from .behavior import analyze_file as behavior_analyze_file
@@ -28,27 +28,17 @@ from .report import ReportWriter, diff_reports, render_report
 from .scanner import ScanResult, Scanner
 from .selftest import run_selftest
 from .signatures import Signature, SignatureDB, VALID_SEVERITIES
-from .utils import human_size
+from .utils import human_size, parse_since
 
 BUNDLED_SIGNATURES = Path(__file__).resolve().parent.parent / "data" / "signatures.json"
 
 
-def parse_since(text: str) -> float:
-    """Parse a *--since* duration (``30s``, ``30m``, ``2h``, ``1d``, ``1w``
-    or a bare number of seconds) into seconds. Raises ArgumentTypeError."""
-    t = text.strip().lower()
-    if not t:
-        raise argparse.ArgumentTypeError("--since needs a duration")
-    unit = t[-1]
-    units = {"s": 1.0, "m": 60.0, "h": 3600.0, "d": 86400.0, "w": 604800.0}
-    value = t[:-1] if unit in units else t
+def _argparse_since(text: str) -> float:
+    """argparse ``type=`` wrapper around :func:`parse_since`."""
     try:
-        seconds = float(value) * units.get(unit, 1.0)
-    except ValueError:
-        raise argparse.ArgumentTypeError(f"invalid --since duration: {text!r}")
-    if seconds <= 0:
-        raise argparse.ArgumentTypeError("--since duration must be positive")
-    return seconds
+        return parse_since(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
 
 
 def _build(args):
@@ -110,11 +100,34 @@ def cmd_scan(args) -> int:
         print(paint(f"error: no such file or directory: {target}", RED), file=sys.stderr)
         return 2
 
+    if getattr(args, "baseline", None) and target.is_dir():
+        if config.cache_enabled:
+            # A baseline comparison needs the *current* hash of every file.
+            config.cache_enabled = False
+            if not args.json:
+                print(paint(
+                    " Baseline mode: scan cache disabled (all files hashed)",
+                    YELLOW))
+
     try:
         result = scanner.scan_path(target)
     except OSError as exc:
         print(paint(f"error: {exc}", RED), file=sys.stderr)
         return 2
+
+    if getattr(args, "baseline", None) and target.is_dir():
+        from .integrity import CHANGED, MISSING, NEW
+
+        rc, extra = _apply_baseline(result, target, args.baseline)
+        if rc != 0:
+            return rc
+        if extra and not args.json:
+            changed = sum(1 for f in extra if f.name == CHANGED)
+            missing = sum(1 for f in extra if f.name == MISSING)
+            new = sum(1 for f in extra if f.name == NEW)
+            print(paint(
+                f" Integrity vs baseline: {changed} changed, "
+                f"{missing} missing, {new} new", YELLOW))
 
     notes: dict = {}
     if args.action != "detect":
@@ -343,6 +356,67 @@ def cmd_sig(args) -> int:
     return 0
 
 
+# ----------------------------------------------------------------- manifest
+def cmd_manifest(args) -> int:
+    config, db, scanner, quarantine = _build(args)
+    target = Path(args.target)
+    if not target.exists():
+        print(paint(f"error: no such file or directory: {target}", RED),
+              file=sys.stderr)
+        return 2
+    try:
+        from .integrity import build_manifest, save_manifest
+
+        manifest = build_manifest(target, config)
+    except OSError as exc:
+        print(paint(f"error: {exc}", RED), file=sys.stderr)
+        return 2
+    if args.out:
+        save_manifest(manifest, Path(args.out))
+        print(paint(f"Manifest written: {len(manifest['files'])} file(s) "
+                    f"-> {args.out}", GREEN))
+        print("Re-check later with:  "
+              f"python3 -m antivirus scan {target} --baseline {args.out}")
+    else:
+        print(json.dumps(manifest, indent=2, ensure_ascii=False))
+    return 0
+
+
+# -------------------------------------------------------------- scan baseline
+def _apply_baseline(result: ScanResult, target: Path,
+                    baseline_file: str) -> tuple:
+    """Diff the scan against an integrity baseline.
+
+    Returns ``(0, extra_findings)`` on success or ``(2, None)`` on error.
+    """
+    import json as _json
+
+    from .integrity import compare_baseline, load_manifest
+
+    bpath = Path(baseline_file)
+    if not bpath.exists():
+        print(paint(f"error: no such baseline: {bpath}", RED), file=sys.stderr)
+        return 2, None
+    try:
+        baseline = load_manifest(bpath)
+    except (ValueError, _json.JSONDecodeError) as exc:
+        print(paint(f"error: {bpath}: {exc}", RED), file=sys.stderr)
+        return 2, None
+    target_resolved = target.resolve()
+    current = {}
+    for p, meta in result.file_meta.items():
+        pp = Path(p)
+        try:
+            rel = pp.resolve().relative_to(target_resolved)
+        except (ValueError, OSError):
+            continue
+        current[str(rel)] = meta
+    extra = compare_baseline(baseline, current)
+    if extra:
+        result.findings.extend(extra)
+    return 0, extra
+
+
 # --------------------------------------------------------------------- hash
 def cmd_hash(args) -> int:
     rows = []
@@ -382,6 +456,36 @@ def cmd_hash(args) -> int:
             print(f"size:   {r['size']} bytes")
             print()
     return 0 if ok else 2
+
+
+# ------------------------------------------------------------------ samples
+def cmd_samples(args) -> int:
+    from .samples import build_all_samples
+
+    root = Path(args.dir)
+    try:
+        written = build_all_samples(root)
+    except OSError as exc:
+        print(paint(f"error: {exc}", RED), file=sys.stderr)
+        return 2
+    print(paint(f"Wrote {len(written)} inert demo sample file(s) to {root}",
+                GREEN))
+    print("Nothing here is real malware; scan it to test the engine:")
+    print(f"  python3 -m antivirus scan {root}")
+    return 0
+
+
+# ------------------------------------------------------------------------ web
+def cmd_web(args) -> int:
+    from .web import run_web
+
+    config, db, scanner, quarantine = _build(args)
+    try:
+        return run_web(config, db, scanner, quarantine,
+                       host=args.host, port=args.port)
+    except OSError as exc:
+        print(paint(f"error: {exc}", RED), file=sys.stderr)
+        return 2
 
 
 # ----------------------------------------------------------------- behavior
@@ -500,6 +604,8 @@ def cmd_report(args) -> int:
         return 0
     if args.raction == "diff":
         return _report_diff(config, args)
+    if args.raction == "summary":
+        return _report_summary(config, writer)
     # action: show
     if args.file:
         path = Path(args.file)
@@ -534,6 +640,51 @@ def _load_report_file(config: Config, ref: Optional[str],
             raise FileNotFoundError("no saved reports yet")
         path = files[default_index]
     return path, json.loads(path.read_text(encoding="utf-8"))
+
+
+def _report_summary(config: Config, writer: "ReportWriter") -> int:
+    files = writer.all_reports()
+    if not files:
+        print("No reports yet. Run a scan first.")
+        return 0
+    infected = 0
+    total_findings = 0
+    by_name: Dict[str, int] = {}
+    by_sev: Dict[str, int] = {}
+    for f in files:
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            continue
+        if not data.get("clean"):
+            infected += 1
+        for finding in data.get("findings", []):
+            total_findings += 1
+            name = finding.get("name", "?")
+            by_name[name] = by_name.get(name, 0) + 1
+            sev = finding.get("severity", "info")
+            by_sev[sev] = by_sev.get(sev, 0) + 1
+
+    bar = "=" * 62
+    print()
+    print(paint(bar, BOLD))
+    print(paint(f" Report summary: {len(files)} report(s) in {config.report_dir}",
+                BOLD))
+    print(bar)
+    print(f" Infected reports: {infected}    clean: {len(files) - infected}")
+    print(f" Total findings:   {total_findings}")
+    if by_sev:
+        order = ("critical", "high", "medium", "low", "info")
+        parts = [f"{s}: {by_sev[s]}" for s in order if s in by_sev]
+        print(" By severity:      " + "   ".join(parts))
+    if by_name:
+        top = sorted(by_name.items(), key=lambda kv: (-kv[1], kv[0]))[:10]
+        print()
+        print(paint(" Top indicators:", BOLD))
+        for name, count in top:
+            print(f"   {count:>4}  {name}")
+    print(bar)
+    return 0
 
 
 def _report_diff(config: Config, args) -> int:
@@ -608,10 +759,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--exclude", action="append", default=None, metavar="GLOB",
                    help="skip files whose name or relative path matches GLOB "
                         "(repeatable), e.g. --exclude '*.log'")
-    p.add_argument("--since", type=parse_since, default=0.0, metavar="DURATION",
+    p.add_argument("--since", type=_argparse_since, default=0.0, metavar="DURATION",
                    help="only scan files modified within DURATION "
                         "(30s / 30m / 2h / 1d / 1w / N seconds) – older "
                         "files are skipped and counted as such")
+    p.add_argument("--baseline", default=None, metavar="FILE",
+                   help="integrity baseline (manifest) to compare against – "
+                        "reports changed / missing / new files "
+                        "(see: antivirus manifest)")
     p.add_argument("--json", action="store_true", help="machine readable output")
 
     p = sub.add_parser("monitor", help="watch a directory and scan new/changed files")
@@ -628,7 +783,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--exclude", action="append", default=None, metavar="GLOB",
                    help="skip files whose name or relative path matches GLOB "
                         "(repeatable), e.g. --exclude '*.log'")
-    p.add_argument("--since", type=parse_since, default=0.0, metavar="DURATION",
+    p.add_argument("--since", type=_argparse_since, default=0.0, metavar="DURATION",
                    help="only track files modified within DURATION "
                         "(30s / 30m / 2h / 1d / 1w / N seconds)")
 
@@ -693,7 +848,10 @@ def build_parser() -> argparse.ArgumentParser:
     rsub = p.add_subparsers(dest="raction", required=True)
     rsub.add_parser("list", help="list saved reports")
     ps = rsub.add_parser("show", help="show a report (default: the latest)")
+    _common_options(ps)
     ps.add_argument("file", nargs="?", help="report file or name in the report dir")
+    py = rsub.add_parser("summary", help="aggregate all saved reports")
+    _common_options(py)
     pd = rsub.add_parser(
         "diff",
         help="compare two reports (default: the two newest) and show what "
@@ -712,6 +870,26 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true",
                    help="machine readable output")
 
+    p = sub.add_parser("manifest",
+                       help="build a file-integrity baseline (hashes) for a tree")
+    _common_options(p)
+    p.add_argument("target", help="file or directory to baseline")
+    p.add_argument("--out", default=None, metavar="FILE",
+                   help="manifest file (default: print JSON to stdout)")
+
+    p = sub.add_parser("samples",
+                       help="write the inert demo sample tree (safe test material)")
+    p.add_argument("dir", nargs="?", default="samples",
+                   help="destination directory (default: ./samples)")
+
+    p = sub.add_parser("web",
+                       help="open the web console (dashboard + JSON API)")
+    _common_options(p)
+    p.add_argument("--host", default="0.0.0.0",
+                   help="bind address (default 0.0.0.0)")
+    p.add_argument("--port", type=int, default=8420,
+                   help="port (default 8420)")
+
     return parser
 
 
@@ -726,6 +904,9 @@ _COMMANDS = {
     "selftest": lambda args: run_selftest(),
     "report": cmd_report,
     "hash": cmd_hash,
+    "manifest": cmd_manifest,
+    "samples": cmd_samples,
+    "web": cmd_web,
 }
 
 

