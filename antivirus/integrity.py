@@ -76,6 +76,26 @@ def load_manifest(path: Path) -> Dict:
     return data
 
 
+def current_from_result(result: "ScanResult", target: Path) -> Dict[str, Dict]:
+    """Relativise a scan's ``file_meta`` against *target*.
+
+    Returns ``{relative_path: {"sha256": …, "size": …}}`` for files under
+    the target (paths outside the tree are ignored).
+    """
+    from pathlib import Path as _P
+
+    target_resolved = _P(target).resolve()
+    current: Dict[str, Dict] = {}
+    for p, meta in getattr(result, "file_meta", {}).items():
+        pp = _P(p)
+        try:
+            rel = pp.resolve().relative_to(target_resolved)
+        except (ValueError, OSError):
+            continue
+        current[str(rel)] = meta
+    return current
+
+
 def compare_baseline(baseline: Dict, current: Dict[str, Dict]) -> List[Finding]:
     """Diff a baseline against the current state of the tree.
 

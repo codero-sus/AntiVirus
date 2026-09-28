@@ -283,6 +283,40 @@ def run_selftest() -> int:
             server.shutdown()
             server.server_close()
 
+        # -- module API (v1.8) -------------------------------------------------
+        import antivirus
+
+        mod_dir = workdir / "module-tree"
+        mod_dir.mkdir()
+        (mod_dir / "e.txt").write_bytes(EICAR)
+        mod_result = antivirus.scan(mod_dir, base=str(workdir))
+        check("module API: antivirus.scan() detects EICAR",
+              any(f.name == "EICAR-Test-File" for f in mod_result.findings),
+              str(sorted({f.name for f in mod_result.findings})))
+
+        # -- TUI model (v1.8) ----------------------------------------------------
+        from .tui import TuiModel
+        from .web import WebApp
+
+        tui_dir = workdir / "tui-tree"
+        tui_dir.mkdir()
+        (tui_dir / "e.txt").write_bytes(EICAR)
+        model = TuiModel(WebApp(config, db, scanner, quarantine),
+                         target=str(tui_dir))
+        model.start_scan()
+        import time as _time
+
+        for _ in range(200):
+            model.tick()
+            if not model.running:
+                break
+            _time.sleep(0.05)
+        check("tui: model scan finds the threat",
+              model.job is not None and model.job.status == "done"
+              and any(f["name"] == "EICAR-Test-File"
+                      for f in model.findings),
+              model.message)
+
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 

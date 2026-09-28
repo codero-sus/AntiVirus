@@ -39,6 +39,7 @@ class App:
         self.config.report_dir = base / "reports"
         self.config.signatures_file = base / "signatures.json"
         self.config.cache_dir = base / ".av-cache"
+        self.config.baseline_dir = base / "baselines"
         if BUNDLED_DB.exists():
             shutil.copyfile(BUNDLED_DB, self.config.signatures_file)
         self.db = SignatureDB(self.config.signatures_file)
@@ -1353,6 +1354,271 @@ class WebConsoleTests(unittest.TestCase):
                                  {"id": qid})
         self.assertEqual(status, 200)
         self.assertTrue((self.base / "victim.txt").exists())
+
+
+class ModuleAPITests(unittest.TestCase):
+    """v1.8: the package works as a plain importable module."""
+
+    def test_one_shot_scan(self):
+        import antivirus
+
+        base = Path(tempfile.mkdtemp(prefix="av-mod-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        (base / "victim.txt").write_bytes(EICAR)
+
+        result = antivirus.scan(base, base=str(base))
+        self.assertTrue(any(f.name == "EICAR-Test-File"
+                            for f in result.findings))
+        self.assertFalse(result.clean)
+
+    def test_antivirus_class(self):
+        import antivirus
+
+        base = Path(tempfile.mkdtemp(prefix="av-av-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        av = antivirus.Antivirus(base=str(base))
+
+        # signature added via the API is picked up by the next scan
+        av.add_signature(id="AV-MOD-1", name="ModOne", severity="high",
+                         pattern="MODONE-MARKER")
+        f = base / "marker.txt"
+        f.write_text("here is MODONE-MARKER inside\n")
+        self.assertTrue(any(x.name == "ModOne"
+                            for x in av.scan_file(f)))
+
+        # eicar one-file scan + file_info + manifest
+        e = base / "eicar.txt"
+        e.write_bytes(EICAR)
+        findings = av.scan_file(e)
+        self.assertTrue(findings)
+
+        info = av.file_info(e)
+        import hashlib
+
+        self.assertEqual(info["sha256"], hashlib.sha256(EICAR).hexdigest())
+        self.assertEqual(info["size"], len(EICAR))
+
+        manifest = av.manifest(base)
+        self.assertIn("eicar.txt", manifest["files"])
+
+        # directory scan with action=quarantine via the API
+        result = av.scan(base, action="quarantine")
+        self.assertIn("quarantined as",
+                      " ".join(result.notes.values()))
+        self.assertFalse(e.exists())
+        items = [i for i in av.quarantine.items()
+                 if i.original_path.endswith("eicar.txt")]
+        self.assertTrue(items)
+        av.quarantine.restore(items[0].id)
+        self.assertTrue(e.exists())
+
+    def test_apply_actions_detect_is_noop(self):
+        import antivirus
+
+        base = Path(tempfile.mkdtemp(prefix="av-act-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        (base / "e.txt").write_bytes(EICAR)
+        result = antivirus.scan(base, base=str(base), action="detect")
+        self.assertTrue(result.findings)
+        self.assertTrue((base / "e.txt").exists())
+
+
+class TuiModelTests(unittest.TestCase):
+    """v1.8: the curses TUI's model layer (headless, no terminal)."""
+
+    def setUp(self):
+        base = Path(tempfile.mkdtemp(prefix="av-tui-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        from antivirus.tui import TuiModel
+        from antivirus.web import WebApp
+
+        app = App(base)
+        app.scanner.config.cache_enabled = False
+        self.model = TuiModel(WebApp(app.config, app.db, app.scanner,
+                                     app.quarantine), target=str(base))
+
+    def _wait_done(self):
+        for _ in range(200):
+            self.model.tick()
+            if not self.model.running:
+                return
+            time.sleep(0.05)
+
+    def test_scan_cycle(self):
+        (self.model.app.config.quarantine_dir.parent / "victim.txt") \
+            .write_bytes(EICAR)
+        self.model.start_scan()
+        self.assertFalse(self.model.error)
+        self._wait_done()
+        self.assertEqual(self.model.job.status, "done")
+        self.assertTrue(any(f["name"] == "EICAR-Test-File"
+                            for f in self.model.findings))
+        self.assertIn("INFECTED", self.model.message)
+
+    def test_selection_and_toggles(self):
+        self.model.findings = [
+            {"severity": "high", "name": "A", "kind": "k", "path": "p",
+             "message": "m"},
+            {"severity": "low", "name": "B", "kind": "k", "path": "p",
+             "message": "m"},
+        ]
+        self.model.move(1)
+        self.assertEqual(self.model.selection, 1)
+        self.model.move(1)  # wraps around
+        self.assertEqual(self.model.selection, 0)
+        self.model.toggle_fast()
+        self.assertTrue(self.model.fast)
+        self.model.cycle_action()
+        self.assertEqual(self.model.action, "quarantine")
+        self.model.set_since("2h")
+        self.assertEqual(self.model.since, "2h")
+        self.model.set_since("nope")
+        self.assertTrue(self.model.error)
+        self.assertEqual(self.model.since, "2h")
+        self.model.bottom()
+        self.assertIn("B", self.model.detail_text)
+
+    def test_invalid_target(self):
+        self.model.target = "/definitely/not/here"
+        self.model.start_scan()
+        self.assertIn("no such file", self.model.error)
+
+
+class FileinfoTests(unittest.TestCase):
+    """v1.8: file identification + `antivirus fileinfo` command."""
+
+    def test_identify_content(self):
+        from antivirus.fileinfo import identify_content
+
+        self.assertIn("PE", identify_content(b"MZ\x90\x00rest", "a.exe"))
+        self.assertIn("ELF", identify_content(b"\x7fELF\x02\x01", "a"))
+        self.assertIn("64-bit", identify_content(b"\x7fELF\x02\x01", "a"))
+        self.assertIn("32-bit", identify_content(b"\x7fELF\x01\x01", "a"))
+        self.assertEqual(identify_content(b"\x1f\x8b\x08", "a.gz"),
+                         "gzip stream")
+        self.assertEqual(identify_content(b"PK\x03\x04", "a.zip"),
+                         "ZIP archive")
+        tar_head = b"\x00" * 257 + b"ustar" + b"\x00" * 10
+        self.assertEqual(identify_content(tar_head, "a.tar"), "TAR archive")
+        self.assertIn("shebang", identify_content(b"#!/bin/sh\n", "a.sh"))
+        self.assertIn("Python", identify_content(b"", "a.py"))
+
+    def test_fileinfo_cli(self):
+        from antivirus.cli import main
+
+        old_cwd = os.getcwd()
+        os.chdir(ROOT)
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = main(["fileinfo", "samples/behavior/suspicious.exe",
+                           "samples/behavior/sneaky.tar.gz",
+                           "samples/behavior/harmless.sh"])
+        finally:
+            os.chdir(old_cwd)
+        out = buf.getvalue()
+        self.assertEqual(rc, 0)
+        self.assertIn("sha256:", out)
+        self.assertIn("PE", out)
+        self.assertIn("gzip", out)
+        self.assertIn("shebang", out)
+
+
+class GuiFilterTests(unittest.TestCase):
+    """v1.8: the GUI's findings filter predicate (headless)."""
+
+    def test_finding_matches(self):
+        from antivirus.gui import finding_matches
+        from antivirus.models import Finding
+
+        f = Finding(path="/tmp/a.py", kind="behavior",
+                    name="Shell command execution",
+                    severity="medium",
+                    message="os.system call found")
+        self.assertTrue(finding_matches(f, "", None))
+        self.assertTrue(finding_matches(f, "os.system", None))
+        self.assertTrue(finding_matches(f, "A.PY", None))
+        self.assertFalse(finding_matches(f, "network", None))
+        self.assertTrue(finding_matches(f, "", {"medium"}))
+        self.assertFalse(finding_matches(f, "", {"high"}))
+
+
+class WebBaselinesAndInfoTests(WebConsoleTests):
+    """v1.8: web API additions (baselines, fileinfo, reports, docs)."""
+
+    def test_baselines_and_scan_against_baseline(self):
+        d = self.base / "tree"
+        d.mkdir()
+        (d / "a.txt").write_text("one\n")
+        (d / "b.txt").write_text("two\n")
+
+        status, data = self._req("POST", "/api/baselines",
+                                 {"target": str(d), "id": "t1"})
+        self.assertEqual(status, 200)
+        self.assertEqual(data["files"], 2)
+
+        status, data = self._req("GET", "/api/baselines")
+        self.assertEqual(status, 200)
+        self.assertIn("t1", {b["id"] for b in data["baselines"]})
+
+        (d / "a.txt").write_text("CHANGED\n")
+        (d / "b.txt").unlink()
+        (d / "c.txt").write_text("three\n")
+
+        status, data = self._req("POST", "/api/scan",
+                                 {"target": str(d), "baseline": "t1"})
+        self.assertEqual(status, 200)
+        job = data["job"]
+        for _ in range(50):
+            time.sleep(0.2)
+            status, detail = self._req("GET", f"/api/jobs/{job['id']}")
+            if detail["job"]["status"] != "running":
+                break
+        self.assertEqual(detail["job"]["status"], "done")
+        integrity = {f["name"] for f in detail["result"]["findings"]
+                     if f["kind"] == "integrity"}
+        self.assertEqual(integrity,
+                         {"File changed since baseline",
+                          "File missing since baseline",
+                          "File not in baseline"})
+
+    def test_fileinfo_api(self):
+        (self.base / "victim.txt").write_bytes(EICAR)
+        status, data = self._req(
+            "GET", "/api/fileinfo?path=" +
+            urllib_parse(self.base / "victim.txt"))
+        self.assertEqual(status, 200)
+        self.assertEqual(data["size"], len(EICAR))
+        self.assertEqual(len(data["sha256"]), 64)
+        self.assertTrue(data["findings"])
+
+        status, data = self._req("GET", "/api/fileinfo?path=/nope/missing")
+        self.assertEqual(status, 404)
+
+    def test_reports_and_docs(self):
+        status, data = self._req("GET", "/api/reports")
+        self.assertEqual(status, 200)
+        self.assertIsInstance(data["reports"], list)
+
+        status, data = self._req("GET", "/api/reports/summary")
+        self.assertEqual(status, 200)
+        self.assertIn("reports", data)
+        self.assertIn("top_indicators", data)
+
+        import urllib.request
+
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{self.port}/api/docs",
+                timeout=15) as resp:
+            html = resp.read().decode("utf-8")
+        self.assertIn("JSON API", html)
+        self.assertIn("/api/baselines", html)
+
+
+def urllib_parse(path: Path) -> str:
+    from urllib.parse import quote
+
+    return quote(str(path), safe="/")
 
 
 if __name__ == "__main__":

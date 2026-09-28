@@ -81,9 +81,21 @@ watches folders for new/changed files, and writes JSON + text reports.
   review severity-coloured findings, and manage the quarantine
   (`python3 -m antivirus gui`)
 - **Web console** — a browser UI + JSON API on the standard-library
-  `http.server` (no packages): scan jobs with live progress, results
-  table, quarantine manager and signature editor
+  `http.server` (no packages): scan jobs with **live findings feed**,
+  results table with text filter, quick single-file check (type,
+  digests, mini-scan), integrity baselines, report history, quarantine
+  manager, signature editor and built-in API docs
   (`python3 -m antivirus web --port 8420`)
+- **Terminal UI** — a curses TUI with live scan progress, coloured
+  findings list, detail view and scan options
+  (`python3 -m antivirus tui`)
+- **Usable as a module** — `import antivirus` for a one-shot
+  `antivirus.scan(target)`, or `from antivirus import Antivirus` for a
+  long-lived engine (signatures, quarantine, baselines, file info) in
+  your own programs — see [Using it as a module](#using-it-as-a-module)
+- **File identification** — `fileinfo FILE…` (and `/api/fileinfo` in the
+  web console) reports the file type from magic bytes + extension, size,
+  mtime and SHA-256/MD5
 - **File-integrity baselines** — `manifest DIR` hashes a tree into a JSON
   baseline; a later `scan DIR --baseline FILE` reports every file that
   changed, appeared or disappeared (classic FIM)
@@ -326,9 +338,47 @@ original path, timestamp and reason recorded in `quarantine/manifest.json`.
 | `manifest TARGET [--out FILE]` | Build a file-integrity baseline (SHA-256 of every file) |
 | `samples [DIR]` | Write the inert demo sample tree (safe test material) |
 | `web [--host 0.0.0.0] [--port 8420]` | Open the web console (dashboard + JSON API) |
+| `tui [TARGET]` | Terminal UI (curses): live scan, findings, options |
+| `fileinfo FILE…` | Identify files: type (magic), size, mtime, SHA-256/MD5 |
 
 Common options (most commands): `--signatures FILE`, `--quarantine-dir DIR`,
 `--report-dir DIR`, `--max-size BYTES`.
+
+## Using it as a module
+
+Everything is standard-library only, so the package drops straight into
+another project — no installation, no dependencies:
+
+```python
+import antivirus                      # one-shot, artefacts under ./
+
+result = antivirus.scan("/path/to/scan", fast=True)
+print(result.clean, result.worst_severity)
+for f in result.findings:             # Finding: severity, name, path, kind, message
+    print(f"[{f.severity}] {f.name}  {f.path}")
+
+# --- long-lived engine with its own working area -------------------------
+from antivirus import Antivirus
+
+av = Antivirus(base="~/.myapp")       # signatures/cache/reports/quarantine
+                                       # /baselines live under ~/.myapp
+result = av.scan("some/dir", action="quarantine")
+print(result.notes)                   # {path: "quarantined as …"}
+
+av.add_signature(id="AV-MINE-001", name="Mine",
+                 pattern="UNIQUE-MARKER", severity="high")
+av.scan_file("suspicious.bin")        # -> [Finding, …]
+av.file_info("suspicious.bin")        # type (magic), size, mtime, sha256, md5
+baseline = av.manifest("some/dir")    # integrity baseline (dict)
+av.save_manifest(baseline, "baseline.json")
+av.quarantine.restore("275a021b-…")
+av.remove_signature("AV-MINE-001")
+```
+
+`antivirus.scan` returns a `ScanResult` (see `antivirus.scanner`) and
+`av.scan` additionally carries a `notes` attribute for applied actions.
+The same components back the CLI, GUI, TUI and web console, so behaviour
+is identical in every front-end.
 
 ## Web console
 
@@ -339,44 +389,74 @@ python3 -m antivirus web --port 8420
 
 The dashboard (single page, no external assets, dark theme) offers:
 
-- **Scan jobs** — target + action (detect / quarantine / delete), `--fast`
-  and `--since` options; each scan runs in a background thread and the UI
-  polls live progress (files / MiB / findings), then renders the
-  severity-coloured results table. Past jobs stay clickable in the job list.
+- **Scan jobs** — target + action (detect / quarantine / delete),
+  `fast` / `since` options and an integrity-baseline selector; each scan
+  runs in a background thread and the UI polls **live progress and a
+  running findings feed**. Past jobs stay clickable in the job list.
+- **Results with text filter** — filter findings by name / file / kind /
+  detail while they stream in.
+- **Quick file check** — type any file path: type (magic), size, mtime,
+  SHA-256/MD5 plus a single-file mini-scan.
+- **Integrity baselines** — create a manifest from the current target and
+  scan against it (changed / missing / new files).
+- **Report history** — saved-report summary + latest reports.
 - **Quarantine manager** — list, restore or purge quarantined files.
 - **Signature editor** — add (pattern / sha256 / md5), inspect and remove
   signatures; changes apply to the very next scan.
+- **API docs** — the JSON API is documented in-browser at `/api/docs`.
 
 JSON API (useful for scripting / your own front-end):
 
 | Endpoint | Method | Purpose |
 | --- | --- | --- |
 | `/api/health` | GET | engine status + version |
-| `/api/scan` | POST | start a job: `{"target", "action", "fast", "no_archives", "since"}` |
+| `/api/scan` | POST | start a job: `{"target", "action", "fast", "no_archives", "since", "baseline"}` |
 | `/api/jobs` | GET | all jobs (summary) |
-| `/api/jobs/<id>` | GET | job progress + full result when done |
+| `/api/jobs/<id>` | GET | job progress + `findings_preview` (live) + full result when done |
 | `/api/quarantine` | GET | quarantined items |
 | `/api/quarantine/restore` / `/api/quarantine/purge` | POST | `{"id"}` |
 | `/api/signatures` | GET / POST | list / add signatures |
 | `/api/signatures/remove` | POST | `{"id"}` |
+| `/api/baselines` | GET / POST | list / create integrity baselines (`{"target", "id?"}`) |
+| `/api/fileinfo` | GET | `?path=…` — type, size, mtime, SHA-256/MD5 + single-file findings |
+| `/api/reports` / `/api/reports/summary` | GET | saved reports / aggregate |
+| `/api/docs` | GET | in-browser API documentation |
 
 The console binds to `0.0.0.0` by default and has **no authentication** —
 it is a local tool, so only expose it on interfaces you trust.
+
+## Terminal UI
+
+```bash
+python3 -m antivirus tui            # or: tui /path/to/scan
+```
+
+A curses screen (standard library, Unix-like systems) with a live
+progress line, a scrollable severity-coloured findings list (findings
+appear while the scan runs) and per-finding detail. Keys: `s` scan,
+`e` edit target, `j/k` move, `g/G` top/bottom, `t` fast, `a` cycle
+action, `f` incremental window, `?` help, `q` quit. The TUI shares the
+web console's job engine, so every feature (quarantine, signatures,
+baselines) works identically in all front-ends.
 
 ## Project layout
 
 ```
 antivirus/
-├── __init__.py      # package metadata
+├── __init__.py      # package metadata + module API exports
 ├── __main__.py      # python3 -m antivirus
+├── api.py           # high-level module API (Antivirus, scan, scan_file)
 ├── cli.py           # argparse CLI + console output
 ├── gui.py           # Tkinter graphical interface (python3 -m antivirus gui)
+├── tui.py           # curses terminal UI (model + renderer)
+├── web.py           # web console (dashboard + JSON API, http.server)
 ├── config.py        # all tunables in one dataclass
 ├── models.py        # Finding dataclass + entropy helpers
 ├── cache.py         # scan cache (fast rescans of unchanged files)
 ├── behavior.py      # behavioural analysis (Python AST, shell/PS/batch,
 │                    #   PE/ELF import tables, binary IOCs, SUID)
 ├── pe.py            # PE32/PE32+ dissection ("debug report") + indicators
+├── fileinfo.py      # file identification (magic + digests)
 ├── integrity.py     # file-integrity baselines (manifest + diff)
 ├── samples.py       # builder for the inert demo samples (fake PE/ELF,
 │                    #   sneaky ZIP/TAR.GZ, `samples` tree)
@@ -385,7 +465,6 @@ antivirus/
 ├── quarantine.py    # quarantine store with manifest, restore, purge
 ├── monitor.py       # polling directory watcher
 ├── report.py        # JSON + text report writer, diff, summary
-├── web.py           # web console (dashboard + JSON API, http.server)
 ├── selftest.py      # built-in end-to-end self test
 ├── output.py        # tiny ANSI colour helper
 └── utils.py         # shared helpers

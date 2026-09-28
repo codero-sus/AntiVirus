@@ -89,6 +89,46 @@ class ReportWriter:
         return files
 
 
+def summarize_reports(report_paths: List[Path]) -> Dict:
+    """Aggregate saved report documents (pure – shared by CLI and web).
+
+    Returns ``{"reports", "infected", "clean", "total_findings",
+    "by_severity", "top_indicators"}``.
+    """
+    infected = 0
+    total_findings = 0
+    by_name: Dict[str, int] = {}
+    by_sev: Dict[str, int] = {}
+    count = 0
+    for f in report_paths:
+        try:
+            data = json.loads(Path(f).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        count += 1
+        if not data.get("clean"):
+            infected += 1
+        for finding in data.get("findings", []):
+            total_findings += 1
+            name = finding.get("name", "?")
+            by_name[name] = by_name.get(name, 0) + 1
+            sev = finding.get("severity", "info")
+            by_sev[sev] = by_sev.get(sev, 0) + 1
+    order = ("critical", "high", "medium", "low", "info")
+    return {
+        "reports": count,
+        "infected": infected,
+        "clean": count - infected,
+        "total_findings": total_findings,
+        "by_severity": {s: by_sev[s] for s in order if s in by_sev},
+        "top_indicators": [
+            {"name": n, "count": c}
+            for n, c in sorted(by_name.items(),
+                               key=lambda kv: (-kv[1], kv[0]))[:10]
+        ],
+    }
+
+
 def diff_reports(old: Dict, new: Dict) -> Dict[str, List[Dict]]:
     """Compare two saved scan-report documents (JSON dicts).
 

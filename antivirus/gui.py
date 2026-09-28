@@ -70,6 +70,19 @@ def finding_row(f: Finding) -> Tuple[str, str, str, str, str]:
     return (f.severity, f.name, f.path, f.kind, f.message)
 
 
+def finding_matches(f: Finding, text: str, severities) -> bool:
+    """Pure filter predicate (headless-testable): text over severity, name,
+    path, kind and message, plus an optional set of allowed severities
+    (``None`` = all)."""
+    if severities is not None and f.severity not in severities:
+        return False
+    text = (text or "").strip().lower()
+    if not text:
+        return True
+    haystack = " ".join((f.severity, f.name, f.path, f.kind, f.message))
+    return text in haystack.lower()
+
+
 def summarize(result: ScanResult, notes: Dict[str, str]) -> str:
     """One-line scan summary for the status bar / log."""
     threats = {f.path for f in result.findings}
@@ -132,6 +145,7 @@ if _TK_AVAILABLE:
             self._last_result: Optional[ScanResult] = None
             self._last_notes: Dict[str, str] = {}
             self._scanned_paths: Dict[str, List[Finding]] = {}
+            self._all_findings: List[Finding] = []
 
             self._build_ui()
             self._log(f"AntiVirus {__version__} – educational tool. "
@@ -175,6 +189,20 @@ if _TK_AVAILABLE:
             self.no_behavior_var = tk.BooleanVar(value=False)
             ttk.Checkbutton(opts, text="no behaviour analysis",
                             variable=self.no_behavior_var).pack(side="left", padx=8)
+            ttk.Separator(opts, orient="vertical").pack(side="left", fill="y",
+                                                        padx=8)
+            ttk.Label(opts, text="Fast:").pack(side="left")
+            self.fast_var = tk.BooleanVar(value=False)
+            ttk.Checkbutton(opts, text="fast (hash+pattern only)",
+                            variable=self.fast_var).pack(side="left", padx=4)
+            ttk.Label(opts, text="Since:").pack(side="left", padx=(10, 2))
+            self.since_var = tk.StringVar(value="")
+            ttk.Entry(opts, textvariable=self.since_var, width=6).pack(
+                side="left")
+            ttk.Label(opts, text="Exclude:").pack(side="left", padx=(10, 2))
+            self.exclude_var = tk.StringVar(value="")
+            ttk.Entry(opts, textvariable=self.exclude_var, width=18).pack(
+                side="left")
 
             btns = ttk.Frame(self)
             btns.pack(fill="x", **pad)
@@ -200,6 +228,33 @@ if _TK_AVAILABLE:
             # -- Findings tab --------------------------------------------------
             f_tab = ttk.Frame(self.nb)
             self.nb.add(f_tab, text=" Findings")
+
+            fabs = ttk.Frame(f_tab)
+            fabs.pack(fill="x", side="bottom", pady=(4, 0))
+            ttk.Button(fabs, text="PE analyze…",
+                       command=self._pe_analyze_selected).pack(side="left")
+            ttk.Button(fabs, text="File info…",
+                       command=self._file_info_selected).pack(side="left",
+                                                              padx=4)
+            ttk.Button(fabs, text="Open file location",
+                       command=self._open_finding_location).pack(side="left",
+                                                                 padx=4)
+
+            fbar = ttk.Frame(f_tab)
+            fbar.pack(fill="x", side="bottom", pady=(0, 4))
+            self.filter_var = tk.StringVar()
+            filt = ttk.Entry(fbar, textvariable=self.filter_var)
+            filt.pack(side="left", fill="x", expand=True)
+            filt.bind("<KeyRelease>", lambda _e: self._apply_filter())
+            self.filter_var.trace_add("write", lambda *_a: self._apply_filter())
+            self._sev_vars: Dict[str, tk.BooleanVar] = {}
+            for sev in ("critical", "high", "medium", "low", "info"):
+                var = tk.BooleanVar(value=True)
+                self._sev_vars[sev] = var
+                ttk.Checkbutton(fbar, text=sev, variable=var,
+                                command=self._apply_filter).pack(side="left",
+                                                                 padx=(6, 0))
+
             cols = ("severity", "name", "file", "kind")
             widths = {"severity": 80, "name": 260, "file": 380, "kind": 150}
             self.findings_tree = ttk.Treeview(
@@ -291,10 +346,27 @@ if _TK_AVAILABLE:
             action = self.action_var.get()
             self.scanner.threads = self.threads_var.get()
             self.config.behavior_enabled = not self.no_behavior_var.get()
+            self.config.fast_mode = self.fast_var.get()
+            since_text = self.since_var.get().strip()
+            if since_text:
+                from .utils import parse_since
+
+                try:
+                    self.config.since_ts = time.time() - parse_since(since_text)
+                except ValueError as exc:
+                    messagebox.showerror("AntiVirus", str(exc))
+                    return
+            else:
+                self.config.since_ts = 0.0
+            exclude_text = self.exclude_var.get().strip()
+            self.config.exclude_patterns = (
+                tuple(g.strip() for g in exclude_text.split(",") if g.strip())
+                if exclude_text else ())
             self._stop.clear()
             self._last_result = None
             self._last_notes = {}
             self._scanned_paths = {}
+            self._all_findings = []
             for iid in self.findings_tree.get_children():
                 self.findings_tree.delete(iid)
             self.detail_text.configure(state="normal")
@@ -469,12 +541,91 @@ if _TK_AVAILABLE:
             self.after(100, self._poll_queue)
 
         def _add_finding(self, f: Finding) -> None:
-            row = finding_row(f)
+            self._all_findings.append(f)
+            self._scanned_paths.setdefault(f.path, []).append(f)
+            if self._finding_visible(f):
+                self._insert_row(f)
+
+        def _finding_visible(self, f: Finding) -> bool:
+            severities = {s for s, v in self._sev_vars.items() if v.get()}
+            return finding_matches(f, self.filter_var.get(), severities)
+
+        def _insert_row(self, f: Finding) -> None:
             self.findings_tree.insert(
-                "", "end", values=row,
+                "", "end", values=finding_row(f),
                 tags=(f.severity, Path(f.path).name),
                 iid=f"{f.path}\x1f{f.name}\x1f{len(self._scanned_paths.get(f.path, []))}")
-            self._scanned_paths.setdefault(f.path, []).append(f)
+
+        def _apply_filter(self) -> None:
+            for iid in self.findings_tree.get_children():
+                self.findings_tree.delete(iid)
+            for f in self._all_findings:
+                if self._finding_visible(f):
+                    self._insert_row(f)
+
+        def _selected_finding_path(self) -> Optional[str]:
+            sel = self.findings_tree.selection()
+            if not sel:
+                messagebox.showinfo("AntiVirus", "Select a finding first.")
+                return None
+            return sel[0].split("\x1f")[0]
+
+        def _show_text_dialog(self, title: str, text: str) -> None:
+            win = tk.Toplevel(self)
+            win.title(title)
+            win.geometry("780x500")
+            win.minsize(480, 300)
+            txt = tk.Text(win, wrap="none", relief="sunken")
+            vsb = ttk.Scrollbar(win, orient="vertical", command=txt.yview)
+            hsb = ttk.Scrollbar(win, orient="horizontal", command=txt.xview)
+            txt.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+            txt.pack(side="left", fill="both", expand=True)
+            vsb.pack(side="left", fill="y")
+            hsb.pack(side="bottom", fill="x")
+            txt.insert("1.0", text)
+            txt.configure(state="disabled")
+            win.protocol("WM_DELETE_WINDOW", win.destroy)
+
+        def _pe_analyze_selected(self) -> None:
+            path = self._selected_finding_path()
+            if path is None:
+                return
+            try:
+                data = Path(path).read_bytes()
+            except OSError as exc:
+                messagebox.showerror("AntiVirus", f"Cannot read {path}:\n{exc}")
+                return
+            try:
+                from .pe import parse_pe, pe_indicators, render_pe_report
+
+                info = parse_pe(data)
+                report = render_pe_report(info, pe_indicators(info))
+            except Exception as exc:  # malformed PE etc.
+                report = f"PE analysis failed: {exc}"
+            self._show_text_dialog(f"PE analysis – {Path(path).name}", report)
+
+        def _file_info_selected(self) -> None:
+            path = self._selected_finding_path()
+            if path is None:
+                return
+            try:
+                from .fileinfo import file_info, render_file_info
+
+                info = file_info(Path(path))
+                self._show_text_dialog(f"File info – {info['name']}",
+                                       render_file_info(info))
+            except OSError as exc:
+                messagebox.showerror("AntiVirus", f"Cannot read {path}:\n{exc}")
+
+        def _open_finding_location(self) -> None:
+            path = self._selected_finding_path()
+            if path is None:
+                return
+            loc = Path(path)
+            if loc.is_file():
+                loc = loc.parent
+            if not open_in_file_manager(loc):
+                self._log(f"Location: {loc.resolve()}")
 
         def _on_finding_select(self, _event=None) -> None:
             sel = self.findings_tree.selection()

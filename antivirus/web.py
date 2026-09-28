@@ -62,7 +62,7 @@ main{display:grid;grid-template-columns:1.6fr 1fr;gap:14px;padding:14px;max-widt
 @media(max-width:980px){main{grid-template-columns:1fr}}
 section{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:14px}
 h2{font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin:0 0 10px}
-form.scan{display:grid;grid-template-columns:1fr 150px 150px;gap:8px}
+form.scan{display:grid;grid-template-columns:1fr 140px 130px;gap:8px}
 input,select{background:#0d1117;color:var(--text);border:1px solid var(--border);border-radius:6px;padding:8px 10px;font-size:13px;width:100%}
 label.opt{display:flex;align-items:center;gap:6px;font-size:13px;color:var(--muted);width:auto}
 button{background:var(--accent);border:0;border-radius:6px;color:#fff;padding:8px 16px;font-size:13px;cursor:pointer;width:auto}
@@ -90,6 +90,10 @@ td{padding:6px 8px;border-bottom:1px solid #21262d;vertical-align:top;word-break
 .joblist li{padding:5px 8px;border-bottom:1px solid #21262d;cursor:pointer}
 .joblist li:hover{background:#1c2129}
 .joblist li.active{background:#1f2937}
+pre{background:#0d1117;border:1px solid var(--border);border-radius:6px;padding:10px;overflow:auto;font-size:12px;max-height:280px}
+footer{text-align:center;color:var(--muted);font-size:12px;padding:10px 0 18px}
+footer a{color:var(--accent)}
+.live{color:var(--accent)}
 </style>
 </head>
 <body>
@@ -117,6 +121,14 @@ td{padding:6px 8px;border-bottom:1px solid #21262d;vertical-align:top;word-break
           <label class="opt"><input type="checkbox" id="no-archives" style="width:auto"> skip archives</label>
           <button type="submit">Scan</button>
         </div>
+        <div style="display:flex;gap:6px;align-items:center;grid-column:1/-1">
+          <label class="opt" style="flex:0 0 auto">integrity baseline:</label>
+          <select id="baseline" style="width:260px">
+            <option value="">(off)</option>
+          </select>
+          <button type="button" class="ghost small" onclick="newBaseline()">new from target</button>
+          <span class="muted">compares this scan against a saved manifest (changed / missing / new files)</span>
+        </div>
       </form>
       <div id="job-status" class="muted" style="display:none">
         <div class="progress"><div id="progress-bar"></div></div>
@@ -124,13 +136,22 @@ td{padding:6px 8px;border-bottom:1px solid #21262d;vertical-align:top;word-break
       </div>
     </section>
     <section style="margin-top:14px">
-      <h2>Results <span class="muted" id="result-target"></span></h2>
+      <h2>Results <span class="muted" id="result-target"></span> <span class="muted live" id="live-flag"></span></h2>
       <div class="summary" id="summary"></div>
+      <input id="filter" placeholder="filter findings (name / file / kind / detail)…" style="margin-bottom:8px">
       <table id="findings" style="display:none">
         <thead><tr><th>Severity</th><th>Finding</th><th>Kind</th><th>File</th></tr></thead>
         <tbody></tbody>
       </table>
       <div class="empty" id="clean-msg" style="display:none">No threats found.</div>
+    </section>
+    <section style="margin-top:14px">
+      <h2>Quick file check</h2>
+      <div style="display:flex;gap:6px">
+        <input id="qpath" placeholder="path to a single file (e.g. samples/behavior/suspicious.exe)">
+        <button type="button" class="ghost" onclick="quickScan()">inspect</button>
+      </div>
+      <pre id="qout" style="display:none"></pre>
     </section>
   </div>
   <div>
@@ -167,8 +188,13 @@ td{padding:6px 8px;border-bottom:1px solid #21262d;vertical-align:top;word-break
         </div>
       </form>
     </section>
+    <section style="margin-top:14px">
+      <h2>Report history</h2>
+      <div id="reports" class="muted">…</div>
+    </section>
   </div>
 </main>
+<footer id="footer"></footer>
 <script>
 const $ = id => document.getElementById(id);
 async function api(path, body, method) {
@@ -179,35 +205,65 @@ async function api(path, body, method) {
   try { data = await r.json(); } catch (e) {}
   return {ok: r.ok, status: r.status, data};
 }
-let currentJob = null, pollTimer = null;
+let currentJob = null, pollTimer = null, lastFindings = [];
 
 function esc(s) { const d = document.createElement("div"); d.textContent = s == null ? "" : String(s); return d.innerHTML; }
 function sevClass(s) { return ["critical","high","medium","low","info"].includes(s) ? s : "info"; }
+function fmtMiB(n) { return (n / 1048576).toFixed(1); }
 
 async function init() {
   const h = await api("/api/health");
   $("ver").textContent = "v" + (h.data.version || "?");
   if (!h.ok) $("engine-dot").style.background = "var(--red)";
-  loadJobs(); loadQuarantine(); loadSigs();
+  $("footer").innerHTML = "AntiVirus Web Console · " + (h.data.version || "") +
+    ' · <a href="/api/docs">API documentation</a>';
+  loadJobs(); loadQuarantine(); loadSigs(); loadBaselines(); loadReports();
   setInterval(() => { $("clock").textContent = new Date().toLocaleTimeString(); }, 1000);
+  $("filter").addEventListener("input", renderFindings);
 }
 
+/* ------------------------------------------------------------- scan flow */
 $("scan-form").addEventListener("submit", async e => {
   e.preventDefault();
   const body = {target: $("target").value.trim() || ".", action: $("action").value,
-                fast: $("fast").checked, no_archives: $("no-archives").checked};
+                fast: $("fast").checked, no_archives: $("no-archives").checked,
+                baseline: $("baseline").value};
   const since = $("since").value.trim();
   if (since) body.since = since;
   const r = await api("/api/scan", body);
   if (!r.ok) { alert("Scan failed: " + (r.data.error || r.status)); return; }
   currentJob = r.data.job;
+  lastFindings = [];
+  renderFindings();
   startPolling();
 });
+
+async function newBaseline() {
+  const target = $("target").value.trim() || ".";
+  const r = await api("/api/baselines", {target: target});
+  if (!r.ok) { alert("Baseline failed: " + (r.data.error || r.status)); return; }
+  loadBaselines();
+  $("baseline").value = r.data.id;
+}
+async function loadBaselines() {
+  const r = await api("/api/baselines");
+  if (!r.ok) return;
+  const sel = $("baseline");
+  const current = sel.value;
+  sel.innerHTML = '<option value="">(off)</option>';
+  for (const b of r.data.baselines) {
+    const o = document.createElement("option");
+    o.value = b.id; o.textContent = b.id;
+    sel.appendChild(o);
+  }
+  if (current) sel.value = current;
+}
 
 function startPolling() {
   if (pollTimer) clearInterval(pollTimer);
   $("job-status").style.display = "block";
   $("progress-bar").style.width = "8%";
+  $("live-flag").textContent = "";
   pollTimer = setInterval(pollJob, 1000);
   pollJob();
 }
@@ -217,34 +273,47 @@ async function pollJob() {
   if (!r.ok) { stopPolling(); return; }
   const j = r.data.job;
   $("progress-text").textContent = j.target + " — " + j.files_scanned +
-    " file(s), " + (j.bytes_scanned / 1048576).toFixed(1) + " MiB, " +
-    j.findings + " finding(s)";
+    " file(s), " + fmtMiB(j.bytes_scanned) + " MiB, " +
+    j.findings + " finding(s)" + (j.baseline ? " [vs baseline]" : "");
   if (j.status === "running") {
     $("progress-bar").style.width = "40%";
+    $("live-flag").textContent = "(live)";
+    lastFindings = r.data.findings_preview || [];
+    renderFindings();
     loadJobs();
   } else {
     stopPolling();
     $("progress-bar").style.width = "100%";
+    $("live-flag").textContent = "";
     if (j.status === "error") alert("Scan error: " + j.error);
     if (r.data.result) showResult(r.data.result);
-    loadJobs(); loadQuarantine();
+    loadJobs(); loadQuarantine(); loadReports();
   }
 }
 function stopPolling() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
 
-function showResult(d) {
+function showResult(d, live) {
   $("result-target").textContent = " — " + d.target;
-  const n = d.findings.length;
+  lastFindings = d.findings;
   $("summary").innerHTML =
     '<div class="card"><div class="num">' + d.files_scanned + '</div><div class="muted">files</div></div>' +
-    '<div class="card"><div class="num">' + n + '</div><div class="muted">threats</div></div>' +
-    '<div class="card"><div class="num">' + d.files_cached + '</div><div class="muted">cached</div></div>' +
-    '<div class="card"><div class="num">' + d.elapsed_seconds + 's</div><div class="muted">duration</div></div>';
+    '<div class="card"><div class="num">' + lastFindings.length + '</div><div class="muted">threats</div></div>' +
+    '<div class="card"><div class="num">' + (d.files_cached || 0) + '</div><div class="muted">cached</div></div>' +
+    '<div class="card"><div class="num">' + (d.elapsed_seconds != null ? d.elapsed_seconds : "…") + 's</div><div class="muted">duration</div></div>';
+  renderFindings();
+}
+
+function renderFindings() {
+  const text = ($("filter").value || "").toLowerCase();
   const tb = $("findings").querySelector("tbody");
   tb.innerHTML = "";
-  $("findings").style.display = n ? "table" : "none";
-  $("clean-msg").style.display = n ? "none" : "block";
-  for (const f of d.findings) {
+  const shown = lastFindings.filter(f => !text ||
+    (f.name + " " + f.path + " " + f.kind + " " + f.message).toLowerCase().includes(text));
+  $("findings").style.display = shown.length ? "table" : "none";
+  $("clean-msg").style.display = shown.length ? "none" : "block";
+  $("clean-msg").textContent = lastFindings.length ?
+    "No findings match the filter." : "No threats found.";
+  for (const f of shown) {
     const tr = document.createElement("tr");
     tr.innerHTML =
       '<td><span class="badge ' + sevClass(f.severity) + '">' + esc(f.severity).toUpperCase() + '</span></td>' +
@@ -255,6 +324,7 @@ function showResult(d) {
   }
 }
 
+/* ----------------------------------------------------------------- jobs */
 async function loadJobs() {
   const r = await api("/api/jobs");
   if (!r.ok) return;
@@ -275,6 +345,7 @@ async function viewJob(id) {
   if (r.ok && r.data.result) showResult(r.data.result);
 }
 
+/* ------------------------------------------------------------- quarantine */
 async function loadQuarantine() {
   const r = await api("/api/quarantine");
   if (!r.ok) return;
@@ -295,6 +366,7 @@ async function loadQuarantine() {
 async function qRestore(id) { const r = await api("/api/quarantine/restore", {id}); if (!r.ok) alert(r.data.error || "restore failed"); loadQuarantine(); }
 async function qPurge(id) { if (!confirm("Purge permanently?")) return; const r = await api("/api/quarantine/purge", {id}); if (!r.ok) alert(r.data.error || "purge failed"); loadQuarantine(); }
 
+/* -------------------------------------------------------------- signatures */
 async function loadSigs() {
   const r = await api("/api/signatures");
   if (!r.ok) return;
@@ -327,8 +399,107 @@ $("sig-form").addEventListener("submit", async e => {
 });
 async function sigRemove(id) { const r = await api("/api/signatures/remove", {id}); if (!r.ok) alert(r.data.error || "remove failed"); loadSigs(); }
 
+/* --------------------------------------------------------- quick file check */
+async function quickScan() {
+  const path = $("qpath").value.trim();
+  const out = $("qout");
+  if (!path) return;
+  out.style.display = "block";
+  out.textContent = "inspecting " + path + " …";
+  const r = await api("/api/fileinfo?path=" + encodeURIComponent(path));
+  if (!r.ok) { out.textContent = "error: " + (r.data.error || r.status); return; }
+  const d = r.data;
+  let text =
+    "type:   " + d.type + "\n" +
+    "size:   " + d.size + " bytes    mtime: " + d.mtime_iso + "\n" +
+    "sha256: " + d.sha256 + "\n" +
+    "md5:    " + d.md5 + "\n\n";
+  text += d.findings.length ?
+    d.findings.length + " finding(s):\n" +
+    d.findings.map(f => "  [" + f.severity + "] " + f.name + " — " + f.message).join("\n") :
+    "no findings";
+  out.textContent = text;
+}
+
+/* ------------------------------------------------------------- reports */
+async function loadReports() {
+  const [list, sum] = await Promise.all([api("/api/reports"), api("/api/reports/summary")]);
+  if (!list.ok) return;
+  const el = $("reports");
+  let text = "summary: " + sum.data.reports + " report(s), " +
+    sum.data.infected + " infected, " + sum.data.total_findings +
+    " total finding(s)\n";
+  const top = (sum.data.top_indicators || []).slice(0, 3);
+  if (top.length) text += "top: " + top.map(t => t.name + " ×" + t.count).join(", ") + "\n";
+  text += "latest: ";
+  const recent = list.data.reports.slice(-4).reverse();
+  el.textContent = text + (recent.length ? "" : "none");
+  for (const r of recent) {
+    el.textContent += "\n· " + r.name + " — " + (r.clean ? "clean" : r.findings + " finding(s)");
+  }
+}
+
 init();
 </script>
+</body>
+</html>
+"""
+
+
+DOCS_PAGE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>AntiVirus API</title>
+<style>
+body{font:14px/1.5 -apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+     background:#0d1117;color:#e6edf3;max-width:900px;margin:0 auto;padding:24px}
+h1{font-size:20px}
+code{background:#161b22;border:1px solid #30363d;border-radius:4px;
+     padding:1px 6px;font-size:13px}
+table{border-collapse:collapse;width:100%;margin:14px 0}
+th,td{border:1px solid #30363d;padding:6px 10px;text-align:left;
+      vertical-align:top;font-size:13px}
+th{background:#161b22}
+.mut{color:#8b949e}
+a{color:#2f81f7}
+</style>
+</head>
+<body>
+<h1>AntiVirus Web Console — JSON API</h1>
+<p class="mut">Local tool — no authentication. All endpoints are JSON
+(UTF-8); <code>POST</code> bodies are JSON objects. <a href="/">← back to the console</a></p>
+<table>
+<tr><th>Endpoint</th><th>Method</th><th>Purpose</th></tr>
+<tr><td><code>/api/health</code></td><td>GET</td><td>engine status + version</td></tr>
+<tr><td><code>/api/scan</code></td><td>POST</td><td>start a scan job —
+    <code>{"target","action","fast","no_archives","since","baseline"}</code></td></tr>
+<tr><td><code>/api/jobs</code></td><td>GET</td><td>all jobs (summary)</td></tr>
+<tr><td><code>/api/jobs/&lt;id&gt;</code></td><td>GET</td><td>job progress,
+    <code>findings_preview</code> (live), and the full <code>result</code> when done</td></tr>
+<tr><td><code>/api/quarantine</code></td><td>GET</td><td>quarantined items</td></tr>
+<tr><td><code>/api/quarantine/restore</code> / <code>/api/quarantine/purge</code></td><td>POST</td><td><code>{"id"}</code></td></tr>
+<tr><td><code>/api/signatures</code></td><td>GET / POST</td><td>list / add signatures
+    (<code>id,name,severity,category,description,sha256,md5,pattern</code>)</td></tr>
+<tr><td><code>/api/signatures/remove</code></td><td>POST</td><td><code>{"id"}</code></td></tr>
+<tr><td><code>/api/baselines</code></td><td>GET</td><td>list integrity baselines (manifests)</td></tr>
+<tr><td><code>/api/baselines</code></td><td>POST</td><td>create one —
+    <code>{"target","id?"}</code>; pass the returned <code>id</code> as
+    <code>baseline</code> in <code>/api/scan</code> to report changed /
+    missing / new files</td></tr>
+<tr><td><code>/api/fileinfo</code></td><td>GET</td><td><code>?path=…</code> —
+    type (magic), size, mtime, SHA-256/MD5 plus a single-file scan
+    (<code>findings</code>)</td></tr>
+<tr><td><code>/api/reports</code></td><td>GET</td><td>saved reports (list)</td></tr>
+<tr><td><code>/api/reports/summary</code></td><td>GET</td><td>aggregate of all saved reports</td></tr>
+<tr><td><code>/api/docs</code></td><td>GET</td><td>this page</td></tr>
+</table>
+<h2>Example (curl)</h2>
+<pre>curl -s -X POST localhost:8420/api/scan -d '{{"target":".","action":"detect"}}'
+curl -s localhost:8420/api/jobs/&lt;id&gt;
+curl -s -X POST localhost:8420/api/baselines -d '{{"target":"."}}'
+curl -s -X POST localhost:8420/api/scan \\
+     -d '{{"target":".","baseline":"baseline-20260928-120000"}}'</pre>
 </body>
 </html>
 """
@@ -339,10 +510,12 @@ class ScanJob:
     """One scan running in a background thread (progress-pollable)."""
 
     def __init__(self, scanner: Scanner, target: Path, action: str = "detect",
-                 quarantine: Optional[Quarantine] = None) -> None:
+                 quarantine: Optional[Quarantine] = None,
+                 baseline: Optional[Path] = None) -> None:
         self.id = uuid.uuid4().hex[:12]
         self.target = str(target)
         self.action = action
+        self.baseline: Optional[str] = str(baseline) if baseline else None
         self.status = "running"
         self.error: Optional[str] = None
         self.started_at = time.time()
@@ -352,32 +525,29 @@ class ScanJob:
         self._scanner = scanner
         self._target = Path(target)
         self._quarantine = quarantine
+        self._baseline = baseline
         self.thread = threading.Thread(target=self._run, daemon=True)
 
     def _run(self) -> None:
         try:
             self._scanner.scan_path(self._target, result=self.result)
+            if self._baseline is not None and self._target.is_dir():
+                from .integrity import (
+                    compare_baseline,
+                    current_from_result,
+                    load_manifest,
+                )
+
+                manifest = load_manifest(self._baseline)
+                extra = compare_baseline(
+                    manifest, current_from_result(self.result, self._target))
+                if extra:
+                    self.result.findings.extend(extra)
             if self.action != "detect":
-                handled = set()
-                for finding in self.result.findings:
-                    if finding.path in handled:
-                        continue
-                    handled.add(finding.path)
-                    path = Path(finding.path)
-                    if not path.exists():
-                        self.notes[finding.path] = "already gone"
-                    elif self.action == "quarantine":
-                        try:
-                            item = self._quarantine.put(path, finding)
-                            self.notes[finding.path] = f"quarantined as {item.id}"
-                        except OSError as exc:
-                            self.notes[finding.path] = f"quarantine failed: {exc}"
-                    else:  # delete
-                        try:
-                            path.unlink()
-                            self.notes[finding.path] = "deleted"
-                        except OSError as exc:
-                            self.notes[finding.path] = f"delete failed: {exc}"
+                from .api import apply_actions
+
+                self.notes = apply_actions(self.result, self._quarantine,
+                                           self.action)
             self.status = "done"
         except Exception as exc:  # the UI needs a reason, not a traceback
             self.status = "error"
@@ -386,6 +556,10 @@ class ScanJob:
             self.result.finished_at = time.time()
             self.finished_at = self.result.finished_at
 
+    def findings_preview(self, limit: int = 100) -> List[dict]:
+        """Lightweight findings collected so far (for live progress UIs)."""
+        return [f.to_dict() for f in self.result.findings[:limit]]
+
     def progress(self) -> dict:
         r = self.result
         now = self.finished_at or time.time()
@@ -393,6 +567,7 @@ class ScanJob:
             "id": self.id,
             "target": self.target,
             "action": self.action,
+            "baseline": self.baseline,
             "status": self.status,
             "error": self.error,
             "started_at": self.started_at,
@@ -443,8 +618,17 @@ class WebApp:
                 cfg.since_ts = time.time() - parse_since(since)
             except ValueError as exc:
                 raise ValueError(f"invalid --since duration: {since!r}") from exc
+        baseline_path: Optional[Path] = None
+        if opts.get("baseline"):
+            baseline_path = self.resolve_baseline(str(opts["baseline"]))
+            if baseline_path is None:
+                raise ValueError(f"no such baseline: {opts['baseline']!r}")
+            # A baseline comparison needs the *current* hash of every file;
+            # cached verdicts carry no digests, so bypass the cache.
+            cfg.cache_enabled = False
         scanner = Scanner(cfg, self.db)
-        job = ScanJob(scanner, target, action, self.quarantine)
+        job = ScanJob(scanner, target, action, self.quarantine,
+                      baseline=baseline_path)
         with self._lock:
             self.jobs[job.id] = job
             if len(self.jobs) > 64:  # keep the job table bounded
@@ -467,11 +651,84 @@ class WebApp:
         job = self.job(job_id)
         if job is None:
             return None
-        data = {"job": job.progress()}
+        data = {"job": job.progress(),
+                "findings_preview": job.findings_preview()}
         result = job.result_dict()
         if result is not None:
             data["result"] = result
         return data
+
+    # -------------------------------------------------------- baselines (FIM)
+    def create_baseline(self, target: Path, baseline_id: Optional[str] = None
+                        ) -> dict:
+        from .integrity import build_manifest, save_manifest
+
+        target = Path(target)
+        if not target.exists():
+            raise FileNotFoundError(str(target))
+        manifest = build_manifest(target, self.config)
+        if not baseline_id:
+            baseline_id = "baseline-" + time.strftime("%Y%m%d-%H%M%S")
+        safe = "".join(c for c in str(baseline_id) if c.isalnum() or c in "-_")
+        bpath = self.config.baseline_dir / f"{safe}.json"
+        save_manifest(manifest, bpath)
+        return {"id": bpath.stem, "path": str(bpath),
+                "files": len(manifest["files"])}
+
+    def list_baselines(self) -> List[dict]:
+        out: List[dict] = []
+        bdir = self.config.baseline_dir
+        if bdir.is_dir():
+            for p in sorted(bdir.glob("*.json")):
+                out.append({"id": p.stem, "path": str(p)})
+        return out
+
+    def resolve_baseline(self, ref: str) -> Optional[Path]:
+        """Resolve a baseline reference: path, or id in the baseline dir."""
+        p = Path(ref)
+        if p.exists():
+            return p
+        candidate = self.config.baseline_dir / f"{ref}.json"
+        return candidate if candidate.exists() else None
+
+    # ------------------------------------------------------- file utilities
+    def file_info(self, path: str) -> Optional[dict]:
+        from .fileinfo import file_info
+
+        p = Path(path)
+        if not p.exists():
+            return None
+        info = file_info(p)
+        info["findings"] = [f.to_dict()
+                            for f in self.scanner.scan_file(p)]
+        return info
+
+    # ---------------------------------------------------------------- reports
+    def reports(self) -> List[dict]:
+        out: List[dict] = []
+        for p in self.report_paths():
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            out.append({
+                "name": p.name,
+                "target": data.get("target"),
+                "clean": bool(data.get("clean")),
+                "findings": len(data.get("findings", [])),
+                "mtime": p.stat().st_mtime,
+            })
+        return out
+
+    def report_summary(self) -> dict:
+        from .report import summarize_reports
+
+        return summarize_reports(self.report_paths())
+
+    def report_paths(self) -> List[Path]:
+        from .report import ReportWriter
+
+        return ReportWriter(self.config.report_dir).all_reports()
 
 
 # --------------------------------------------------------------------- handler
@@ -537,6 +794,17 @@ class _Handler(BaseHTTPRequestHandler):
             elif path == "/api/signatures":
                 sigs = [asdict(s) for s in self.app.db.list()]
                 self._json(200, {"signatures": sigs})
+            elif path == "/api/baselines":
+                self._json(200, {"baselines": self.app.list_baselines()})
+            elif path == "/api/fileinfo":
+                self._fileinfo()
+            elif path == "/api/reports":
+                self._json(200, {"reports": self.app.reports()})
+            elif path == "/api/reports/summary":
+                self._json(200, self.app.report_summary())
+            elif path == "/api/docs":
+                self._send(200, DOCS_PAGE.encode("utf-8"),
+                           "text/html; charset=utf-8")
             else:
                 self._json(404, {"error": "not found"})
         except (BrokenPipeError, ConnectionResetError):
@@ -547,6 +815,8 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             if path == "/api/scan":
                 self._scan()
+            elif path == "/api/baselines":
+                self._baseline_create()
             elif path == "/api/quarantine/restore":
                 self._quarantine_op("restore")
             elif path == "/api/quarantine/purge":
@@ -582,6 +852,7 @@ class _Handler(BaseHTTPRequestHandler):
             "no_archives": bool(body.get("no_archives")),
             "no_behavior": bool(body.get("no_behavior")),
             "since": body.get("since") or "",
+            "baseline": str(body.get("baseline") or "").strip(),
         }
         try:
             job = self.app.start_scan(Path(target), action, options)
@@ -589,6 +860,40 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(400, {"error": str(exc)})
             return
         self._json(200, {"job": job.progress()})
+
+    def _baseline_create(self) -> None:
+        body = self._body()
+        if body is None:
+            self._json(400, {"error": "invalid JSON body"})
+            return
+        target = str(body.get("target") or "").strip()
+        if not target:
+            self._json(400, {"error": "target is required"})
+            return
+        try:
+            info = self.app.create_baseline(Path(target),
+                                            body.get("id") or None)
+        except FileNotFoundError:
+            self._json(404, {"error": f"no such file or directory: {target}"})
+            return
+        except (OSError, ValueError) as exc:
+            self._json(400, {"error": str(exc)})
+            return
+        self._json(200, info)
+
+    def _fileinfo(self) -> None:
+        from urllib.parse import parse_qs
+
+        query = parse_qs(urlsplit(self.path).query)
+        path = (query.get("path") or [""])[0].strip()
+        if not path:
+            self._json(400, {"error": "path query parameter is required"})
+            return
+        info = self.app.file_info(path)
+        if info is None:
+            self._json(404, {"error": f"no such file: {path}"})
+            return
+        self._json(200, info)
 
     def _quarantine_op(self, op: str) -> None:
         body = self._body()

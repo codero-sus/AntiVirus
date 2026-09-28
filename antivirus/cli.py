@@ -458,6 +458,41 @@ def cmd_hash(args) -> int:
     return 0 if ok else 2
 
 
+# ----------------------------------------------------------------- fileinfo
+def cmd_fileinfo(args) -> int:
+    from .fileinfo import file_info, render_file_info
+
+    ok = True
+    for name in args.files:
+        p = Path(name)
+        if not p.exists():
+            print(paint(f"error: no such file: {name}", RED), file=sys.stderr)
+            ok = False
+            continue
+        print(render_file_info(file_info(p)))
+        print()
+    return 0 if ok else 2
+
+
+# ------------------------------------------------------------------------ tui
+def cmd_tui(args) -> int:
+    from .tui import run_tui, tui_available
+    from .web import WebApp
+
+    if not tui_available():
+        print("error: the TUI needs curses (Unix-like systems with a TTY).",
+              file=sys.stderr)
+        print("Use the CLI instead:  python3 -m antivirus scan .",
+              file=sys.stderr)
+        return 2
+    config, db, scanner, quarantine = _build(args)
+    app = WebApp(config, db, scanner, quarantine)
+    try:
+        return run_tui(app, target=args.target or ".")
+    except KeyboardInterrupt:
+        return 0
+
+
 # ------------------------------------------------------------------ samples
 def cmd_samples(args) -> int:
     from .samples import build_all_samples
@@ -643,46 +678,30 @@ def _load_report_file(config: Config, ref: Optional[str],
 
 
 def _report_summary(config: Config, writer: "ReportWriter") -> int:
-    files = writer.all_reports()
-    if not files:
+    from .report import summarize_reports
+
+    data = summarize_reports(writer.all_reports())
+    if not data["reports"]:
         print("No reports yet. Run a scan first.")
         return 0
-    infected = 0
-    total_findings = 0
-    by_name: Dict[str, int] = {}
-    by_sev: Dict[str, int] = {}
-    for f in files:
-        try:
-            data = json.loads(f.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            continue
-        if not data.get("clean"):
-            infected += 1
-        for finding in data.get("findings", []):
-            total_findings += 1
-            name = finding.get("name", "?")
-            by_name[name] = by_name.get(name, 0) + 1
-            sev = finding.get("severity", "info")
-            by_sev[sev] = by_sev.get(sev, 0) + 1
 
     bar = "=" * 62
     print()
     print(paint(bar, BOLD))
-    print(paint(f" Report summary: {len(files)} report(s) in {config.report_dir}",
-                BOLD))
+    print(paint(f" Report summary: {data['reports']} report(s) "
+                f"in {config.report_dir}", BOLD))
     print(bar)
-    print(f" Infected reports: {infected}    clean: {len(files) - infected}")
-    print(f" Total findings:   {total_findings}")
-    if by_sev:
-        order = ("critical", "high", "medium", "low", "info")
-        parts = [f"{s}: {by_sev[s]}" for s in order if s in by_sev]
+    print(f" Infected reports: {data['infected']}    "
+          f"clean: {data['clean']}")
+    print(f" Total findings:   {data['total_findings']}")
+    if data["by_severity"]:
+        parts = [f"{s}: {c}" for s, c in data["by_severity"].items()]
         print(" By severity:      " + "   ".join(parts))
-    if by_name:
-        top = sorted(by_name.items(), key=lambda kv: (-kv[1], kv[0]))[:10]
+    if data["top_indicators"]:
         print()
         print(paint(" Top indicators:", BOLD))
-        for name, count in top:
-            print(f"   {count:>4}  {name}")
+        for item in data["top_indicators"]:
+            print(f"   {item['count']:>4}  {item['name']}")
     print(bar)
     return 0
 
@@ -890,6 +909,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--port", type=int, default=8420,
                    help="port (default 8420)")
 
+    p = sub.add_parser("tui",
+                       help="terminal UI (curses): live scan, findings, actions")
+    _common_options(p)
+    p.add_argument("target", nargs="?", default=".",
+                   help="initial target (default .)")
+
+    p = sub.add_parser("fileinfo",
+                       help="identify one or more files (type, size, digests)")
+    p.add_argument("files", nargs="+", help="file(s) to identify")
+
     return parser
 
 
@@ -907,6 +936,8 @@ _COMMANDS = {
     "manifest": cmd_manifest,
     "samples": cmd_samples,
     "web": cmd_web,
+    "tui": cmd_tui,
+    "fileinfo": cmd_fileinfo,
 }
 
 
