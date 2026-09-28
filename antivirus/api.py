@@ -153,7 +153,8 @@ class Antivirus:
     """
 
     def __init__(self, base=".", config: Optional[Config] = None,
-                 threads: "str | int" = "auto") -> None:
+                 threads: "str | int" = "auto",
+                 signatures: Optional[str] = None) -> None:
         base_path = Path(os.path.expanduser(str(base)))
         if config is None:
             config = Config()
@@ -162,6 +163,8 @@ class Antivirus:
             config.signatures_file = base_path / "data" / "signatures.json"
             config.cache_dir = base_path / ".av-cache"
             config.baseline_dir = base_path / "baselines"
+        if signatures is not None:
+            config.signatures_file = Path(os.path.expanduser(str(signatures)))
         config.resolve_paths(base_path)
 
         sig = config.signatures_file
@@ -307,6 +310,18 @@ class Antivirus:
         return verify_tree(Path(os.path.expanduser(str(target))),
                            manifest, self.config)
 
+    def rescue_build(self, out_dir=None, iso_path=None) -> Dict:
+        """Build the rescue kit + ISO, using this engine's signature DB.
+
+        *out_dir* / *iso_path* default to ``rescue-kit`` / ``rescue.iso``
+        inside the engine's base directory.
+        """
+        from .rescue import build_rescue_disk
+
+        out = Path(out_dir) if out_dir else self.base / "rescue-kit"
+        iso = Path(iso_path) if iso_path else self.base / "rescue.iso"
+        return build_rescue_disk(out, iso, self.config.signatures_file)
+
     # ------------------------------------------------------------- properties
     @property
     def version(self) -> str:
@@ -316,15 +331,42 @@ class Antivirus:
 
 
 # ------------------------------------------------------------------ one-shot
-def scan(target, base=".", **kwargs) -> ScanResult:
+def scan(target, base=".", signatures: Optional[str] = None,
+         **kwargs) -> ScanResult:
     """One-shot convenience scan (see :meth:`Antivirus.scan`).
 
     The engine's working area is *base* (default ``"."``): a throwaway use
-    will create ``data/``, ``.av-cache``, ``reports/`` there.
+    will create ``data/``, ``.av-cache``, ``reports/`` there. *signatures*
+    may point at a specific signature database (its parent directory is
+    used for the working artefacts).
     """
-    return Antivirus(base=base).scan(target, **kwargs)
+    return Antivirus(base=base, signatures=signatures).scan(target, **kwargs)
 
 
 def scan_file(path, base=".") -> List[Finding]:
     """One-shot single-file scan; returns its findings."""
     return Antivirus(base=base).scan_file(path)
+
+
+def rescue_build(out_dir="rescue-kit", iso_path="rescue.iso",
+                 signatures: Optional[str] = None) -> Dict:
+    """One-shot rescue kit + ISO image build (see :mod:`antivirus.rescue`).
+
+    *signatures* may point at a specific signature database to snapshot
+    (default: the bundled one).
+    """
+    from .rescue import build_rescue_disk
+
+    return build_rescue_disk(Path(os.path.expanduser(str(out_dir))),
+                             iso_path, signatures)
+
+
+def run_rescue(target, **kwargs) -> Dict:
+    """One-shot rescue scan of a mounted volume (see :mod:`antivirus.rescue`).
+
+    Quarantine/reports go to ``rescue-quarantine`` / ``rescue-reports``
+    under the CWD (the live side), never into the scanned tree.
+    """
+    from .rescue import run_rescue as _run_rescue
+
+    return _run_rescue(target, **kwargs)

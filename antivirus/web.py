@@ -17,6 +17,8 @@ Serves a single-page dashboard plus a small JSON API:
     POST /api/signatures/remove    {"id"}
     GET  /api/verify           ?target=&baseline= – fast integrity check
     GET  /api/stats            engine statistics (sigs/cache/quarantine)
+    POST /api/rescue/build     build the rescue kit + ISO image
+    GET  /api/rescue           last rescue build (404 until one exists)
 
 Scans run in background threads (jobs) so the UI can poll live progress.
 This is a *local* tool: there is no authentication – bind it to an
@@ -199,6 +201,11 @@ footer a{color:var(--accent)}
       <h2>Engine stats <button class="ghost small" style="float:right" onclick="loadStats()">refresh</button></h2>
       <div id="stats" class="muted">…</div>
     </section>
+    <section style="margin-top:14px">
+      <h2>Rescue disk <button class="ghost small" style="float:right" onclick="rescueBuild()">build</button></h2>
+      <div id="rescue" class="muted">…</div>
+      <p class="muted" style="margin-top:8px">Self-contained kit + ISO image: copy to a USB stick, boot any live system (or mount the ISO), then scan the infected volume — threats are quarantined to the rescue media, never into the scanned disk.</p>
+    </section>
   </div>
 </main>
 <footer id="footer"></footer>
@@ -225,7 +232,7 @@ async function init() {
   $("footer").innerHTML = "AntiVirus Web Console · " + (h.data.version || "") +
     ' · <a href="/api/docs">API documentation</a>';
   loadJobs(); loadQuarantine(); loadSigs(); loadBaselines(); loadReports();
-  loadStats();
+  loadStats(); loadRescue();
   setInterval(() => { $("clock").textContent = new Date().toLocaleTimeString(); }, 1000);
   $("filter").addEventListener("input", renderFindings);
 }
@@ -468,6 +475,23 @@ async function loadStats() {
   el.textContent = text;
 }
 
+/* ------------------------------------------------------------- rescue disk */
+async function loadRescue() {
+  const r = await api("/api/rescue");
+  const el = $("rescue");
+  if (!r.ok) { el.textContent = "no rescue kit yet — press build"; return; }
+  const d = r.data;
+  let text = "kit: " + d.kit;
+  if (d.iso) text += "\niso: " + d.iso + " (" + fmtBytes(d.iso_size) + ")";
+  text += "\nsignatures: " + d.signatures + " · files: " + d.files + "\nbuilt: " + d.built;
+  el.textContent = text;
+}
+async function rescueBuild() {
+  const r = await api("/api/rescue/build", {});
+  if (!r.ok) { alert("Rescue build failed: " + (r.data.error || r.status)); return; }
+  loadRescue();
+}
+
 /* ------------------------------------------------------------- fast verify */
 async function verifyBaseline() {
   const target = $("target").value.trim() || ".";
@@ -541,6 +565,11 @@ a{color:#2f81f7}
     <code>changed/missing/new</code> counts and the findings</td></tr>
 <tr><td><code>/api/stats</code></td><td>GET</td><td>engine statistics: signature
     counts by severity/kind, scan-cache size, quarantine items, report totals</td></tr>
+<tr><td><code>/api/rescue/build</code></td><td>POST</td><td>build the rescue kit
+    + ISO image — <code>{"out"?, "iso"?}</code>; returns kit/iso paths and
+    the signature count</td></tr>
+<tr><td><code>/api/rescue</code></td><td>GET</td><td>last rescue build (404 until
+    one exists)</td></tr>
 <tr><td><code>/api/docs</code></td><td>GET</td><td>this page</td></tr>
 </table>
 <h2>Example (curl)</h2>
@@ -777,6 +806,44 @@ class WebApp:
 
         return engine_stats(self.config, self.db, self.quarantine)
 
+    # -------------------------------------------------------------- rescue
+    def rescue_build(self, out_dir: Optional[str] = None,
+                     iso_path: Optional[str] = None) -> dict:
+        from .rescue import build_rescue_disk
+
+        out = Path(out_dir) if out_dir else Path.cwd() / "rescue-kit"
+        iso = Path(iso_path) if iso_path else Path.cwd() / "rescue.iso"
+        info = build_rescue_disk(out, iso, self.config.signatures_file)
+        self.last_rescue = {
+            "kit": str(out),
+            "iso": str(iso),
+            "iso_size": info.get("iso_size"),
+            "antivirus": info["antivirus"],
+            "signatures": info["signatures"]["count"],
+            "files": len(info["files"]),
+            "built": info["built"],
+        }
+        return info
+
+    def rescue_status(self) -> Optional[dict]:
+        if getattr(self, "last_rescue", None):
+            return self.last_rescue
+        from .rescue import read_kit_manifest
+
+        manifest = read_kit_manifest(Path.cwd() / "rescue-kit")
+        if manifest is None:
+            return None
+        iso = Path.cwd() / "rescue.iso"
+        return {
+            "kit": str(Path.cwd() / "rescue-kit"),
+            "iso": str(iso) if iso.exists() else None,
+            "iso_size": iso.stat().st_size if iso.exists() else None,
+            "antivirus": manifest["antivirus"],
+            "signatures": manifest["signatures"]["count"],
+            "files": len(manifest["files"]),
+            "built": manifest["built"],
+        }
+
     # ------------------------------------------------------- file utilities
     def file_info(self, path: str) -> Optional[dict]:
         from .fileinfo import file_info
@@ -892,6 +959,12 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json(200, self.app.stats())
             elif path == "/api/verify":
                 self._verify()
+            elif path == "/api/rescue":
+                status = self.app.rescue_status()
+                if status is None:
+                    self._json(404, {"error": "no rescue kit built yet"})
+                else:
+                    self._json(200, status)
             elif path == "/api/docs":
                 self._send(200, DOCS_PAGE.encode("utf-8"),
                            "text/html; charset=utf-8")
@@ -905,6 +978,8 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             if path == "/api/scan":
                 self._scan()
+            elif path == "/api/rescue/build":
+                self._rescue_build()
             elif path == "/api/baselines":
                 self._baseline_create()
             elif path == "/api/quarantine/restore":
@@ -1002,6 +1077,23 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(200, self.app.verify(Path(target), baseline))
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             self._json(400, {"error": str(exc)})
+
+    def _rescue_build(self) -> None:
+        body = self._body() or {}
+        try:
+            info = self.app.rescue_build(body.get("out"), body.get("iso"))
+        except (OSError, ValueError) as exc:
+            self._json(400, {"error": str(exc)})
+            return
+        self._json(200, {
+            "kit": info["kit"],
+            "iso": info["iso"],
+            "iso_size": info.get("iso_size"),
+            "antivirus": info["antivirus"],
+            "signatures": info["signatures"]["count"],
+            "files": len(info["files"]),
+            "built": info["built"],
+        })
 
     def _quarantine_op(self, op: str) -> None:
         body = self._body()

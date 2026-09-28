@@ -75,6 +75,11 @@ watches folders for new/changed files, and writes JSON + text reports.
   report
 - **Signature editor** — add your own signatures from the CLI (hash or
   pattern)
+- **Rescue disk** — `rescue build` packages the engine + signatures into a
+  self-contained kit *and* a mountable ISO 9660 image (pure-Python writer)
+  for scanning a machine from a live system; `rescue run` scans an infected
+  volume with quarantine/reports always sent to the live side and the scan
+  cache disabled; `rescue verify` checks the media's SHA-256 manifest
 - **Self test** — built-in end-to-end test using the harmless EICAR string
 - **Graphical UI** — Tkinter desktop app (standard library, no extra
   packages): pick a target, scan with live progress and a stop button,
@@ -336,6 +341,66 @@ Quarantine keeps the file under an id like
 `275a021bbfb6-20260918-120000-a1b2c3` inside `quarantine/files/`, with the
 original path, timestamp and reason recorded in `quarantine/manifest.json`.
 
+## Rescue disk
+
+`antivirus rescue` builds a **self-contained rescue kit** — the whole engine
+plus a snapshot of the signature database, shipped as a directory *and* a
+standard ISO 9660 image (written by a pure-Python writer — no third-party
+disk tooling) — for scanning a machine from outside itself:
+
+```console
+$ antivirus rescue build --out ~/usb/kit --iso ~/usb/rescue.iso
+==============================================================
+ Rescue kit built: /home/user/usb/kit
+==============================================================
+ Version:        AntiVirus 2.0.0
+ Signatures:     51 (signatures.json)
+ Files:          29 (SHA-256 manifest)
+ ISO image:      /home/user/usb/rescue.iso (136.0 KiB)
+```
+
+The kit contains the full `antivirus` package (as `antivirus.zip`, so it
+runs from a mounted ISO), its own `signatures.json`, a `run-rescue.py`
+runner, a `bootstrap.sh` launcher, and a `rescue-manifest.json` holding the
+SHA-256 of every file — so the media can prove it is not corrupt or
+tampered with:
+
+```console
+$ kit/bootstrap.sh --verify      # "Rescue kit OK"
+$ kit/bootstrap.sh --selftest    # the full self test, from the media
+$ kit/bootstrap.sh /mnt/disk --action quarantine
+```
+
+Typical flow: copy the kit (or burn the ISO) to a USB stick → boot any
+live system or VM → mount the infected volume → run the kit against it.
+
+Rescue runs are deliberately different from normal scans:
+
+- **quarantine always goes to the rescue/live side** (CWD or
+  `--rescue-quarantine`), never into the volume being scanned;
+- **reports always go to the rescue side** (`--rescue-reports`);
+- the **scan cache is always disabled** — a rescue must not trust, or
+  create, cached state on the suspect machine.
+
+The ISO image is a valid ISO 9660 filesystem (root directory, path
+tables, PVD/SVD — verified by the self test), so any OS can mount or burn
+it. It is **not** a bootable disc image (that needs a platform
+bootloader — out of scope for a stdlib-only package); use it from any
+live environment.
+
+```console
+$ antivirus rescue build [--out DIR] [--iso FILE | --no-iso]
+$ antivirus rescue run TARGET [--action detect|quarantine|remove]
+                [--fast] [--since FILE] [--exclude SPEC ...]
+                [--rescue-quarantine DIR] [--rescue-reports DIR] [--json]
+$ antivirus rescue verify KIT
+```
+
+Module API: `antivirus.rescue_build(out_dir=..., iso_path=...,
+signatures=...)`, `antivirus.run_rescue(target, action=..., ...)` and
+`Antivirus.rescue_build(...)`; helpers `antivirus.rescue.verify_kit` and
+`build_iso9660`. Web API: `POST /api/rescue/build`, `GET /api/rescue`.
+
 ## Command reference
 
 | Command | Description |
@@ -400,6 +465,14 @@ av.save_manifest(baseline, "baseline.json")
 av.verify("some/dir", "baseline.json")   # fast hash-only diff -> [Finding, …]
 av.quarantine.restore("275a021b-…")
 av.remove_signature("AV-MINE-001")
+
+# --- rescue disk -----------------------------------------------------------
+manifest = antivirus.rescue_build(out_dir="/usb/kit",
+                                  iso_path="/usb/rescue.iso")
+info = antivirus.run_rescue("/mnt/infected-disk", action="quarantine",
+                            quarantine_dir="/usb/rescue-quarantine",
+                            report_dir="/usb/rescue-reports")
+print(info["result"].clean, info["report"])
 ```
 
 Plain-text IOC lists import through the same database:
@@ -456,6 +529,8 @@ JSON API (useful for scripting / your own front-end):
 | `/api/reports` / `/api/reports/summary` | GET | saved reports / aggregate |
 | `/api/verify` | GET | `?target=&baseline=` — fast integrity check (hash + diff only) |
 | `/api/stats` | GET | engine statistics (signatures, cache, quarantine, reports) |
+| `/api/rescue/build` | POST | `{"out"?, "iso"?}` — build the rescue kit + ISO image |
+| `/api/rescue` | GET | last rescue build (404 until one exists) |
 | `/api/docs` | GET | in-browser API documentation |
 
 The console binds to `0.0.0.0` by default and has **no authentication** —
@@ -494,6 +569,7 @@ antivirus/
 ├── pe.py            # PE32/PE32+ dissection ("debug report") + indicators
 ├── fileinfo.py      # file identification (magic + digests)
 ├── integrity.py     # file-integrity baselines (manifest + diff + fast verify)
+├── rescue.py        # rescue kit + ISO 9660 writer + rescue scan runner
 ├── samples.py       # builder for the inert demo samples (fake PE/ELF,
 │                    #   sneaky ZIP/TAR.GZ, `samples` tree)
 ├── scanner.py       # single-pass hashing, patterns, behaviour, heuristics

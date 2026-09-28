@@ -680,6 +680,115 @@ def cmd_tui(args) -> int:
         return 0
 
 
+# --------------------------------------------------------------------- rescue
+def _cmd_rescue(args) -> int:
+    if args.rescue_action == "build":
+        return cmd_rescue_build(args)
+    if args.rescue_action == "run":
+        return cmd_rescue_run(args)
+    return cmd_rescue_verify(args)
+
+
+def cmd_rescue_build(args) -> int:
+    from .rescue import build_rescue_disk, build_rescue_kit
+    from .utils import human_size
+
+    sig = Path(args.signatures) if args.signatures and \
+        Path(args.signatures).exists() else None
+    try:
+        if args.no_iso:
+            manifest = build_rescue_kit(Path(args.out), sig)
+        else:
+            manifest = build_rescue_disk(Path(args.out),
+                                         Path(args.iso), sig)
+    except (OSError, ValueError) as exc:
+        print(paint(f"error: {exc}", RED), file=sys.stderr)
+        return 2
+
+    bar = "=" * 62
+    print()
+    print(paint(bar, BOLD))
+    print(paint(f" Rescue kit built: {manifest['kit']}", BOLD))
+    print(bar)
+    print(f" Version:        AntiVirus {manifest['antivirus']}")
+    print(f" Signatures:     {manifest['signatures']['count']} "
+          f"({manifest['signatures']['file']})")
+    print(f" Files:          {len(manifest['files'])} (SHA-256 manifest)")
+    if "iso" in manifest:
+        print(f" ISO image:      {manifest['iso']} "
+              f"({human_size(manifest['iso_size'])})")
+    print(bar)
+    print(" Next steps:")
+    print("   1. Copy the kit (or the ISO) to a USB stick.")
+    print("   2. Boot a live system (any Linux live USB / rescue VM),")
+    print("      mount the infected volume:  sudo mount /dev/sda1 /mnt/disk")
+    print(f"   3. Verify the media:    {args.out}/bootstrap.sh --selftest")
+    print(f"      Rescue scan:         {args.out}/bootstrap.sh /mnt/disk "
+          f"--action quarantine")
+    print(f"   Verify the manifest:   antivirus rescue verify {args.out}")
+    print(bar)
+    return 0
+
+
+def cmd_rescue_run(args) -> int:
+    from .rescue import run_rescue
+
+    target = Path(args.target)
+    if not target.exists():
+        print(paint(f"error: no such file or directory: {target}", RED),
+              file=sys.stderr)
+        return 2
+    try:
+        info = run_rescue(
+            target, action=args.action, fast=args.fast,
+            since=str(args.since) if args.since else "",
+            exclude=tuple(args.exclude) if args.exclude else (),
+            quarantine_dir=args.rescue_quarantine,
+            report_dir=args.rescue_reports)
+    except (OSError, ValueError) as exc:
+        print(paint(f"error: {exc}", RED), file=sys.stderr)
+        return 2
+    result = info["result"]
+
+    if args.json:
+        data = result.to_dict()
+        data["action"] = args.action
+        data["actions_taken"] = info["notes"]
+        data["rescue"] = {
+            "quarantine_dir": info["quarantine_dir"],
+            "report": str(info["report"]) if info["report"] else None,
+            "signatures": info["signatures_file"],
+        }
+        print(json.dumps(data, indent=2, ensure_ascii=False))
+    else:
+        _print_scan_summary(result, args.action, info["notes"],
+                            info["report"])
+        print(paint(
+            f" Quarantine lives on the rescue side: {info['quarantine_dir']}"
+            f"  (outside the scanned tree)", YELLOW))
+    return 0 if result.clean else 1
+
+
+def cmd_rescue_verify(args) -> int:
+    from .rescue import read_kit_manifest, verify_kit
+
+    problems = verify_kit(Path(args.kit))
+    manifest = read_kit_manifest(Path(args.kit))
+    if manifest:
+        print(f"Kit: {args.kit}  (AntiVirus {manifest['antivirus']}, "
+              f"built {manifest['built']}, "
+              f"{manifest['signatures']['count']} signature(s))")
+    if problems:
+        for p in problems:
+            print(paint(f"  FAIL: {p}", RED))
+        print(paint(f"Verification FAILED ({len(problems)} problem(s)).",
+                    RED))
+        return 1
+    print(paint("Verification OK — every file matches the manifest.",
+                GREEN))
+    return 0
+
+
 # ------------------------------------------------------------------ samples
 def cmd_samples(args) -> int:
     from .samples import build_all_samples
@@ -1160,6 +1269,48 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true",
                    help="machine readable output")
 
+    p = sub.add_parser(
+        "rescue",
+        help="rescue disk: build a self-contained kit/ISO, scan a mounted "
+             "volume from a live system, verify a kit")
+    rsub = p.add_subparsers(dest="rescue_action", required=True)
+    rb = rsub.add_parser(
+        "build", help="build the rescue kit (directory + ISO image)")
+    _common_options(rb)
+    rb.add_argument("--out", default="rescue-kit", metavar="DIR",
+                    help="kit directory (default ./rescue-kit)")
+    rb.add_argument("--iso", default="rescue.iso", metavar="FILE",
+                    help="ISO image path (default ./rescue.iso)")
+    rb.add_argument("--no-iso", action="store_true",
+                    help="skip the ISO image (directory kit only)")
+    rr = rsub.add_parser(
+        "run", help="rescue scan of a mounted volume — quarantine goes to "
+                    "the rescue side, never into the scanned tree")
+    _common_options(rr)
+    rr.add_argument("target", help="mounted volume / directory to scan")
+    rr.add_argument("--action", choices=("detect", "quarantine", "delete"),
+                    default="detect", help="what to do with threats")
+    rr.add_argument("--fast", action="store_true",
+                    help="hash + pattern layers only")
+    rr.add_argument("--since", type=_argparse_since, default=0.0,
+                    metavar="DURATION",
+                    help="only files modified within DURATION "
+                         "(30s / 30m / 2h / 1d / 1w)")
+    rr.add_argument("--exclude", action="append", default=None,
+                    metavar="GLOB", help="skip matching files (repeatable)")
+    rr.add_argument("--rescue-quarantine", default="rescue-quarantine",
+                    metavar="DIR",
+                    help="quarantine on the live side (default "
+                         "./rescue-quarantine)")
+    rr.add_argument("--rescue-reports", default="rescue-reports",
+                    metavar="DIR", help="report dir on the live side")
+    rr.add_argument("--json", action="store_true",
+                    help="machine readable output")
+    rv = rsub.add_parser(
+        "verify", help="verify a rescue kit against its SHA-256 manifest")
+    rv.add_argument("kit", nargs="?", default="rescue-kit",
+                    help="kit directory (default ./rescue-kit)")
+
     return parser
 
 
@@ -1182,6 +1333,7 @@ _COMMANDS = {
     "verify": cmd_verify,
     "export": cmd_export,
     "stats": cmd_stats,
+    "rescue": _cmd_rescue,
 }
 
 

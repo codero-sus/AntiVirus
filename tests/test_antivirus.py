@@ -2145,5 +2145,366 @@ class WebStatsAndVerifyTests(WebConsoleTests):
         self.assertEqual(status, 400)
 
 
+class Iso9660Tests(unittest.TestCase):
+    """v2.0: the pure-Python ISO 9660 writer produces a valid image."""
+
+    def _build(self, files):
+        from antivirus.rescue import build_iso9660
+
+        base = Path(tempfile.mkdtemp(prefix="av-iso-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        out = base / "x.iso"
+        size = build_iso9660(out, files)
+        return base, out.read_bytes(), size
+
+    def test_structure_and_contents(self):
+        data_a = b"hello world\n"
+        data_b = b"\x00" * 5000 + b"tail"
+        _base, img, size = self._build({"a.txt": data_a, "b.bin": data_b})
+        self.assertEqual(size, len(img))
+        self.assertEqual(len(img) % 2048, 0)
+        sector = 2048
+
+        # PVD
+        self.assertEqual(img[2048:2053], b"CD001")
+        self.assertEqual(img[2053], 1)
+        self.assertEqual(img[2054], 1)
+        self.assertEqual(img[2087:2119].rstrip(b" ").decode(),
+                         "ANTIVIRUS-RESCUE")
+        self.assertEqual(int.from_bytes(img[2119:2123], "little"),
+                         len(img) // sector)
+        self.assertEqual(int.from_bytes(img[2431 + 2:2431 + 6], "little"), 3)
+        # SVD
+        self.assertEqual(img[4096:4101], b"CD001")
+        self.assertEqual(img[4102], 255)
+
+        # root directory: extents must point at the exact file bytes
+        root = img[3 * sector:4 * sector]
+        off, found = 0, {}
+        while off < sector and root[off] != 0:
+            n = root[off]
+            ext = int.from_bytes(root[off + 2:off + 6], "little")
+            fsize = int.from_bytes(root[off + 10:off + 14], "little")
+            flags = root[off + 25]
+            namelen = root[off + 32]
+            name = root[off + 33:off + 33 + namelen].decode()
+            if name not in (".", ".."):
+                self.assertEqual(flags, 0)
+                found[name] = (ext, fsize)
+            off += n
+        self.assertEqual(set(found), {"A.TXT", "B.BIN"})
+        ext, n = found["A.TXT"]
+        self.assertEqual(img[ext * sector:ext * sector + n], data_a)
+        ext, n = found["B.BIN"]
+        self.assertEqual(img[ext * sector:ext * sector + n], data_b)
+
+        # both path tables: 1 (root) + 2 file entries
+        for off_pt in (4, 5):
+            table = img[off_pt * sector:(off_pt + 1) * sector]
+            off, entries = 0, 0
+            while off < sector and table[off] != 0:
+                n = table[off]
+                self.assertEqual(table[off + 1], 2)  # parent = root
+                self.assertEqual(int.from_bytes(table[off + 2:off + 4],
+                                                "little"),
+                                 int.from_bytes(table[off + 4:off + 6],
+                                                "big"))
+                off += n
+                entries += 1
+            self.assertEqual(entries, 3)
+
+    def test_invalid_names_and_empty(self):
+        from antivirus.rescue import build_iso9660
+
+        base = Path(tempfile.mkdtemp(prefix="av-iso-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        with self.assertRaises(ValueError):
+            build_iso9660(base / "x.iso", {})
+        with self.assertRaises(ValueError):
+            build_iso9660(base / "x.iso", {"has space.txt": b"y"})
+        with self.assertRaises(ValueError):
+            build_iso9660(base / "x.iso",
+                          {"x" * 40 + ".txt": b"y"})
+
+    def test_sector_aligned_file_size(self):
+        # a file exactly N*2048 bytes must not gain an extra sector
+        data = b"\x00" * (2 * 2048)
+        _base, img, size = self._build({"big.bin": data})
+        self.assertEqual(len(img), 6 * 2048 + 2 * 2048)
+
+
+class RescueKitTests(unittest.TestCase):
+    """v2.0: the rescue kit is self-contained and manifest-verified."""
+
+    def _build(self, **kwargs):
+        from antivirus.rescue import build_rescue_kit
+
+        base = Path(tempfile.mkdtemp(prefix="av-rkit-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        kit = base / "kit"
+        manifest = build_rescue_kit(kit, **kwargs)
+        return base, kit, manifest
+
+    def test_build_and_verify_clean_and_corrupted(self):
+        from antivirus.rescue import verify_kit
+
+        base, kit, manifest = self._build()
+        self.assertEqual(verify_kit(kit), [])
+        self.assertGreaterEqual(manifest["signatures"]["count"], 1)
+        for name in ("run-rescue.py", "bootstrap.sh", "antivirus.zip",
+                     "signatures.json", "rescue-manifest.json"):
+            self.assertTrue((kit / name).exists(), name)
+        self.assertTrue((kit / "antivirus" / "__init__.py").exists())
+        self.assertTrue((kit / "bootstrap.sh").stat().st_mode & 0o111)
+
+        (kit / "signatures.json").write_bytes(b"corrupted")
+        problems = verify_kit(kit)
+        self.assertTrue(any("signatures.json" in p for p in problems))
+
+    def test_kit_package_is_self_contained(self):
+        from antivirus.rescue import build_rescue_kit
+
+        import subprocess
+        import sys as _sys
+
+        base = Path(tempfile.mkdtemp(prefix="av-rpkg-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        kit = base / "kit"
+        build_rescue_kit(kit)
+        (base / "e.txt").write_bytes(EICAR)
+
+        # a fresh interpreter must be able to import the kit's copy of the
+        # package and detect EICAR using the kit's own signature database
+        code = (
+            "import sys\n"
+            f"sys.path.insert(0, {str(kit)!r})\n"
+            "import antivirus\n"
+            "from antivirus.scanner import Scanner\n"
+            "from antivirus.signatures import SignatureDB\n"
+            f"db = SignatureDB({str(kit / 'signatures.json')!r})\n"
+            f"f = Scanner(antivirus.config.Config(), db).scan_file("
+            f"{str(base / 'e.txt')!r})\n"
+            "assert any(x.kind == 'signature-hash' for x in f), f\n"
+            "print('KIT-OK')\n"
+        )
+        proc = subprocess.run([_sys.executable, "-c", code],
+                              capture_output=True, text=True, timeout=120)
+        self.assertIn("KIT-OK", proc.stdout, proc.stderr)
+
+    def test_default_signature_db_has_eicar(self):
+        from antivirus.rescue import _default_signature_db
+
+        db = _default_signature_db()
+        self.assertEqual(len(db["signatures"]), 1)
+        sig = db["signatures"][0]
+        self.assertEqual(sig["id"], "EICAR-STD-2014")
+        self.assertEqual(len(sig["sha256"]), 64)
+        self.assertEqual(len(sig["md5"]), 32)
+
+        base = Path(tempfile.mkdtemp(prefix="av-rdef-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        p = base / "db.json"
+        p.write_text(json.dumps(db, indent=2) + "\n")
+        loaded = SignatureDB(p)
+        self.assertEqual(len(loaded.list()), 1)
+        (base / "e.txt").write_bytes(EICAR)
+        self.assertTrue(loaded.by_sha256(
+            __import__("hashlib").sha256(EICAR).hexdigest()))
+
+    def test_iso_variant_verify(self):
+        from antivirus.rescue import build_rescue_disk, verify_kit
+
+        base = Path(tempfile.mkdtemp(prefix="av-riso-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        kit = base / "kit"
+        manifest = build_rescue_disk(kit, base / "rescue.iso")
+        self.assertTrue(manifest["iso"].endswith(".iso"))
+        self.assertEqual(manifest["iso_size"] % 2048, 0)
+        # simulate an ISO mount: zip variant, no antivirus/ directory
+        mounted = base / "mounted"
+        mounted.mkdir()
+        for name in ("antivirus.zip", "run-rescue.py", "signatures.json",
+                     "rescue-manifest.json", "bootstrap.sh",
+                     "README-RESCUE.txt"):
+            shutil.copyfile(kit / name, mounted / name)
+        self.assertEqual(verify_kit(mounted), [])
+
+
+class RescueRunTests(unittest.TestCase):
+    """v2.0: rescue scans quarantine to the live side, never the target."""
+
+    def _disk(self, base):
+        disk = base / "sda1"
+        (disk / "user").mkdir(parents=True)
+        (disk / "user" / "clean.txt").write_text("fine\n")
+        (disk / "user" / "trojan.txt").write_bytes(EICAR)
+        return disk
+
+    def test_quarantine_goes_to_rescue_side(self):
+        from antivirus.rescue import run_rescue
+
+        base = Path(tempfile.mkdtemp(prefix="av-rrun-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        disk = self._disk(base)
+        media_q = base / "usb" / "quarantine"
+
+        info = run_rescue(disk, action="quarantine",
+                          quarantine_dir=str(media_q),
+                          report_dir=str(base / "usb" / "reports"))
+        self.assertEqual(len(info["result"].findings), 1)
+        self.assertFalse((disk / "user" / "trojan.txt").exists())
+        self.assertTrue((disk / "user" / "clean.txt").exists())
+        self.assertEqual(len(list((media_q / "files").glob("*"))), 1)
+        self.assertTrue(info["report"].exists())
+        # the scanned tree must not host any rescue artefacts
+        self.assertFalse((disk / "rescue-quarantine").exists())
+        self.assertFalse((disk / "rescue-reports").exists())
+        self.assertFalse((disk / "quarantine").exists())
+
+    def test_detect_leaves_tree_untouched(self):
+        from antivirus.rescue import run_rescue
+
+        base = Path(tempfile.mkdtemp(prefix="av-rrun2-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        disk = self._disk(base)
+        info = run_rescue(disk, action="detect",
+                          quarantine_dir=str(base / "q"),
+                          report_dir=str(base / "r"))
+        self.assertEqual(info["result"].files_scanned, 2)
+        self.assertTrue((disk / "user" / "trojan.txt").exists())
+        self.assertEqual(len(list((base / "q" / "files").glob("*"))), 0)
+
+    def test_invalid_action_and_missing_target(self):
+        from antivirus.rescue import run_rescue
+
+        base = Path(tempfile.mkdtemp(prefix="av-rrun3-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        disk = self._disk(base)
+        with self.assertRaises(ValueError):
+            run_rescue(disk, action="nuke")
+        with self.assertRaises(FileNotFoundError):
+            run_rescue(base / "nope")
+
+
+class RescueCliTests(unittest.TestCase):
+    """v2.0: `antivirus rescue build / run / verify` end to end."""
+
+    def test_full_flow(self):
+        from antivirus.cli import main
+
+        base = Path(tempfile.mkdtemp(prefix="av-rcli-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        old_cwd = os.getcwd()
+        os.chdir(base)
+        try:
+            def run(*argv):
+                out, err = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(out), \
+                        contextlib.redirect_stderr(err):
+                    rc = main(list(argv))
+                return rc, out.getvalue(), err.getvalue()
+
+            rc, out, _ = run("rescue", "build", "--out", "kit",
+                             "--iso", "rescue.iso")
+            self.assertEqual(rc, 0)
+            self.assertIn("Rescue kit built", out)
+            self.assertTrue((base / "rescue.iso").exists())
+            self.assertTrue((base / "kit" / "bootstrap.sh").exists())
+
+            rc, out, _ = run("rescue", "verify", "kit")
+            self.assertEqual(rc, 0)
+            self.assertIn("Verification OK", out)
+
+            (base / "kit" / "signatures.json").write_bytes(b"bad")
+            rc, out, _ = run("rescue", "verify", "kit")
+            self.assertEqual(rc, 1)
+            self.assertIn("FAILED", out)
+
+            disk = base / "sda1"
+            (disk / "u").mkdir(parents=True)
+            (disk / "u" / "t.txt").write_bytes(EICAR)
+            rc, out, _ = run("rescue", "run", str(disk), "--action",
+                             "quarantine", "--rescue-quarantine", "rq",
+                             "--rescue-reports", "rr", "--json")
+            self.assertEqual(rc, 1)
+            data = json.loads(out)
+            self.assertEqual(len(data["findings"]), 1)
+            self.assertEqual(data["rescue"]["quarantine_dir"],
+                             str(base / "rq"))
+            self.assertFalse((disk / "u" / "t.txt").exists())
+            self.assertTrue((base / "rq" / "files").exists())
+        finally:
+            os.chdir(old_cwd)
+
+    def test_run_missing_target(self):
+        from antivirus.cli import main
+
+        base = Path(tempfile.mkdtemp(prefix="av-rcli2-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        old_cwd = os.getcwd()
+        os.chdir(base)
+        try:
+            err = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(err):
+                rc = main(["rescue", "run", "nope"])
+            self.assertEqual(rc, 2)
+            self.assertIn("no such file or directory", err.getvalue())
+        finally:
+            os.chdir(old_cwd)
+
+
+class RescueWebTests(WebConsoleTests):
+    """v2.0: web rescue build + status."""
+
+    def test_rescue_build_and_status(self):
+        status, data = self._req("GET", "/api/rescue")
+        self.assertEqual(status, 404)
+
+        kit = self.base / "kit"
+        iso = self.base / "rescue.iso"
+        status, data = self._req("POST", "/api/rescue/build",
+                                 {"out": str(kit), "iso": str(iso)})
+        self.assertEqual(status, 200)
+        self.assertTrue(kit.exists())
+        self.assertTrue(iso.exists())
+        self.assertGreater(data["iso_size"], 0)
+        self.assertEqual(data["signatures"],
+                         len(self.app_fixture.db.list()))
+
+        status, data = self._req("GET", "/api/rescue")
+        self.assertEqual(status, 200)
+        self.assertEqual(data["kit"], str(kit))
+        self.assertEqual(data["iso"], str(iso))
+        self.assertIn("files", data)
+
+
+class RescueModuleTests(unittest.TestCase):
+    """v2.0: rescue is part of the plain-module API."""
+
+    def test_rescue_build_and_run(self):
+        import antivirus
+
+        base = Path(tempfile.mkdtemp(prefix="av-rmod-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        manifest = antivirus.rescue_build(out_dir=base / "kit",
+                                          iso_path=base / "rescue.iso")
+        self.assertEqual(manifest["iso_size"] % 2048, 0)
+        self.assertTrue((base / "rescue.iso").exists())
+        from antivirus.rescue import verify_kit
+        self.assertEqual(verify_kit(base / "kit"), [])
+
+        disk = base / "disk"
+        disk.mkdir()
+        (disk / "e.txt").write_bytes(EICAR)
+        info = antivirus.run_rescue(disk, action="quarantine",
+                                    quarantine_dir=str(base / "q"),
+                                    report_dir=str(base / "r"),
+                                    signatures_file=str(
+                                        (base / "kit") / "signatures.json"))
+        self.assertEqual(len(info["result"].findings), 1)
+        self.assertFalse((disk / "e.txt").exists())
+
+
 if __name__ == "__main__":
     unittest.main()

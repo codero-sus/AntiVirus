@@ -15,4 +15,8 @@ htmlcov/
 # AntiVirus runtime artefacts (created when you run a scan)
 quarantine/
 reports/
-.av-cache/
+.av-cache
+
+# Rescue disk build output (rescue build)
+rescue-kit/
+rescue.iso

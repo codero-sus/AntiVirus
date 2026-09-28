@@ -7,13 +7,14 @@ text marker that antivirus vendors agree to detect; it is not malware).
 from __future__ import annotations
 
 import hashlib
+import os
 import random
 import re
 import shutil
 import sys
 import tempfile
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 from .config import Config
 from .quarantine import Quarantine
@@ -24,7 +25,50 @@ from .utils import md5_new
 EICAR = b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"
 
 
-def run_selftest() -> int:
+def _iso_structure_ok(img: bytes, n_files: int) -> bool:
+    """Minimal ISO 9660 reader: PVD, SVD, root directory, path tables."""
+    sector = 2048
+    if len(img) % sector or len(img) // sector < 6:
+        return False
+    if img[2048:2053] != b"CD001" or img[2053] != 1 or img[2054] != 1:
+        return False                       # PVD
+    if int.from_bytes(img[2119:2123], "little") != len(img) // sector:
+        return False                       # volume space size
+    if img[4096:4101] != b"CD001" or img[4102] != 255:
+        return False                       # SVD
+
+    root_sector = img[3 * sector:4 * sector]
+    off, count = 0, 0
+    while off < sector and root_sector[off] != 0:
+        n = root_sector[off]
+        if n < 33 or off + n > sector:
+            return False
+        ext = int.from_bytes(root_sector[off + 2:off + 6], "little")
+        fsize = int.from_bytes(root_sector[off + 10:off + 14], "little")
+        flags = root_sector[off + 25]
+        namelen = root_sector[off + 32]
+        if 33 + namelen > n or not root_sector[off + 33:off + 33 + namelen].isascii():
+            return False
+        name = root_sector[off + 33:off + 33 + namelen]
+        if name not in (b".", b".."):
+            if flags != 0 or ext * sector + fsize > len(img):
+                return False
+            count += 1
+        off += n
+
+    pt = int.from_bytes(img[2048 + 379:2048 + 383], "little")
+    table = img[pt * sector:(pt + 1) * sector]
+    off, entries = 0, 0
+    while off < sector and table[off] != 0:
+        n = table[off]
+        if n < 23 or off + n > sector:
+            return False
+        off += n
+        entries += 1
+    return count == n_files and entries == n_files + 1
+
+
+def run_selftest(signatures_file: Optional[str] = None) -> int:
     print(f"AntiVirus self test  (Python {sys.version.split()[0]})")
     print("-" * 62)
     workdir = Path(tempfile.mkdtemp(prefix="antivirus-selftest-"))
@@ -43,9 +87,12 @@ def run_selftest() -> int:
         config.report_dir = workdir / "reports"
         config.signatures_file = workdir / "signatures.json"
 
-        # Work on a private copy of the bundled database, never the repo one.
+        # Work on a private copy of a database, never a shared one. The
+        # rescue kit passes its own snapshot via *signatures_file*.
         bundled = Path(__file__).resolve().parent.parent / "data" / "signatures.json"
-        if bundled.exists():
+        if signatures_file and Path(signatures_file).is_file():
+            shutil.copyfile(signatures_file, config.signatures_file)
+        elif bundled.exists():
             shutil.copyfile(bundled, config.signatures_file)
         db = SignatureDB(config.signatures_file)
         if not db.list():  # no bundled DB available – create the EICAR entry
@@ -289,7 +336,8 @@ def run_selftest() -> int:
         mod_dir = workdir / "module-tree"
         mod_dir.mkdir()
         (mod_dir / "e.txt").write_bytes(EICAR)
-        mod_result = antivirus.scan(mod_dir, base=str(workdir))
+        mod_result = antivirus.scan(mod_dir, base=str(workdir),
+                                    signatures=str(config.signatures_file))
         check("module API: antivirus.scan() detects EICAR",
               any(f.name == "EICAR-Test-File" for f in mod_result.findings),
               str(sorted({f.name for f in mod_result.findings})))
@@ -358,6 +406,54 @@ def run_selftest() -> int:
               and st["quarantine"]["items"] == len(quarantine.items())
               and st["reports"]["reports"] >= 1,
               str(st.get("signatures")))
+
+        # -- rescue disk (v2.0) ------------------------------------------------
+        from .rescue import (
+            KIT_FILES,
+            build_rescue_disk,
+            run_rescue,
+            run_rescue_selftest,
+            verify_kit,
+        )
+
+        kit_dir = workdir / "rescue-kit"
+        rescue = build_rescue_disk(kit_dir, iso_path=workdir / "rescue.iso",
+                                   signatures_file=config.signatures_file)
+        check("rescue: kit + ISO built (manifest complete)",
+              verify_kit(kit_dir) == []
+              and rescue["iso_size"] % 2048 == 0
+              and rescue["signatures"]["count"] == len(db.list()),
+              str(verify_kit(kit_dir))[:200])
+
+        iso_img = Path(rescue["iso"]).read_bytes()
+        check("rescue: ISO 9660 structure valid (PVD/SVD/root/path tables)",
+              _iso_structure_ok(iso_img, len(KIT_FILES)))
+
+        foreign = workdir / "foreign-disk"
+        foreign.mkdir()
+        (foreign / "e.txt").write_bytes(EICAR)
+        (foreign / "c.txt").write_text("clean\n")
+        media_q = workdir / "rescue-quarantine"
+        info = run_rescue(
+            foreign, action="quarantine",
+            quarantine_dir=str(media_q),
+            report_dir=str(workdir / "rescue-reports"),
+            signatures_file=str(config.signatures_file))
+        check("rescue: threat quarantined to the rescue side, "
+              "scanned disk otherwise untouched",
+              not (foreign / "e.txt").exists()
+              and (foreign / "c.txt").exists()
+              and len(list((media_q / "files").glob("*"))) == 1
+              and info["report"].exists()
+              and not (foreign / "rescue-quarantine").exists())
+
+        if os.environ.get("AV_RESCUE_NESTED_SELFTEST"):
+            # Running as a rescue-kit media check: don't spawn another.
+            check("rescue: kit self test (nested — skipped)", True)
+        else:
+            rc, _tail = run_rescue_selftest(kit_dir)
+            check("rescue: kit self test passes (media check)", rc == 0,
+                  _tail[-200:])
 
     finally:
         shutil.rmtree(workdir, ignore_errors=True)

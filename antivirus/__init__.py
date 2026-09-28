@@ -13,6 +13,8 @@ Features
 * Directory monitoring (polling based, no external dependencies)
 * JSON + human readable scan reports, report diff & summary, CSV/JSONL export
 * Fast integrity checks (verify), plain-text IOC imports, engine statistics
+* Rescue disk: self-contained kit + ISO 9660 image for scanning a system
+  from a live environment (quarantine stays on the rescue side)
 * Multiple front-ends: CLI, Tkinter GUI, curses TUI, web console —
   and a plain-module API for embedding in your own code
 
@@ -39,13 +41,22 @@ Everything is standard library only (Tkinter/curses are optional and used
 only by their respective front-ends).
 """
 
-__version__ = "1.9.0"
+__version__ = "2.0.0"
 
-from .api import Antivirus, apply_actions, scan, scan_file  # noqa: E402
+from .api import (  # noqa: E402
+    Antivirus,
+    apply_actions,
+    rescue_build,
+    run_rescue,
+    scan,
+    scan_file,
+)
 
 __all__ = [
     "Antivirus",
     "apply_actions",
+    "rescue_build",
+    "run_rescue",
     "scan",
     "scan_file",
     "__version__",
