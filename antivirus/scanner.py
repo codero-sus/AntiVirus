@@ -213,6 +213,9 @@ class Scanner:
         self.config = config
         self.db = db
         self.threads = threads
+        #: Optional ``(done, total)`` callback, invoked after every file
+        #: finishes (cached or freshly scanned). Used for progress bars.
+        self.on_progress: Optional[Callable[[int, int], None]] = None
         self._patterns: List[Tuple[Signature, "re.Pattern[bytes]"]] = []
         self._combined: Optional["re.Pattern[bytes]"] = None
         self._name_to_sig: Dict[str, Signature] = {}
@@ -271,6 +274,17 @@ class Scanner:
             return result
 
         # Cache partition: unchanged files keep their previous verdict.
+        total = len(files)
+        _done = [0]
+
+        def _tick() -> None:
+            _done[0] += 1
+            if self.on_progress is not None:
+                try:
+                    self.on_progress(_done[0], total)
+                except Exception:
+                    pass  # a broken progress callback must not kill a scan
+
         to_scan: List[Tuple[Path, Optional[os.stat_result]]] = []
         if cache is not None:
             for p, st in files:
@@ -285,16 +299,18 @@ class Scanner:
                     if cached:
                         result.findings.extend(cached)
                     result.scanned_paths[str(p)] = cached
+                    _tick()
                 else:
                     to_scan.append((p, st))
             files = to_scan
 
         workers = self._workers()
         if len(files) > 1 and workers > 1:
-            self._scan_files_parallel(files, result, workers)
+            self._scan_files_parallel(files, result, workers, _tick)
         else:
             for p, st in files:
                 self._scan_file(p, result, st=st)
+                _tick()
 
         # Record fresh verdicts for the next (fast) scan.
         if cache is not None and result.scanned_paths:
@@ -352,7 +368,8 @@ class Scanner:
             return 1
 
     def _scan_files_parallel(self, files: List[Tuple[Path, Optional[os.stat_result]]],
-                             result: ScanResult, workers: int) -> None:
+                             result: "ScanResult", workers: int,
+                             _tick: Optional[Callable[[], None]] = None) -> None:
         def work(item: Tuple[Path, Optional[os.stat_result]]) -> ScanResult:
             p, st = item
             local = ScanResult(target=str(p), started_at=0.0)
@@ -361,6 +378,8 @@ class Scanner:
 
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="av-scan") as pool:
             for local in pool.map(work, files, chunksize=16):
+                if _tick is not None:
+                    _tick()
                 result.files_scanned += local.files_scanned
                 result.files_skipped += local.files_skipped
                 result.bytes_scanned += local.bytes_scanned
@@ -527,6 +546,15 @@ class Scanner:
                 size=size,
             ))
 
+        # Backfill digests on findings produced by layers that don't set
+        # them (behaviour / archives), so reports & exports carry the
+        # file's hash and size for every finding.
+        for f in local:
+            if not f.sha256:
+                f.sha256 = sha256
+            if not f.size:
+                f.size = size
+
         result.findings.extend(local)
         result.scanned_paths[str(path)] = local
 
@@ -599,6 +627,11 @@ class Scanner:
                     ),
                     sha256=sha256, size=len(data),
                 ))
+        for f in local:
+            if not f.sha256:
+                f.sha256 = sha256
+            if not f.size:
+                f.size = len(data)
         return local
 
     # --------------------------------------------------------------- archives

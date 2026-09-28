@@ -317,6 +317,48 @@ def run_selftest() -> int:
                       for f in model.findings),
               model.message)
 
+        # -- verify / export / ioc / stats (v1.9) ---------------------------
+        import io as _io
+
+        from .integrity import verify_tree
+        from .report import ReportWriter, iter_export_rows, write_export
+        from .signatures import parse_ioc_text
+        from .api import engine_stats
+
+        fim2 = workdir / "fim2"
+        fim2.mkdir()
+        (fim2 / "x.txt").write_text("one\n")
+        man = build_manifest(fim2, config)
+        check("verify: clean tree has no findings",
+              verify_tree(fim2, man, config) == [])
+        (fim2 / "x.txt").write_text("two\n")
+        check("verify: changed file reported (hash-only check)",
+              any(f.name == CHANGED
+                  for f in verify_tree(fim2, man, config)))
+
+        writer = ReportWriter(config.report_dir)
+        writer.save(scanner.scan_path(mod_dir), action="detect")
+        buf = _io.StringIO()
+        n = write_export(iter_export_rows(writer.all_reports()), buf,
+                         fmt="csv")
+        check("export: CSV rows written for saved reports",
+              n >= 1 and "EICAR" in buf.getvalue(), f"rows={n}")
+
+        ioc_sigs = parse_ioc_text(
+            "# comment\n" + hashlib.sha256(EICAR).hexdigest() + "\n"
+            "IOC-LITERAL-ABC\n")
+        check("ioc: hash + literal lines parsed",
+              len(ioc_sigs) == 2
+              and bool(ioc_sigs[0].sha256) and bool(ioc_sigs[1].pattern),
+              str([s.id for s in ioc_sigs]))
+
+        st = engine_stats(config, db, quarantine)
+        check("stats: engine snapshot consistent",
+              st["signatures"]["total"] == len(db.list())
+              and st["quarantine"]["items"] == len(quarantine.items())
+              and st["reports"]["reports"] >= 1,
+              str(st.get("signatures")))
+
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 

@@ -92,6 +92,33 @@ def _common_options(parser: argparse.ArgumentParser) -> None:
                         help="skip files larger than BYTES")
 
 
+class _ProgressBar:
+    """A single-line scan progress bar written to *stderr* (so stdout
+    stays pure for ``--json`` / pipes). Only ticks at most every 0.1 s.
+    """
+
+    def __init__(self, interval: float = 0.1) -> None:
+        self._interval = interval
+        self._last = 0.0
+        self._total = 0
+        self._width = 30
+
+    def __call__(self, done: int, total: int) -> None:
+        self._total = max(total, 1)
+        now = time.monotonic()
+        if now - self._last < self._interval and done < self._total:
+            return
+        self._last = now
+        frac = min(done / self._total, 1.0)
+        filled = int(self._width * frac)
+        sys.stderr.write(
+            f"\r  [{('#' * filled) + ('.' * (self._width - filled))}] "
+            f"{done}/{self._total} files ({frac * 100:3.0f}%)   ")
+        sys.stderr.flush()
+        if done >= self._total:
+            sys.stderr.write("\n")
+
+
 # --------------------------------------------------------------------- scan
 def cmd_scan(args) -> int:
     config, db, scanner, quarantine = _build(args)
@@ -109,6 +136,9 @@ def cmd_scan(args) -> int:
                     " Baseline mode: scan cache disabled (all files hashed)",
                     YELLOW))
 
+    # A live progress bar on stderr (stdout stays pure for --json/pipes).
+    if not args.json and target.is_dir() and sys.stderr.isatty():
+        scanner.on_progress = _ProgressBar()
     try:
         result = scanner.scan_path(target)
     except OSError as exc:
@@ -213,13 +243,24 @@ def cmd_monitor(args) -> int:
     if not target.exists():
         print(paint(f"error: no such file or directory: {target}", RED), file=sys.stderr)
         return 2
-    watcher = DirectoryWatcher(scanner, quarantine, action=args.action,
-                               interval=args.interval)
-    print(paint(f"Monitoring {target} – press Ctrl+C to stop", CYAN))
+    if args.json:
+        # Machine-readable mode: one JSON object per event on stdout,
+        # human messages suppressed.
+        def _emit(event: dict) -> None:
+            print(json.dumps(event, ensure_ascii=False), flush=True)
+
+        watcher = DirectoryWatcher(
+            scanner, quarantine, action=args.action, interval=args.interval,
+            log=lambda level, message: None, on_event=_emit)
+    else:
+        watcher = DirectoryWatcher(scanner, quarantine, action=args.action,
+                                   interval=args.interval)
+        print(paint(f"Monitoring {target} – press Ctrl+C to stop", CYAN))
     try:
         watcher.run(target)
     except KeyboardInterrupt:
-        print(paint("Monitor stopped.", GREEN))
+        if not args.json:
+            print(paint("Monitor stopped.", GREEN))
     return 0
 
 
@@ -297,12 +338,19 @@ def cmd_sig(args) -> int:
         if not in_path.exists():
             print(paint(f"error: no such file: {in_path}", RED), file=sys.stderr)
             return 2
+        text = in_path.read_text(encoding="utf-8")
         try:
-            data = json.loads(in_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            print(paint(f"error: invalid JSON: {exc}", RED), file=sys.stderr)
-            return 2
-        items = data if isinstance(data, list) else data.get("signatures", [])
+            data = json.loads(text)
+            items = data if isinstance(data, list) else data.get("signatures", [])
+        except json.JSONDecodeError:
+            # Not JSON -> treat as a plain-text IOC file (hash lines,
+            # ``pattern:`` lines, or literal strings).
+            from .signatures import parse_ioc_text
+
+            source = args.source or in_path.stem
+            ioc_sigs = parse_ioc_text(text, source=source,
+                                      severity=args.severity)
+            items = [vars(s) for s in ioc_sigs]
         known = {s.id.lower() for s in db.list()}
         added = skipped = failed = 0
         for item in items:
@@ -379,6 +427,145 @@ def cmd_manifest(args) -> int:
               f"python3 -m antivirus scan {target} --baseline {args.out}")
     else:
         print(json.dumps(manifest, indent=2, ensure_ascii=False))
+    return 0
+
+
+# ------------------------------------------------------------------ verify
+def cmd_verify(args) -> int:
+    """Fast integrity-only check (hash + diff, no signature scanning)."""
+    from .integrity import CHANGED, MISSING, NEW, load_manifest, verify_tree
+
+    config, db, scanner, quarantine = _build(args)
+    target = Path(args.target)
+    if not target.exists():
+        print(paint(f"error: no such file or directory: {target}", RED),
+              file=sys.stderr)
+        return 2
+    bpath = Path(args.baseline)
+    if not bpath.exists():
+        print(paint(f"error: no such baseline: {bpath}", RED), file=sys.stderr)
+        return 2
+    try:
+        baseline = load_manifest(bpath)
+        findings = verify_tree(target, baseline, config)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(paint(f"error: {exc}", RED), file=sys.stderr)
+        return 2
+
+    changed = sum(1 for f in findings if f.name == CHANGED)
+    missing = sum(1 for f in findings if f.name == MISSING)
+    new = sum(1 for f in findings if f.name == NEW)
+
+    if args.json:
+        print(json.dumps({
+            "target": str(target),
+            "baseline": str(bpath),
+            "changed": changed, "missing": missing, "new": new,
+            "clean": not findings,
+            "findings": [f.to_dict() for f in findings],
+        }, indent=2, ensure_ascii=False))
+    else:
+        bar = "=" * 62
+        print()
+        print(paint(bar, BOLD))
+        print(paint(f" Integrity check of {target} vs {bpath.name}", BOLD))
+        print(bar)
+        if not findings:
+            print(paint(" No changes since the baseline.", GREEN))
+        else:
+            for f in findings:
+                color = SEVERITY_COLOR.get(f.severity, YELLOW)
+                print(f"  {paint(f'[{f.severity.upper()}]', color)} "
+                      f"{paint(f.name, BOLD)}")
+                print(f"    file: {f.path}")
+        print(paint(f" {changed} changed, {missing} missing, {new} new",
+                    YELLOW if findings else GREEN))
+        print(bar)
+    return 0 if not findings else 1
+
+
+# ------------------------------------------------------------------- export
+def cmd_export(args) -> int:
+    """Export findings from saved reports to CSV (default) or JSONL."""
+    from .report import (
+        EXPORT_COLUMNS,
+        ReportWriter,
+        iter_export_rows,
+        write_export,
+    )
+
+    config, db, scanner, quarantine = _build(args)
+    writer = ReportWriter(config.report_dir)
+    if args.reports:
+        paths = []
+        for ref in args.reports:
+            p = Path(ref)
+            if not p.exists():
+                p = config.report_dir / ref
+            if not p.exists():
+                print(paint(f"error: no such report: {ref}", RED),
+                      file=sys.stderr)
+                return 2
+            paths.append(p)
+    else:
+        paths = writer.all_reports()
+    if not paths:
+        print(paint("error: no saved reports to export (run a scan first)",
+                    RED), file=sys.stderr)
+        return 2
+
+    rows = iter_export_rows(paths)
+    if args.out:
+        out_path = Path(args.out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_path, "w", encoding="utf-8", newline="") as fh:
+            count = write_export(rows, fh, fmt=args.format)
+        print(paint(f"Exported {count} finding(s) from {len(paths)} "
+                    f"report(s) -> {out_path}", GREEN))
+    else:
+        count = write_export(rows, sys.stdout, fmt=args.format)
+        print(paint(f"({count} finding(s) from {len(paths)} report(s))",
+                    YELLOW), file=sys.stderr)
+    return 0
+
+
+# --------------------------------------------------------------------- stats
+def cmd_stats(args) -> int:
+    """Show engine statistics (signatures, cache, quarantine, reports)."""
+    from .api import engine_stats
+
+    config, db, scanner, quarantine = _build(args)
+    stats = engine_stats(config, db, quarantine, include_reports=not args.no_reports)
+    if args.json:
+        print(json.dumps(stats, indent=2, ensure_ascii=False))
+        return 0
+
+    bar = "=" * 62
+    print()
+    print(paint(bar, BOLD))
+    print(paint(f" AntiVirus {stats['version']} – engine statistics", BOLD))
+    print(bar)
+    sig = stats["signatures"]
+    sev = ", ".join(f"{k}: {v}" for k, v in sig["by_severity"].items())
+    kind = ", ".join(f"{k}: {v}" for k, v in sig["by_kind"].items())
+    print(f" Signatures:  {sig['total']}   ({sev})")
+    print(f"              kinds -> {kind}")
+    print(f"              db     -> {sig['path']}")
+    cache = stats["cache"]
+    cache_txt = f"{cache['entries']} entries, {human_size(cache['size_bytes'])}" \
+        if cache["entries"] or cache["size_bytes"] else "empty / absent"
+    print(f" Scan cache:  {cache_txt}   ({cache['path']})")
+    q = stats["quarantine"]
+    print(f" Quarantine:  {q['items']} item(s)   ({q['path']})")
+    if "reports" in stats:
+        r = stats["reports"]
+        print(f" Reports:     {r['reports']} total "
+              f"({r['infected']} infected / {r['clean']} clean), "
+              f"{r['total_findings']} finding(s)")
+        if r["by_severity"]:
+            print("                " + ", ".join(
+                f"{k}: {v}" for k, v in r["by_severity"].items()))
+    print(bar)
     return 0
 
 
@@ -805,6 +992,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--since", type=_argparse_since, default=0.0, metavar="DURATION",
                    help="only track files modified within DURATION "
                         "(30s / 30m / 2h / 1d / 1w / N seconds)")
+    p.add_argument("--json", action="store_true",
+                   help="emit one JSON object per event (removed / clean / "
+                        "threat / quarantined / deleted / error)")
 
     p = sub.add_parser("quarantine", help="list, restore or purge quarantined files")
     _common_options(p)
@@ -823,8 +1013,27 @@ def build_parser() -> argparse.ArgumentParser:
     pr.add_argument("id", help="signature id to remove")
     pe = ssub.add_parser("export", help="export the database to a JSON file")
     pe.add_argument("file", help="destination JSON file")
-    pi = ssub.add_parser("import", help="merge signatures from a JSON file")
-    pi.add_argument("file", help="JSON file (export format) to import from")
+    pi = ssub.add_parser(
+        "import", help="merge signatures from a JSON file or a plain-text "
+                       "IOC file (hash / pattern lines)")
+    # Same options as the parent `sig` parser, but with SUPPRESS defaults
+    # so that values given *before* the subcommand (the usual position)
+    # are kept, while values given after `import` also work.
+    pi.add_argument("--signatures", default=argparse.SUPPRESS,
+                    help=argparse.SUPPRESS)
+    pi.add_argument("--quarantine-dir", default=argparse.SUPPRESS,
+                    help=argparse.SUPPRESS)
+    pi.add_argument("--report-dir", default=argparse.SUPPRESS,
+                    help=argparse.SUPPRESS)
+    pi.add_argument("--max-size", type=int, default=argparse.SUPPRESS,
+                    help=argparse.SUPPRESS)
+    pi.add_argument("file", help="JSON file (export format) or plain-text "
+                                 "IOC file to import from")
+    pi.add_argument("--source", default="",
+                    help="category stamped on imported signatures "
+                         "(plain-text imports; default: the file's stem)")
+    pi.add_argument("--severity", choices=VALID_SEVERITIES, default="medium",
+                    help="severity for plain-text IOC imports")
     pa = ssub.add_parser("add", help="add a signature")
     pa.add_argument("--id", required=True, help="unique signature id")
     pa.add_argument("--name", required=True, help="human readable name")
@@ -919,6 +1128,38 @@ def build_parser() -> argparse.ArgumentParser:
                        help="identify one or more files (type, size, digests)")
     p.add_argument("files", nargs="+", help="file(s) to identify")
 
+    p = sub.add_parser(
+        "verify",
+        help="fast integrity check against a baseline (hash + diff, "
+             "no signature scanning)")
+    _common_options(p)
+    p.add_argument("target", help="file or directory to check")
+    p.add_argument("--baseline", required=True, metavar="FILE",
+                   help="manifest file (see: antivirus manifest)")
+    p.add_argument("--json", action="store_true",
+                   help="machine readable output")
+
+    p = sub.add_parser(
+        "export",
+        help="export findings from saved reports to CSV or JSONL")
+    _common_options(p)
+    p.add_argument("reports", nargs="*",
+                   help="report file or name in the report dir "
+                        "(default: all saved reports)")
+    p.add_argument("--format", choices=("csv", "jsonl"), default="csv",
+                   help="output format (default csv)")
+    p.add_argument("--out", default=None, metavar="FILE",
+                   help="write to FILE instead of stdout")
+
+    p = sub.add_parser(
+        "stats",
+        help="engine statistics (signatures, cache, quarantine, reports)")
+    _common_options(p)
+    p.add_argument("--no-reports", action="store_true",
+                   help="skip the report aggregation")
+    p.add_argument("--json", action="store_true",
+                   help="machine readable output")
+
     return parser
 
 
@@ -938,6 +1179,9 @@ _COMMANDS = {
     "web": cmd_web,
     "tui": cmd_tui,
     "fileinfo": cmd_fileinfo,
+    "verify": cmd_verify,
+    "export": cmd_export,
+    "stats": cmd_stats,
 }
 
 

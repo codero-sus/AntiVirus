@@ -104,6 +104,29 @@ watches folders for new/changed files, and writes JSON + text reports.
   anywhere, for testing the engine
 - **Report summary** — `report summary` aggregates all saved reports
   (infected/clean counts, severity breakdown, top indicators)
+- **Fast integrity check** — `verify DIR --baseline FILE` re-hashes a tree
+  and diffs it against a baseline **without** running any signature /
+  behaviour / entropy layers, so it is much cheaper than a full
+  `scan --baseline` — the quick "is anything different?" FIM check
+  (also `GET /api/verify` and `av.verify(...)` as a module)
+- **Report export** — `export [REPORT …]` flattens the findings of saved
+  reports (default: all of them) into **CSV** (default) or **JSONL** with
+  one row per finding: report, target, timestamp, severity, kind, name,
+  file, SHA-256, size, action and message — ready for Excel / SIEM / grep
+- **IOC import** — `sig import FILE` also accepts **plain-text IOC files**:
+  64-hex lines become SHA-256 signatures, 32-hex lines MD5 signatures,
+  `pattern: …` lines are regexes, and anything else is a literal marker.
+  `#`/`;` lines are comments; `--source` tags the category and `--severity`
+  sets the level. JSON export files still work unchanged
+- **Engine statistics** — `stats` (and `GET /api/stats`) summarises the
+  engine: signature counts by severity and matcher kind, scan-cache size
+  and entry count, quarantine item count, and report totals
+- **Scan progress bar** — directory scans print a live `[###····]`
+  progress bar on **stderr** (so `--json` stdout stays a pure JSON stream
+  for piping), throttled to a smooth update rate
+- **Machine-readable monitor** — `monitor --json` emits one JSON object per
+  event (`removed` / `clean` / `threat` / `quarantined` / `deleted` /
+  `error`) instead of coloured human lines, for piping into a log aggregator
 
 ## Requirements
 
@@ -318,7 +341,7 @@ original path, timestamp and reason recorded in `quarantine/manifest.json`.
 | Command | Description |
 | --- | --- |
 | `scan TARGET [--action detect\|quarantine\|delete] [--threads N] [--no-behavior] [--fast] [--no-cache] [--no-archives] [--exclude GLOB] [--since DURATION] [--baseline FILE] [--json]` | Scan a file or directory tree (`--threads`: auto, N, or 1; `--fast`: hash+pattern only; `--exclude` repeatable; `--since 30m/2h/1d`: only recently modified files; `--baseline`: integrity check vs a manifest) |
-| `monitor TARGET [--action ...] [--interval 2] [--no-behavior] [--no-archives] [--exclude GLOB] [--since DURATION]` | Watch a directory, scan new/changed files |
+| `monitor TARGET [--action ...] [--interval 2] [--no-behavior] [--no-archives] [--exclude GLOB] [--since DURATION] [--json]` | Watch a directory, scan new/changed files (`--json`: one JSON object per event) |
 | `hash FILE… [--json]` | Print SHA-256 / MD5 / SHA-1 digests + size of each file |
 | `behavior analyze FILE [--json]` | Show what one file appears to do (static behavioural analysis) |
 | `pe analyze FILE [--json]` | Full static PE dissection ("debug report") + red-flag indicators |
@@ -330,8 +353,11 @@ original path, timestamp and reason recorded in `quarantine/manifest.json`.
 | `sig add --id … --name … [--sha256/--md5/--pattern …]` | Add a signature |
 | `sig remove ID` | Remove a signature from the database |
 | `sig export FILE` | Write the database to a JSON file |
-| `sig import FILE` | Merge signatures from a JSON file (skips duplicate ids) |
+| `sig import FILE [--source NAME] [--severity LEVEL]` | Merge signatures from a JSON file **or a plain-text IOC file** (hash / `pattern:` / literal lines; skips duplicate ids) |
 | `selftest` | Run the built-in end-to-end self test |
+| `verify TARGET --baseline FILE [--json]` | Fast integrity check (hash + diff only, no signature scan) vs a manifest |
+| `export [REPORT …] [--format csv\|jsonl] [--out FILE]` | Flatten findings from saved reports (default: all) into CSV / JSONL |
+| `stats [--no-reports] [--json]` | Engine statistics: signatures, cache, quarantine, reports |
 | `report list` / `report show [FILE]` | Inspect saved reports |
 | `report diff [OLD NEW] [--json]` | Compare two reports (default: the two newest): new / cleared / unchanged |
 | `report summary` | Aggregate all saved reports (counts, severities, top indicators) |
@@ -371,9 +397,15 @@ av.scan_file("suspicious.bin")        # -> [Finding, …]
 av.file_info("suspicious.bin")        # type (magic), size, mtime, sha256, md5
 baseline = av.manifest("some/dir")    # integrity baseline (dict)
 av.save_manifest(baseline, "baseline.json")
+av.verify("some/dir", "baseline.json")   # fast hash-only diff -> [Finding, …]
 av.quarantine.restore("275a021b-…")
 av.remove_signature("AV-MINE-001")
 ```
+
+Plain-text IOC lists import through the same database:
+`antivirus sig import feed.txt --source feed --severity high` turns 64-hex
+lines into SHA-256 signatures, 32-hex lines into MD5 signatures, and any
+other line into a literal-marker pattern — the very next scan picks them up.
 
 `antivirus.scan` returns a `ScanResult` (see `antivirus.scanner`) and
 `av.scan` additionally carries a `notes` attribute for applied actions.
@@ -398,8 +430,10 @@ The dashboard (single page, no external assets, dark theme) offers:
 - **Quick file check** — type any file path: type (magic), size, mtime,
   SHA-256/MD5 plus a single-file mini-scan.
 - **Integrity baselines** — create a manifest from the current target and
-  scan against it (changed / missing / new files).
+  scan against it (changed / missing / new files); the **verify (fast)**
+  button runs the cheaper hash-only diff instead of a full scan.
 - **Report history** — saved-report summary + latest reports.
+- **Engine stats** — live signature / cache / quarantine / report totals.
 - **Quarantine manager** — list, restore or purge quarantined files.
 - **Signature editor** — add (pattern / sha256 / md5), inspect and remove
   signatures; changes apply to the very next scan.
@@ -420,6 +454,8 @@ JSON API (useful for scripting / your own front-end):
 | `/api/baselines` | GET / POST | list / create integrity baselines (`{"target", "id?"}`) |
 | `/api/fileinfo` | GET | `?path=…` — type, size, mtime, SHA-256/MD5 + single-file findings |
 | `/api/reports` / `/api/reports/summary` | GET | saved reports / aggregate |
+| `/api/verify` | GET | `?target=&baseline=` — fast integrity check (hash + diff only) |
+| `/api/stats` | GET | engine statistics (signatures, cache, quarantine, reports) |
 | `/api/docs` | GET | in-browser API documentation |
 
 The console binds to `0.0.0.0` by default and has **no authentication** —
@@ -457,14 +493,14 @@ antivirus/
 │                    #   PE/ELF import tables, binary IOCs, SUID)
 ├── pe.py            # PE32/PE32+ dissection ("debug report") + indicators
 ├── fileinfo.py      # file identification (magic + digests)
-├── integrity.py     # file-integrity baselines (manifest + diff)
+├── integrity.py     # file-integrity baselines (manifest + diff + fast verify)
 ├── samples.py       # builder for the inert demo samples (fake PE/ELF,
 │                    #   sneaky ZIP/TAR.GZ, `samples` tree)
 ├── scanner.py       # single-pass hashing, patterns, behaviour, heuristics
-├── signatures.py    # JSON signature database (load/add/save)
+├── signatures.py    # JSON signature database (load/add/save) + IOC parser
 ├── quarantine.py    # quarantine store with manifest, restore, purge
-├── monitor.py       # polling directory watcher
-├── report.py        # JSON + text report writer, diff, summary
+├── monitor.py       # polling directory watcher (structured events)
+├── report.py        # JSON + text report writer, diff, summary, export
 ├── selftest.py      # built-in end-to-end self test
 ├── output.py        # tiny ANSI colour helper
 └── utils.py         # shared helpers

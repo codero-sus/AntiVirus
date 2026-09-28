@@ -11,7 +11,8 @@ Features
 * Scan cache, fast mode, incremental ``--since`` scans
 * Quarantine with manifest: list, restore and purge
 * Directory monitoring (polling based, no external dependencies)
-* JSON + human readable scan reports, report diff & summary
+* JSON + human readable scan reports, report diff & summary, CSV/JSONL export
+* Fast integrity checks (verify), plain-text IOC imports, engine statistics
 * Multiple front-ends: CLI, Tkinter GUI, curses TUI, web console —
   and a plain-module API for embedding in your own code
 
@@ -38,7 +39,7 @@ Everything is standard library only (Tkinter/curses are optional and used
 only by their respective front-ends).
 """
 
-__version__ = "1.8.0"
+__version__ = "1.9.0"
 
 from .api import Antivirus, apply_actions, scan, scan_file  # noqa: E402
 

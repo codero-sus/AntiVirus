@@ -15,6 +15,8 @@ Serves a single-page dashboard plus a small JSON API:
     GET  /api/signatures       signature list
     POST /api/signatures       add a signature
     POST /api/signatures/remove    {"id"}
+    GET  /api/verify           ?target=&baseline= – fast integrity check
+    GET  /api/stats            engine statistics (sigs/cache/quarantine)
 
 Scans run in background threads (jobs) so the UI can poll live progress.
 This is a *local* tool: there is no authentication – bind it to an
@@ -127,7 +129,8 @@ footer a{color:var(--accent)}
             <option value="">(off)</option>
           </select>
           <button type="button" class="ghost small" onclick="newBaseline()">new from target</button>
-          <span class="muted">compares this scan against a saved manifest (changed / missing / new files)</span>
+          <button type="button" class="ghost small" onclick="verifyBaseline()">verify (fast)</button>
+          <span class="muted">full scan compares against the manifest · verify only re-hashes (no signature scan)</span>
         </div>
       </form>
       <div id="job-status" class="muted" style="display:none">
@@ -192,6 +195,10 @@ footer a{color:var(--accent)}
       <h2>Report history</h2>
       <div id="reports" class="muted">…</div>
     </section>
+    <section style="margin-top:14px">
+      <h2>Engine stats <button class="ghost small" style="float:right" onclick="loadStats()">refresh</button></h2>
+      <div id="stats" class="muted">…</div>
+    </section>
   </div>
 </main>
 <footer id="footer"></footer>
@@ -218,6 +225,7 @@ async function init() {
   $("footer").innerHTML = "AntiVirus Web Console · " + (h.data.version || "") +
     ' · <a href="/api/docs">API documentation</a>';
   loadJobs(); loadQuarantine(); loadSigs(); loadBaselines(); loadReports();
+  loadStats();
   setInterval(() => { $("clock").textContent = new Date().toLocaleTimeString(); }, 1000);
   $("filter").addEventListener("input", renderFindings);
 }
@@ -287,7 +295,7 @@ async function pollJob() {
     $("live-flag").textContent = "";
     if (j.status === "error") alert("Scan error: " + j.error);
     if (r.data.result) showResult(r.data.result);
-    loadJobs(); loadQuarantine(); loadReports();
+    loadJobs(); loadQuarantine(); loadReports(); loadStats();
   }
 }
 function stopPolling() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
@@ -439,6 +447,42 @@ async function loadReports() {
   }
 }
 
+/* ------------------------------------------------------------- engine stats */
+function fmtBytes(n) {
+  if (n == null) return "0 B";
+  if (n < 1024) return n + " B";
+  if (n < 1048576) return (n / 1024).toFixed(1) + " KiB";
+  return (n / 1048576).toFixed(1) + " MiB";
+}
+async function loadStats() {
+  const r = await api("/api/stats");
+  if (!r.ok) return;
+  const s = r.data, el = $("stats");
+  const sev = Object.entries(s.signatures.by_severity).map(([k,v]) => k + "×" + v).join(", ");
+  let text = "v" + s.version + "\n";
+  text += "signatures: " + s.signatures.total + (sev ? "  (" + sev + ")" : "") + "\n";
+  text += "scan cache: " + s.cache.entries + " entries · " + fmtBytes(s.cache.size_bytes) + "\n";
+  text += "quarantine: " + s.quarantine.items + " item(s)";
+  if (s.reports) text += "\nreports: " + s.reports.reports + " total · " +
+    s.reports.infected + " infected · " + s.reports.total_findings + " finding(s)";
+  el.textContent = text;
+}
+
+/* ------------------------------------------------------------- fast verify */
+async function verifyBaseline() {
+  const target = $("target").value.trim() || ".";
+  const baseline = $("baseline").value;
+  if (!baseline) { alert("Pick a baseline first (or create one)."); return; }
+  const r = await api("/api/verify?target=" + encodeURIComponent(target) +
+                      "&baseline=" + encodeURIComponent(baseline));
+  if (!r.ok) { alert("Verify failed: " + (r.data.error || r.status)); return; }
+  const d = r.data;
+  if (d.clean) { alert("Integrity check clean — no changes since " + baseline + "."); return; }
+  showResult({target: d.target, findings: d.findings, files_scanned: 0, clean: false});
+  $("result-target").textContent = " — " + d.target + "  [integrity: " +
+    d.changed + " changed, " + d.missing + " missing, " + d.new + " new]";
+}
+
 init();
 </script>
 </body>
@@ -492,6 +536,11 @@ a{color:#2f81f7}
     (<code>findings</code>)</td></tr>
 <tr><td><code>/api/reports</code></td><td>GET</td><td>saved reports (list)</td></tr>
 <tr><td><code>/api/reports/summary</code></td><td>GET</td><td>aggregate of all saved reports</td></tr>
+<tr><td><code>/api/verify</code></td><td>GET</td><td><code>?target=&amp;baseline=</code> —
+    fast integrity check (hash + diff, no signature scan); returns
+    <code>changed/missing/new</code> counts and the findings</td></tr>
+<tr><td><code>/api/stats</code></td><td>GET</td><td>engine statistics: signature
+    counts by severity/kind, scan-cache size, quarantine items, report totals</td></tr>
 <tr><td><code>/api/docs</code></td><td>GET</td><td>this page</td></tr>
 </table>
 <h2>Example (curl)</h2>
@@ -511,7 +560,8 @@ class ScanJob:
 
     def __init__(self, scanner: Scanner, target: Path, action: str = "detect",
                  quarantine: Optional[Quarantine] = None,
-                 baseline: Optional[Path] = None) -> None:
+                 baseline: Optional[Path] = None,
+                 report_writer=None) -> None:
         self.id = uuid.uuid4().hex[:12]
         self.target = str(target)
         self.action = action
@@ -526,6 +576,8 @@ class ScanJob:
         self._target = Path(target)
         self._quarantine = quarantine
         self._baseline = baseline
+        self._report_writer = report_writer
+        self.report_path = None
         self.thread = threading.Thread(target=self._run, daemon=True)
 
     def _run(self) -> None:
@@ -548,6 +600,10 @@ class ScanJob:
 
                 self.notes = apply_actions(self.result, self._quarantine,
                                            self.action)
+            if self._report_writer is not None:
+                self.report_path = self._report_writer.save(
+                    self.result, action=self.action,
+                    actions_taken=self.notes)
             self.status = "done"
         except Exception as exc:  # the UI needs a reason, not a traceback
             self.status = "error"
@@ -585,6 +641,8 @@ class ScanJob:
         data = self.result.to_dict()
         data["action"] = self.action
         data["actions_taken"] = self.notes
+        if self.report_path is not None:
+            data["report"] = str(self.report_path)
         return data
 
 
@@ -627,8 +685,11 @@ class WebApp:
             # cached verdicts carry no digests, so bypass the cache.
             cfg.cache_enabled = False
         scanner = Scanner(cfg, self.db)
+        from .report import ReportWriter
+
         job = ScanJob(scanner, target, action, self.quarantine,
-                      baseline=baseline_path)
+                      baseline=baseline_path,
+                      report_writer=ReportWriter(self.config.report_dir))
         with self._lock:
             self.jobs[job.id] = job
             if len(self.jobs) > 64:  # keep the job table bounded
@@ -690,6 +751,31 @@ class WebApp:
             return p
         candidate = self.config.baseline_dir / f"{ref}.json"
         return candidate if candidate.exists() else None
+
+    # --------------------------------------------------------- verify/stats
+    def verify(self, target: Path, baseline_ref: str) -> dict:
+        """Fast integrity-only check (hash + diff, no signature scan)."""
+        from .integrity import CHANGED, MISSING, NEW, load_manifest, verify_tree
+
+        bpath = self.resolve_baseline(baseline_ref)
+        if bpath is None:
+            raise ValueError(f"no such baseline: {baseline_ref!r}")
+        baseline = load_manifest(bpath)
+        findings = verify_tree(target, baseline, self.config)
+        return {
+            "target": str(target),
+            "baseline": str(bpath),
+            "changed": sum(1 for f in findings if f.name == CHANGED),
+            "missing": sum(1 for f in findings if f.name == MISSING),
+            "new": sum(1 for f in findings if f.name == NEW),
+            "clean": not findings,
+            "findings": [f.to_dict() for f in findings],
+        }
+
+    def stats(self) -> dict:
+        from .api import engine_stats
+
+        return engine_stats(self.config, self.db, self.quarantine)
 
     # ------------------------------------------------------- file utilities
     def file_info(self, path: str) -> Optional[dict]:
@@ -802,6 +888,10 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json(200, {"reports": self.app.reports()})
             elif path == "/api/reports/summary":
                 self._json(200, self.app.report_summary())
+            elif path == "/api/stats":
+                self._json(200, self.app.stats())
+            elif path == "/api/verify":
+                self._verify()
             elif path == "/api/docs":
                 self._send(200, DOCS_PAGE.encode("utf-8"),
                            "text/html; charset=utf-8")
@@ -894,6 +984,24 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(404, {"error": f"no such file: {path}"})
             return
         self._json(200, info)
+
+    def _verify(self) -> None:
+        from urllib.parse import parse_qs
+
+        query = parse_qs(urlsplit(self.path).query)
+        target = (query.get("target") or [""])[0].strip()
+        baseline = (query.get("baseline") or [""])[0].strip()
+        if not target or not baseline:
+            self._json(400, {"error": "target and baseline query parameters "
+                                      "are required"})
+            return
+        if not Path(target).exists():
+            self._json(404, {"error": f"no such file or directory: {target}"})
+            return
+        try:
+            self._json(200, self.app.verify(Path(target), baseline))
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            self._json(400, {"error": str(exc)})
 
     def _quarantine_op(self, op: str) -> None:
         body = self._body()

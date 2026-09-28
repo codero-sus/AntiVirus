@@ -31,8 +31,12 @@ def file_sha256(path: Path, chunk_size: int = 1024 * 1024) -> str:
     return h.hexdigest()
 
 
-def build_manifest(target: Path, config: Config) -> Dict:
-    """Hash every scannable file under *target* and return the baseline."""
+def _hash_tree(target: Path, config: Config) -> Dict[str, Dict]:
+    """Hash every scannable file under *target*.
+
+    Returns ``{relative_path: {"sha256": …, "size": …}}`` (a single file
+    maps to the empty key ``""``).
+    """
     target = Path(target)
     if not target.exists():
         raise FileNotFoundError(str(target))
@@ -53,13 +57,27 @@ def build_manifest(target: Path, config: Config) -> Dict:
             except (ValueError, OSError):
                 continue
             files[str(rel)] = {"sha256": file_sha256(p), "size": st.st_size}
+    return files
 
+
+def build_manifest(target: Path, config: Config) -> Dict:
+    """Hash every scannable file under *target* and return the baseline."""
     return {
         "version": 1,
         "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "target": str(target),
-        "files": files,
+        "files": _hash_tree(target, config),
     }
+
+
+def verify_tree(target: Path, baseline: Dict, config: Config) -> List[Finding]:
+    """Fast integrity-only check: hash the tree and diff against *baseline*.
+
+    Unlike ``scan --baseline`` no signature / behaviour / entropy layers
+    run – this is the quick "is anything different since the baseline?"
+    FIM check. Returns changed / missing / new findings.
+    """
+    return compare_baseline(baseline, _hash_tree(target, config))
 
 
 def save_manifest(manifest: Dict, path: Path) -> None:

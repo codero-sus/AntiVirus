@@ -1621,5 +1621,529 @@ def urllib_parse(path: Path) -> str:
     return quote(str(path), safe="/")
 
 
+class VerifyTests(unittest.TestCase):
+    """v1.9: `verify` – fast integrity check (hash + diff, no scan)."""
+
+    def setUp(self):
+        base = Path(tempfile.mkdtemp(prefix="av-verify-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        self.base = base
+        self.app = App(base)
+        self.d = base / "tree"
+        self.d.mkdir()
+        (self.d / "a.txt").write_text("one\n")
+        (self.d / "b.txt").write_text("two\n")
+
+    def _baseline(self):
+        from antivirus.integrity import build_manifest, save_manifest
+
+        bfile = self.base / "b.json"
+        save_manifest(build_manifest(self.d, self.app.config), bfile)
+        return bfile
+
+    def test_verify_tree_clean_and_dirty(self):
+        from antivirus.integrity import CHANGED, MISSING, NEW, verify_tree
+
+        bfile = self._baseline()
+        baseline = json.loads(bfile.read_text())
+        self.assertEqual(verify_tree(self.d, baseline, self.app.config), [])
+
+        (self.d / "a.txt").write_text("CHANGED\n")
+        (self.d / "b.txt").unlink()
+        (self.d / "c.txt").write_text("three\n")
+        findings = verify_tree(self.d, baseline, self.app.config)
+        self.assertEqual({f.name for f in findings},
+                         {CHANGED, MISSING, NEW})
+
+    def test_cli_verify_json(self):
+        from antivirus.cli import main
+
+        bfile = self._baseline()
+        (self.d / "a.txt").write_text("CHANGED\n")
+        (self.d / "c.txt").write_text("three\n")
+
+        old_cwd = os.getcwd()
+        os.chdir(self.base)
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = main(["verify", str(self.d), "--baseline", str(bfile),
+                           "--json"])
+        finally:
+            os.chdir(old_cwd)
+        data = json.loads(buf.getvalue())
+        self.assertEqual(rc, 1)
+        self.assertEqual(data["changed"], 1)
+        self.assertEqual(data["missing"], 0)
+        self.assertEqual(data["new"], 1)
+        self.assertFalse(data["clean"])
+
+    def test_cli_verify_clean_rc0_and_missing_baseline_rc2(self):
+        from antivirus.cli import main
+
+        bfile = self._baseline()
+        old_cwd = os.getcwd()
+        os.chdir(self.base)
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = main(["verify", str(self.d), "--baseline", str(bfile)])
+            self.assertEqual(rc, 0)
+            self.assertIn("No changes since the baseline", buf.getvalue())
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = main(["verify", str(self.d),
+                           "--baseline", str(self.base / "nope.json")])
+            self.assertEqual(rc, 2)
+        finally:
+            os.chdir(old_cwd)
+
+    def test_module_api_verify_by_id(self):
+        from antivirus import Antivirus
+        from antivirus.integrity import build_manifest
+
+        av = Antivirus(base=str(self.base))
+        manifest = build_manifest(self.d, self.app.config)
+        av.save_manifest(manifest, self.app.config.baseline_dir / "v1.json")
+        self.assertEqual(av.verify(self.d, "v1"), [])
+
+        (self.d / "a.txt").write_text("CHANGED\n")
+        findings = av.verify(self.d, "v1")
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].name, "File changed since baseline")
+
+
+class ExportTests(unittest.TestCase):
+    """v1.9: `export` – findings from saved reports as CSV / JSONL."""
+
+    def setUp(self):
+        base = Path(tempfile.mkdtemp(prefix="av-export-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        self.base = base
+        self.app = App(base)
+        self.app.scanner.config.cache_enabled = False
+        d = base / "tree"
+        d.mkdir()
+        (d / "eicar.txt").write_bytes(EICAR)
+        (d / "clean.txt").write_text("fine\n")
+        self.d = d
+
+    def _scan(self):
+        from antivirus.cli import main
+
+        old_cwd = os.getcwd()
+        os.chdir(self.base)
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = main(["scan", str(self.d), "--json"])
+        finally:
+            os.chdir(old_cwd)
+        self.assertEqual(rc, 1)
+        return json.loads(buf.getvalue())
+
+    def test_export_csv(self):
+        import csv
+
+        from antivirus.cli import main
+
+        result = self._scan()
+        self.assertTrue(result["findings"])
+        # digests must be backfilled on every finding (hash ones set them)
+        self.assertTrue(all(f["sha256"] for f in result["findings"]))
+
+        old_cwd = os.getcwd()
+        os.chdir(self.base)
+        try:
+            buf = io.StringIO()
+            err = io.StringIO()
+            with contextlib.redirect_stdout(buf), \
+                    contextlib.redirect_stderr(err):
+                rc = main(["export"])
+        finally:
+            os.chdir(old_cwd)
+        self.assertEqual(rc, 0)
+        lines = [ln for ln in buf.getvalue().splitlines() if ln]
+        self.assertIn("report,target,started_at,severity,kind,name,file,"
+                      "sha256,size,action,message", lines[0])
+        rows = list(csv.DictReader(buf.getvalue().splitlines()))
+        self.assertEqual(len(rows), len(result["findings"]))
+        eicar_rows = [r for r in rows
+                      if r["file"].endswith("eicar.txt")]
+        self.assertTrue(eicar_rows)
+        self.assertEqual(eicar_rows[0]["severity"], "critical")
+        self.assertEqual(len(eicar_rows[0]["sha256"]), 64)
+        self.assertIn("finding(s)", err.getvalue())
+
+    def test_export_jsonl_and_out_file(self):
+        from antivirus.cli import main
+
+        self._scan()
+        out = self.base / "findings.jsonl"
+        old_cwd = os.getcwd()
+        os.chdir(self.base)
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = main(["export", "--format", "jsonl", "--out", str(out)])
+        finally:
+            os.chdir(old_cwd)
+        self.assertEqual(rc, 0)
+        lines = [ln for ln in out.read_text().splitlines() if ln]
+        data = [json.loads(ln) for ln in lines]
+        self.assertTrue(data)
+        self.assertEqual(set(data[0]), {"report", "target", "started_at",
+                                        "severity", "kind", "name", "file",
+                                        "sha256", "size", "action", "message"})
+
+    def test_export_specific_report_and_no_reports(self):
+        from antivirus.cli import main
+
+        self._scan()
+        report_name = next((self.base / "reports").glob("scan-*.json")).name
+        old_cwd = os.getcwd()
+        os.chdir(self.base)
+        try:
+            buf = io.StringIO()
+            err = io.StringIO()
+            with contextlib.redirect_stdout(buf), \
+                    contextlib.redirect_stderr(err):
+                rc = main(["export", report_name])
+            self.assertEqual(rc, 0)
+            self.assertIn(report_name, buf.getvalue())
+
+            # a second scan, then export only the second report
+            (self.d / "more.txt").write_text("still fine\n")
+            self._scan()
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = main(["export", report_name])
+            self.assertEqual(rc, 0)
+            self.assertNotIn("more.txt", buf.getvalue())
+
+            err = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(err):
+                rc = main(["export", "no-such-report.json"])
+            self.assertEqual(rc, 2)
+        finally:
+            os.chdir(old_cwd)
+
+
+class IocImportTests(unittest.TestCase):
+    """v1.9: `sig import` accepts plain-text IOC files."""
+
+    def test_parse_ioc_text_kinds(self):
+        from antivirus.signatures import parse_ioc_text
+
+        text = (
+            "# comment line\n"
+            "; semicolon comment\n"
+            "\n"
+            "275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f\n"
+            "md5=44d88612fea8a8f36de82e1278abb02f\n"
+            "pattern: ^MZ\\x00{2}\n"
+            "PLAIN-MARKER\n"
+        )
+        sigs = parse_ioc_text(text, source="feedX")
+        self.assertEqual(len(sigs), 4)
+        kinds = [s.id for s in sigs]
+        self.assertTrue(kinds[0].startswith("IOC-SHA256-"))
+        self.assertTrue(kinds[1].startswith("IOC-MD5-"))
+        self.assertTrue(kinds[2].startswith("IOC-PAT-"))
+        self.assertTrue(kinds[3].startswith("IOC-PAT-"))
+        self.assertEqual(sigs[0].sha256,
+                         "275a021bbfb6489e54d471899f7db9d1663fc695"
+                         "ec2fe2a2c4538aabf651fd0f")
+        self.assertEqual(sigs[1].md5, "44d88612fea8a8f36de82e1278abb02f")
+        self.assertEqual(sigs[2].pattern, "^MZ\\x00{2}")
+        self.assertIn("PLAIN\\-MARKER", sigs[3].pattern)
+        self.assertTrue(all(s.category == "feedX" for s in sigs))
+
+    def test_parse_ioc_invalid_hex_is_literal(self):
+        from antivirus.signatures import parse_ioc_text
+
+        sigs = parse_ioc_text("sha256=not-a-real-hash")
+        self.assertEqual(len(sigs), 1)
+        self.assertFalse(sigs[0].sha256)
+        self.assertTrue(sigs[0].pattern)
+
+    def test_cli_import_plain_text_and_detect(self):
+        from antivirus.cli import main
+        from antivirus.scanner import Scanner
+
+        base = Path(tempfile.mkdtemp(prefix="av-ioc-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        dbfile = base / "ioc.json"
+        dbfile.write_text(json.dumps({"signatures": []}) + "\n")
+        ioc = base / "feed.txt"
+        ioc.write_text(
+            "44d88612fea8a8f36de82e1278abb02f\n"
+            "MY-UNIQUE-MARKER-77\n"
+        )
+
+        old_cwd = os.getcwd()
+        os.chdir(base)
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = main(["sig", "--signatures", str(dbfile),
+                           "import", str(ioc), "--source", "feed",
+                           "--severity", "high"])
+            self.assertEqual(rc, 0)
+            self.assertIn("Imported 2", buf.getvalue())
+
+            db = SignatureDB(dbfile)
+            sigs = {s.id: s for s in db.list()}
+            self.assertEqual(len(sigs), 2)
+            md5_sig = next(s for s in sigs.values() if s.md5)
+            pat_sig = next(s for s in sigs.values() if s.pattern)
+            self.assertEqual(md5_sig.severity, "high")
+            self.assertEqual(pat_sig.category, "feed")
+
+            # re-import: both skipped as already present
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = main(["sig", "--signatures", str(dbfile),
+                           "import", str(ioc)])
+            self.assertEqual(rc, 0)
+            self.assertIn("2 already present", buf.getvalue())
+
+            # end-to-end: the md5 IOC catches EICAR, the literal catches its marker
+            scanner = Scanner(App(base).config, db, threads=1)
+            (base / "e.txt").write_bytes(EICAR)
+            findings = scanner.scan_file(base / "e.txt")
+            self.assertTrue(any("IOC" in f.name for f in findings))
+            (base / "m.txt").write_text("prefix MY-UNIQUE-MARKER-77 suffix\n")
+            findings = scanner.scan_file(base / "m.txt")
+            self.assertEqual(len(findings), 1)
+            self.assertEqual(findings[0].severity, "high")
+        finally:
+            os.chdir(old_cwd)
+
+
+class StatsTests(unittest.TestCase):
+    """v1.9: `stats` – engine statistics (CLI + /api/stats)."""
+
+    def test_cli_stats_json(self):
+        from antivirus.cli import main
+
+        base = Path(tempfile.mkdtemp(prefix="av-stats-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        app = App(base)
+        app.scanner.config.cache_enabled = False
+        (base / "e.txt").write_bytes(EICAR)
+        (base / "c.txt").write_text("fine\n")
+
+        old_cwd = os.getcwd()
+        os.chdir(base)
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = main(["scan", str(base), "--json"])
+            self.assertEqual(rc, 1)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = main(["stats", "--json"])
+        finally:
+            os.chdir(old_cwd)
+        self.assertEqual(rc, 0)
+        data = json.loads(buf.getvalue())
+        self.assertEqual(data["signatures"]["total"],
+                         len(SignatureDB(app.config.signatures_file).list()))
+        self.assertGreaterEqual(data["cache"]["entries"], 2)
+        self.assertGreater(data["cache"]["size_bytes"], 0)
+        self.assertEqual(data["quarantine"]["items"], 0)
+        self.assertEqual(data["reports"]["reports"], 1)
+        self.assertEqual(data["reports"]["infected"], 1)
+        self.assertEqual(data["reports"]["total_findings"], 1)
+
+    def test_cli_stats_human(self):
+        from antivirus.cli import main
+
+        base = Path(tempfile.mkdtemp(prefix="av-stats2-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        App(base)
+        old_cwd = os.getcwd()
+        os.chdir(base)
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = main(["stats", "--no-reports"])
+        finally:
+            os.chdir(old_cwd)
+        self.assertEqual(rc, 0)
+        out = buf.getvalue()
+        self.assertIn("engine statistics", out)
+        self.assertIn("Signatures:", out)
+        self.assertIn("Scan cache:", out)
+        self.assertIn("Quarantine:", out)
+
+
+class ProgressTests(unittest.TestCase):
+    """v1.9: Scanner.on_progress ticks per file (bar plumbing)."""
+
+    def test_progress_ticks_sequential_and_cached(self):
+        base = Path(tempfile.mkdtemp(prefix="av-prog-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        app = App(base)
+        d = base / "tree"
+        d.mkdir()
+        for i in range(5):
+            (d / f"f{i}.txt").write_text(f"content {i}\n")
+
+        calls = []
+        app.scanner.on_progress = lambda done, total: calls.append((done, total))
+        result = app.scanner.scan_path(d)
+        self.assertEqual(len(calls), 5)
+        self.assertEqual([c[0] for c in calls], [1, 2, 3, 4, 5])
+        self.assertTrue(all(c[1] == 5 for c in calls))
+
+        # a cached rescan still ticks (cached files are progress too)
+        calls.clear()
+        result2 = app.scanner.scan_path(d)
+        self.assertEqual(len(calls), 5)
+        self.assertEqual(result2.files_cached, 5)
+
+    def test_progress_callback_exception_is_swallowed(self):
+        base = Path(tempfile.mkdtemp(prefix="av-prog2-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        app = App(base)
+        d = base / "tree"
+        d.mkdir()
+        (d / "a.txt").write_text("fine\n")
+
+        def broken(done, total):
+            raise RuntimeError("boom")
+
+        app.scanner.on_progress = broken
+        result = app.scanner.scan_path(d)  # must not raise
+        self.assertTrue(result.clean)
+
+    def test_cli_progress_bar_renders(self):
+        from antivirus.cli import _ProgressBar
+
+        buf = io.StringIO()
+        bar = _ProgressBar(interval=0)  # no throttling in the test
+        with contextlib.redirect_stderr(buf):
+            bar(1, 10)
+            bar(5, 10)
+            bar(10, 10)
+        out = buf.getvalue()
+        self.assertIn("5/10", out)
+        self.assertIn("10/10", out)
+        self.assertIn("###", out)
+
+
+class MonitorEventTests(unittest.TestCase):
+    """v1.9: DirectoryWatcher structured events (monitor --json)."""
+
+    def setUp(self):
+        base = Path(tempfile.mkdtemp(prefix="av-mon-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        self.base = base
+        self.app = App(base)
+        self.app.scanner.config.cache_enabled = False
+        self.watch = base / "watch"
+        self.watch.mkdir()
+
+    def test_events_for_clean_threat_and_removed(self):
+        from antivirus.monitor import DirectoryWatcher
+
+        events = []
+        watcher = DirectoryWatcher(self.app.scanner, self.app.quarantine,
+                                   action="detect", interval=0.1,
+                                   log=lambda level, message: None,
+                                   on_event=events.append)
+        watcher._state = watcher._snapshot(self.watch)
+
+        (self.watch / "ok.txt").write_text("fine\n")
+        (self.watch / "bad.txt").write_bytes(EICAR)
+        watcher.process(watcher.poll(self.watch))
+        names = {(e["event"], e.get("path", "")) for e in events}
+        self.assertIn(("clean", str(self.watch / "ok.txt")), names)
+        threat = next(e for e in events if e["event"] == "threat")
+        self.assertEqual(threat["path"], str(self.watch / "bad.txt"))
+        self.assertEqual(threat["severity"], "critical")
+        self.assertEqual(threat["findings"], 1)
+
+        (self.watch / "ok.txt").unlink()
+        events.clear()
+        watcher.process(watcher.poll(self.watch))
+        self.assertEqual([e["event"] for e in events], ["removed"])
+        self.assertEqual(events[0]["path"], str(self.watch / "ok.txt"))
+
+    def test_event_hook_failure_is_swallowed(self):
+        from antivirus.monitor import DirectoryWatcher
+
+        def broken(event):
+            raise RuntimeError("boom")
+
+        watcher = DirectoryWatcher(self.app.scanner, self.app.quarantine,
+                                   action="detect", interval=0.1,
+                                   log=lambda level, message: None,
+                                   on_event=broken)
+        watcher._state = watcher._snapshot(self.watch)
+        (self.watch / "ok.txt").write_text("fine\n")
+        watcher.process(watcher.poll(self.watch))  # must not raise
+
+
+class WebStatsAndVerifyTests(WebConsoleTests):
+    """v1.9: web API additions (/api/stats, /api/verify)."""
+
+    def test_stats_api(self):
+        (self.base / "e.txt").write_bytes(EICAR)
+        status, data = self._req("POST", "/api/scan", {"target": str(self.base)})
+        job = data["job"]
+        for _ in range(50):
+            time.sleep(0.2)
+            status, detail = self._req("GET", f"/api/jobs/{job['id']}")
+            if detail["job"]["status"] != "running":
+                break
+        self.assertEqual(detail["job"]["status"], "done")
+
+        status, data = self._req("GET", "/api/stats")
+        self.assertEqual(status, 200)
+        self.assertEqual(data["signatures"]["total"],
+                         len(self.app_fixture.db.list()))
+        self.assertEqual(data["quarantine"]["items"], 0)
+        self.assertEqual(data["reports"]["reports"], 1)
+        self.assertEqual(data["reports"]["infected"], 1)
+
+    def test_verify_api(self):
+        from antivirus.integrity import build_manifest
+
+        d = self.base / "tree"
+        d.mkdir()
+        (d / "a.txt").write_text("one\n")
+        bfile = self.base / "b.json"
+        from antivirus.integrity import save_manifest
+
+        save_manifest(build_manifest(d, self.app_fixture.config), bfile)
+
+        status, data = self._req(
+            "GET", "/api/verify?target=" + urllib_parse(d) +
+            "&baseline=" + urllib_parse(bfile))
+        self.assertEqual(status, 200)
+        self.assertTrue(data["clean"])
+
+        (d / "a.txt").write_text("CHANGED\n")
+        status, data = self._req(
+            "GET", "/api/verify?target=" + urllib_parse(d) +
+            "&baseline=" + urllib_parse(bfile))
+        self.assertEqual(status, 200)
+        self.assertEqual(data["changed"], 1)
+        self.assertEqual(len(data["findings"]), 1)
+
+        status, data = self._req(
+            "GET", "/api/verify?target=" + urllib_parse(d))
+        self.assertEqual(status, 400)
+        status, data = self._req(
+            "GET", "/api/verify?target=" + urllib_parse(d) +
+            "&baseline=no-such-id")
+        self.assertEqual(status, 400)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Iterator, List, Optional
 
 from .scanner import ScanResult
 from .utils import human_size
@@ -127,6 +127,68 @@ def summarize_reports(report_paths: List[Path]) -> Dict:
                                key=lambda kv: (-kv[1], kv[0]))[:10]
         ],
     }
+
+
+#: Column order for ``antivirus export`` (CSV header row included).
+EXPORT_COLUMNS = ("report", "target", "started_at", "severity", "kind",
+                  "name", "file", "sha256", "size", "action", "message")
+
+
+def iter_export_rows(report_paths: "List[Path]") -> "Iterator[Dict]":
+    """Yield one flat dict per finding across the given report files.
+
+    Report-level metadata (target, started_at) is repeated on every row
+    so the export is self-contained. Findings are emitted in the order
+    the reports were given (oldest first when using all reports).
+    """
+    from datetime import datetime
+
+    for f in report_paths:
+        try:
+            data = json.loads(Path(f).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        started = data.get("started_at")
+        started_str = (datetime.fromtimestamp(started).strftime("%Y-%m-%d %H:%M:%S")
+                       if isinstance(started, (int, float)) else "")
+        actions = data.get("actions_taken", {}) or {}
+        for finding in data.get("findings", []):
+            yield {
+                "report": Path(f).name,
+                "target": data.get("target", ""),
+                "started_at": started_str,
+                "severity": finding.get("severity", ""),
+                "kind": finding.get("kind", ""),
+                "name": finding.get("name", ""),
+                "file": finding.get("path", ""),
+                "sha256": finding.get("sha256", ""),
+                "size": finding.get("size", ""),
+                "action": actions.get(finding.get("path", ""), ""),
+                "message": finding.get("message", ""),
+            }
+
+
+def write_export(rows: "Iterator[Dict]", out, fmt: str = "csv") -> int:
+    """Write export rows to a file object; returns the row count.
+
+    *fmt* is ``"csv"`` (header + one row per finding) or ``"jsonl"``
+    (one JSON object per line).
+    """
+    import csv
+    import json as _json
+
+    count = 0
+    if fmt == "jsonl":
+        for row in rows:
+            out.write(_json.dumps(row, ensure_ascii=False) + "\n")
+            count += 1
+    else:
+        writer = csv.DictWriter(out, fieldnames=list(EXPORT_COLUMNS))
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+            count += 1
+    return count
 
 
 def diff_reports(old: Dict, new: Dict) -> Dict[str, List[Dict]]:

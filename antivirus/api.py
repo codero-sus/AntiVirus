@@ -21,6 +21,7 @@ be dropped into another project as a plain module:
     av.scan_file("suspicious.bin")
     av.file_info("suspicious.bin")["sha256"]
     av.manifest("some/dir")               # integrity baseline (dict)
+    av.verify("some/dir", "baseline.json")  # fast hash-only diff (findings)
     av.quarantine.restore("275a021b-...")
 
 The API is intentionally thin: it wires together the same
@@ -48,6 +49,59 @@ from .signatures import Signature, SignatureDB
 #: Bundled signature database (same location the CLI falls back to).
 BUNDLED_SIGNATURES = Path(__file__).resolve().parent.parent / "data" / \
     "signatures.json"
+
+
+def engine_stats(config: Config, db: SignatureDB, quarantine: Quarantine,
+                 include_reports: bool = True) -> Dict:
+    """A cross-component snapshot of engine state.
+
+    Shared by ``antivirus stats`` (CLI) and the web console's
+    ``/api/stats`` endpoint. Pure read-only.
+    """
+    from . import __version__
+    from .report import ReportWriter, summarize_reports
+
+    sigs = db.list()
+    by_sev: Dict[str, int] = {}
+    by_kind = {"sha256": 0, "md5": 0, "pattern": 0}
+    for s in sigs:
+        by_sev[s.severity] = by_sev.get(s.severity, 0) + 1
+        if s.sha256:
+            by_kind["sha256"] += 1
+        if s.md5:
+            by_kind["md5"] += 1
+        if s.pattern:
+            by_kind["pattern"] += 1
+    order = ("critical", "high", "medium", "low", "info")
+
+    cache_path = Path(config.cache_dir)
+    cache: Dict = {"path": str(cache_path), "entries": 0, "size_bytes": 0}
+    if cache_path.exists():
+        try:
+            cache["size_bytes"] = cache_path.lstat().st_size
+            cache["entries"] = len(json.loads(
+                cache_path.read_text(encoding="utf-8")).get("entries", {}))
+        except (json.JSONDecodeError, OSError, ValueError):
+            pass
+
+    stats: Dict = {
+        "version": __version__,
+        "signatures": {
+            "total": len(sigs),
+            "by_severity": {s: by_sev[s] for s in order if s in by_sev},
+            "by_kind": by_kind,
+            "path": str(config.signatures_file),
+        },
+        "cache": cache,
+        "quarantine": {
+            "items": len(quarantine.items()),
+            "path": str(config.quarantine_dir),
+        },
+    }
+    if include_reports:
+        stats["reports"] = summarize_reports(
+            ReportWriter(config.report_dir).all_reports())
+    return stats
 
 
 def apply_actions(result: ScanResult, quarantine: Quarantine,
@@ -236,6 +290,22 @@ class Antivirus:
     def save_manifest(self, manifest: Dict, path) -> Path:
         _save_manifest(manifest, Path(path))
         return Path(path)
+
+    def verify(self, target, baseline) -> List[Finding]:
+        """Fast integrity-only check: hash the tree, diff vs *baseline*.
+
+        No signature/behaviour/entropy layers run, so this is much cheaper
+        than ``scan(..., baseline=...)``. *baseline* is a manifest file
+        path or a baseline id stored under *base*.
+        """
+        from .integrity import load_manifest, verify_tree
+
+        bpath = Path(os.path.expanduser(str(baseline)))
+        if not bpath.exists():
+            bpath = self.config.baseline_dir / f"{baseline}.json"
+        manifest = load_manifest(bpath)
+        return verify_tree(Path(os.path.expanduser(str(target))),
+                           manifest, self.config)
 
     # ------------------------------------------------------------- properties
     @property
