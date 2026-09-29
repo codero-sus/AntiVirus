@@ -143,7 +143,9 @@ def walk_files(
     def _excluded(p: Path) -> bool:
         if not patterns:
             return False
-        rel = str(p)[len(root_str) + 1:] if str(p).startswith(root_str + os.sep) else p.name
+        # Normalise to "/" so glob patterns work the same on Windows.
+        rel = str(p)[len(root_str) + 1:].replace(os.sep, "/") \
+            if str(p).startswith(root_str + os.sep) else p.name
         for pat in patterns:
             if fnmatch.fnmatch(p.name, pat) or fnmatch.fnmatch(rel, pat):
                 return True

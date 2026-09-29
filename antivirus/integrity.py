@@ -56,7 +56,7 @@ def _hash_tree(target: Path, config: Config) -> Dict[str, Dict]:
                 rel = p.resolve().relative_to(base)
             except (ValueError, OSError):
                 continue
-            files[str(rel)] = {"sha256": file_sha256(p), "size": st.st_size}
+            files[rel.as_posix()] = {"sha256": file_sha256(p), "size": st.st_size}
     return files
 
 
@@ -110,7 +110,7 @@ def current_from_result(result: "ScanResult", target: Path) -> Dict[str, Dict]:
             rel = pp.resolve().relative_to(target_resolved)
         except (ValueError, OSError):
             continue
-        current[str(rel)] = meta
+        current[rel.as_posix()] = meta
     return current
 
 

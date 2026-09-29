@@ -3,7 +3,8 @@
 Features
 --------
 * Signature-based scanning (SHA-256 / MD5 hashes and regex patterns)
-* Behavioural analysis (Python AST, shell/PowerShell/batch, PE/ELF imports)
+* Behavioural analysis (Python AST, shell/PowerShell/batch/VBScript,
+  PE/ELF imports)
 * PE "debug report" dissection (headers, sections, imports, resources)
 * Archive scanning (ZIP / TAR / GZIP, in memory, zip-slip / tar-slip)
 * Heuristic scanning (Shannon-entropy check for packed / encrypted files)
@@ -17,6 +18,8 @@ Features
   from a live environment (quarantine stays on the rescue side)
 * Multiple front-ends: CLI, Tkinter GUI, curses TUI, web console —
   and a plain-module API for embedding in your own code
+* Runs on Windows, Linux and macOS (the curses TUI is Unix-only; the
+  web console, GUI and CLI work everywhere)
 
 The project ships with the standard, *harmless* EICAR test string so you can
 verify that detection works without touching any real malware.
@@ -41,7 +44,7 @@ Everything is standard library only (Tkinter/curses are optional and used
 only by their respective front-ends).
 """
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 
 from .api import (  # noqa: E402
     Antivirus,

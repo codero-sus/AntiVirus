@@ -667,9 +667,12 @@ def cmd_tui(args) -> int:
     from .web import WebApp
 
     if not tui_available():
-        print("error: the TUI needs curses (Unix-like systems with a TTY).",
+        # Windows: CPython does not bundle curses, so there is no TUI.
+        print("error: the TUI needs curses, which is not available here "
+              "(on Windows, CPython does not bundle it).",
               file=sys.stderr)
-        print("Use the CLI instead:  python3 -m antivirus scan .",
+        print("Use the CLI (python3 -m antivirus scan .) or the web "
+              "console (python3 -m antivirus web) instead.",
               file=sys.stderr)
         return 2
     config, db, scanner, quarantine = _build(args)

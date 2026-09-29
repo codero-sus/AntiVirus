@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "antivirus"
-version = "2.0.0"
+version = "2.1.0"
 description = "A lightweight, dependency-free antivirus in pure Python (educational)."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -15,6 +15,9 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",
     "Topic :: Security",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: MacOS :: MacOS X",
 ]
 
 [project.scripts]

@@ -23,6 +23,10 @@ watches folders for new/changed files, and writes JSON + text reports.
   * *Shell / PowerShell / Batch* — pipe-to-shell downloads, reverse shells,
     crypto-mining C2 endpoints, LOLBin downloaders (certutil/mshta/bitsadmin),
     persistence (cron / services / shell rc), encoded payloads
+  * *VBScript / Windows Script Host* (`.vbs` / `.vbe` / `.wsf`) —
+    `WScript.Shell` command execution, XMLHTTP downloads, certutil /
+    bitsadmin / mshta / scrobj LOLBins, hidden or encoded PowerShell
+    launches, WMI process creation, registry writes, `chr()` obfuscation
   * *PE binaries* — import-table analysis (process-injection API sets,
     download+execute combinations, registry persistence, timestamp
     tampering) plus per-section entropy and packer section names
@@ -214,6 +218,46 @@ python3 -m antivirus pe analyze samples/behavior/packed-upx.exe
 python3 -m antivirus pe analyze samples/behavior/clean.exe   # -> no findings
 ```
 
+## Windows support
+
+Everything runs on Windows (10/11, 32- or 64-bit) with the stock Python
+from python.org — 3.9+, no packages:
+
+```bat
+py -3 -m antivirus scan C:\Users\me\Downloads
+py -3 -m antivirus scan D:\ --action quarantine --fast
+py -3 -m antivirus web            :: dashboard + JSON API in the browser
+py -3 -m antivirus gui            :: Tkinter desktop app
+```
+
+Works on Windows, unchanged from other platforms: signature + behavioural
+scanning (including the **PE dissection** and the **VBScript** layers that
+matter most there), archives, entropy heuristics, quarantine with restore,
+reports, scan cache, integrity baselines (`manifest` / `verify` /
+`scan --baseline`), IOC imports, statistics, the directory monitor, the
+web console, the GUI, and the rescue kit — on Windows the kit ships a
+`bootstrap.bat` next to `bootstrap.sh`:
+
+```bat
+bootstrap.bat D:\ --action quarantine
+```
+
+Platform notes:
+
+- **TUI** — the curses terminal UI is Unix-only (CPython does not bundle
+  `curses` on Windows). `antivirus tui` explains this and points to the
+  web console / GUI / CLI.
+- **Console colour** — ANSI colours are enabled automatically on Windows
+  10+ consoles (best effort). On an older terminal set `set NO_COLOR=1`
+  to get plain output.
+- **Baselines** — manifests and baselines store relative paths in
+  `/`-style on every OS, so a baseline is readable (and diffable) across
+  platforms.
+- The setuid/setgid file-system indicator simply never triggers on NTFS
+  (the bits do not exist there); everything else is OS-agnostic.
+- Scanning system areas (e.g. `C:\Windows`) needs the usual permissions —
+  unreadable files are skipped, like on any other OS.
+
 ## How detection works
 
 For every regular file (symlinks, build dirs and VCS metadata are skipped):
@@ -361,9 +405,9 @@ $ antivirus rescue build --out ~/usb/kit --iso ~/usb/rescue.iso
 
 The kit contains the full `antivirus` package (as `antivirus.zip`, so it
 runs from a mounted ISO), its own `signatures.json`, a `run-rescue.py`
-runner, a `bootstrap.sh` launcher, and a `rescue-manifest.json` holding the
-SHA-256 of every file — so the media can prove it is not corrupt or
-tampered with:
+runner, a `bootstrap.sh` launcher (Linux/macOS) *and* a `bootstrap.bat`
+launcher (Windows), and a `rescue-manifest.json` holding the SHA-256 of
+every file — so the media can prove it is not corrupt or tampered with:
 
 ```console
 $ kit/bootstrap.sh --verify      # "Rescue kit OK"
@@ -371,8 +415,16 @@ $ kit/bootstrap.sh --selftest    # the full self test, from the media
 $ kit/bootstrap.sh /mnt/disk --action quarantine
 ```
 
+On Windows the same kit works from a second live Windows environment
+(or Windows PE), using the drive letter of the infected volume:
+
+```bat
+bootstrap.bat D:\ --action quarantine
+```
+
 Typical flow: copy the kit (or burn the ISO) to a USB stick → boot any
-live system or VM → mount the infected volume → run the kit against it.
+live system or VM (Linux or Windows) → make the infected volume visible
+→ run the kit against it.
 
 Rescue runs are deliberately different from normal scans:
 
@@ -541,6 +593,10 @@ it is a local tool, so only expose it on interfaces you trust.
 ```bash
 python3 -m antivirus tui            # or: tui /path/to/scan
 ```
+
+> **Windows:** CPython does not bundle `curses`, so there is no TUI on
+> Windows — `antivirus tui` tells you so and points to the web console.
+> Everything else (CLI, GUI, web, rescue) works there.
 
 A curses screen (standard library, Unix-like systems) with a live
 progress line, a scrollable severity-coloured findings list (findings

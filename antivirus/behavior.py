@@ -55,6 +55,7 @@ _SCRIPT_EXTS = {
 _SHELL_EXTS = {".sh", ".bash", ".zsh", ".ksh", ".fish"}
 _PS_EXTS = {".ps1", ".psm1", ".psd1"}
 _BAT_EXTS = {".bat", ".cmd"}
+_VBS_EXTS = {".vbs", ".vbe", ".wsf"}
 
 _IP_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
 
@@ -275,6 +276,107 @@ def analyze_batch(text: str) -> List[Indicator]:
     for rx, sev, msg in rules:
         if rx.search(text):
             out.append(Indicator(msg, sev, msg))
+    return out
+
+
+def analyze_vbs(text: str) -> List[Indicator]:
+    """Static heuristics for VBScript / Windows Script Host (.vbs/.vbe/.wsf).
+
+    VBScript is the default scripting language of Windows (WScript/CScript),
+    so this is the script layer that matters most on that platform.  All
+    matches are case-insensitive, as in the language itself.
+    """
+    out: List[Indicator] = []
+
+    def flag(name: str, sev: str, msg: str) -> None:
+        out.append(Indicator(name, sev, msg))
+
+    # VBE files are base64-obfuscated VBScript ("SSe…" header).
+    if re.search(r"\bSSe[A-Za-z0-9+/]{32,}=", text) and not \
+            re.search(r"\bCreateObject\b", text, re.I):
+        flag("VBE-encoded VBScript", "medium",
+             "SSe… encoded VBScript body (obfuscated script payload)")
+        return out
+
+    shell = re.search(r"(?:CreateObject|GetObject)\(\s*\"[^\"]*wscript\.shell\"?",
+                      text, re.I)
+    if shell:
+        # VBScript calls may take no parentheses:  shell.Run "cmd"
+        _run = re.compile(r"\b(?:Run|RunAsync|Exec)\s*(?:\(|\"|')", re.I)
+        if _run.search(text):
+            flag("Shell command execution", "high",
+                 "WScript.Shell Run/Exec — arbitrary command execution")
+        else:
+            flag("WScript.Shell object", "medium",
+                 "WScript.Shell object created (command execution available)")
+
+    http = re.search(
+        r"MSXML2\.ServerXMLHTTP|WinHttp\.WinHttpRequest|Microsoft\.XMLHTTP|"
+        r"MSXML2\.XMLHTTP", text, re.I)
+    if http:
+        if re.search(r"\bDownload(?:String|File)\b|\bSaveToFile\b", text, re.I) \
+                or (re.search(r"\.Open\b", text, re.I)
+                    and re.search(r"\.Send\b", text, re.I)):
+            flag("HTTP download", "high",
+                 "XMLHttpRequest object used to download content")
+        else:
+            flag("XMLHttpRequest object", "medium",
+                 "XMLHttpRequest object created (network fetch available)")
+
+    def _ps_hidden(t: str) -> bool:
+        return bool(re.search(
+            r"powershell[^\n]*(?:-nop\b|-w\s*0\b|-windowstyle\s+hidden\b)",
+            t, re.I))
+
+    def _wmi_process(t: str) -> bool:
+        if re.search(r"\bWin32_Process\.Create\b", t, re.I):
+            return True
+        return bool(re.search(r"winmgmts", t, re.I)) and bool(re.search(
+            r"\bWin32_Process\b|\.Create\(", t, re.I))
+
+    def _ps_encoded(t: str) -> bool:
+        return bool(re.search(r"powershell", t, re.I)) and bool(re.search(
+            r"\b(?:-enc|encodedcommand)\s+[A-Za-z0-9+/=]{16,}", t, re.I))
+
+    rules = [
+        (re.compile(r"certutil\b[^\n]*-urlcache", re.I),
+         "high", "certutil URL download (LOLBin)"),
+        (re.compile(r"bitsadmin\s+/transfer", re.I),
+         "high", "bitsadmin file transfer (LOLBin)"),
+        (re.compile(r"\bmshta\b[^\n]*(?:https?://|javascript:)", re.I),
+         "high", "mshta remote/HTA script execution (LOLBin)"),
+        (re.compile(r"regsvr32\b[^\n]*scrobj\.dll", re.I),
+         "high", "regsvr32 scrobj.dll remote HTA download (LOLBin)"),
+        (_wmi_process, "high", "WMI Win32_Process.Create (process creation)"),
+        (_ps_hidden, "high", "hidden PowerShell launched from script"),
+        (_ps_encoded, "high", "encoded PowerShell launched from script"),
+        (re.compile(r"GetObject\(\s*\"winsock:", re.I),
+         "medium", "winsock GetObject (legacy networking primitive)"),
+        (re.compile(r"\bWScript\.Network\b", re.I),
+         "low", "WScript.Network object (user/domain harvesting)"),
+        (re.compile(r"\bRegWrite\b|reg\s+add\s+\"HK", re.I),
+         "medium", "registry write (possible persistence)"),
+    ]
+    for rx, sev, msg in rules:
+        if callable(rx):  # predicate rules take the text
+            if rx(text):
+                flag(msg, sev, msg)
+            continue
+        if rx.search(text):
+            flag(msg, sev, msg)
+
+    # chr() string construction is the classic VBS obfuscation technique.
+    if len(re.findall(r"\bChr(?:W)?\s*\(\s*[0-9A-Za-z_+ ]{1,20}\s*\)", text)) \
+            >= 10:
+        flag("chr() string obfuscation", "medium",
+             "payload built from many Chr() calls (obfuscated strings)")
+
+    # Dynamic code execution of computed data (VBS: "Execute expr", no parens).
+    if re.search(r"\bExecute(?:Statement)?\s+(?![\"'])\S", text, re.I) \
+            or re.search(r"\bExecute(?:Statement)?\s*\(\s*(?![\"'])[A-Za-z_]",
+                         text, re.I):
+        flag("Dynamic code execution", "high",
+             "Execute/ExecuteStatement on a computed value")
     return out
 
 
@@ -532,6 +634,8 @@ def analyze_file(path: Path, st: Optional[os.stat_result], content: bytes) -> Li
             indicators.extend(analyze_powershell(text))
         if ext in _BAT_EXTS:
             indicators.extend(analyze_batch(text))
+        if ext in _VBS_EXTS:
+            indicators.extend(analyze_vbs(text))
 
     # Deduplicate identical indicators (e.g. shell rule + generic IOC).
     seen = set()

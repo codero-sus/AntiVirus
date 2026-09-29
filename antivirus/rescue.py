@@ -42,8 +42,9 @@ from .scanner import Scanner
 from .signatures import SignatureDB
 
 #: Files the kit always contains (besides the ``antivirus/`` package dir).
-KIT_FILES = ("run-rescue.py", "bootstrap.sh", "signatures.json",
-             "antivirus.zip", "rescue-manifest.json", "README-RESCUE.txt")
+KIT_FILES = ("run-rescue.py", "bootstrap.sh", "bootstrap.bat",
+             "signatures.json", "antivirus.zip", "rescue-manifest.json",
+             "README-RESCUE.txt")
 
 RUN_RESCUE_SCRIPT = '''#!/usr/bin/env python3
 """AntiVirus rescue runner — scan a mounted system volume from a live system.
@@ -179,6 +180,26 @@ fi
 exec "$PY" "$KIT/run-rescue.py" "$@"
 """
 
+BOOTSTRAP_BATCH = """@echo off
+rem AntiVirus rescue bootstrap (Windows) - run from the rescue kit.
+rem
+rem   bootstrap.bat D:\\ [options]     scan the infected volume, e.g. D:\\
+rem   bootstrap.bat --selftest        verify the rescue media itself
+rem
+rem The kit is self-contained; the only requirement is Python 3.9+
+rem on the live system (the py launcher or python on the PATH).
+setlocal
+set "KIT=%~dp0"
+set "PY="
+where py >nul 2>nul && set "PY=py -3"
+if not defined PY where python >nul 2>nul && set "PY=python"
+if not defined PY (
+    echo error: Python 3.9+ not found on the live system 1>&2
+    exit /b 2
+)
+%PY% "%KIT%run-rescue.py" %*
+"""
+
 KIT_README = """ANTI-VIRUS RESCUE KIT
 =====================
 A self-contained rescue kit for scanning a system from a live
@@ -188,19 +209,27 @@ CONTENTS
   antivirus/            a full copy of the AntiVirus package
   antivirus.zip         the same package as a zip (used from the ISO)
   signatures.json       the signature database at build time
-  run-rescue.py         the rescue scanner (python3 only dependency)
-  bootstrap.sh          convenience wrapper
+  run-rescue.py         the rescue scanner (Python 3.9+ is the only
+                        dependency)
+  bootstrap.sh          convenience wrapper (Linux / macOS / BSD)
+  bootstrap.bat         convenience wrapper (Windows)
   rescue-manifest.json  SHA-256 of every kit file (integrity check)
 
-HOW TO USE
+HOW TO USE (any OS, including Windows)
   1. Get the kit onto the live side: copy the directory (or rescue.iso)
      to a USB stick. For the ISO: mount -o loop rescue.iso /mnt/iso
-     (macOS/Windows mount it like any disc).
-  2. Boot a live system (any Linux live USB or rescue VM works) and
-     mount the infected volume, e.g.  sudo mount /dev/sda1 /mnt/disk
-  3. Verify the media:     ./bootstrap.sh --selftest
-     Verify the manifest:  python3 run-rescue.py --verify
-  4. Rescue scan:          ./bootstrap.sh /mnt/disk --action quarantine
+     (Windows/macOS mount it like any disc - drive letters work too,
+     e.g. E:\\).
+  2. Boot a live system (a Linux live USB, a rescue VM, or a second
+     Windows environment) and make the infected volume visible
+     (Linux:  sudo mount /dev/sda1 /mnt/disk).
+  3. Verify the media:
+       Linux/macOS:  ./bootstrap.sh --selftest
+       Windows:      bootstrap.bat --selftest
+     Verify the manifest:  python run-rescue.py --verify
+  4. Rescue scan:
+       Linux/macOS:  ./bootstrap.sh /mnt/disk --action quarantine
+       Windows:      bootstrap.bat D:\\ --action quarantine
      Threats are moved to the rescue media (this kit), the report is
      written here, and the scanned volume is left untouched except for
      the removed threats.
@@ -299,7 +328,8 @@ def build_rescue_kit(out_dir: Path,
     (kit / "antivirus.zip").write_bytes(zip_bytes)
     (kit / "run-rescue.py").write_text(RUN_RESCUE_SCRIPT, encoding="utf-8")
     (kit / "bootstrap.sh").write_text(BOOTSTRAP_SCRIPT, encoding="utf-8")
-    (kit / "bootstrap.sh").chmod(0o755)
+    (kit / "bootstrap.sh").chmod(0o755)  # no-op on Windows, harmless
+    (kit / "bootstrap.bat").write_text(BOOTSTRAP_BATCH, encoding="utf-8")
     (kit / "README-RESCUE.txt").write_text(KIT_README, encoding="utf-8")
 
     manifest = {
