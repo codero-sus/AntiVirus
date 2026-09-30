@@ -26,6 +26,7 @@ class Config:
     signatures_file: Path = Path("data/signatures.json")
     cache_dir: Path = Path(".av-cache")        # scan-cache file (fast rescans)
     baseline_dir: Path = Path("baselines")     # integrity baselines (manifests)
+    registry_dir: Path = Path("registry")      # kill registry (key/IV store)
 
     # Scan limits.
     max_file_size: int = 512 * 1024 * 1024      # 512 MiB – larger files are skipped
@@ -76,7 +77,7 @@ class Config:
         """Make relative paths absolute, relative to *base* (usually the CWD)."""
         base = base.resolve()
         for name in ("quarantine_dir", "report_dir", "signatures_file",
-                     "cache_dir", "baseline_dir"):
+                     "cache_dir", "baseline_dir", "registry_dir"):
             p = Path(getattr(self, name))
             if not p.is_absolute():
                 setattr(self, name, base / p)

@@ -160,6 +160,46 @@ def run_selftest(signatures_file: Optional[str] = None) -> int:
         check("restore puts the file back",
               target.exists() and target.read_bytes() == EICAR)
 
+        # -- kill engine (in-place obfuscation + registry) --------------------------
+        from .kill import KillRegistry, transform
+
+        killer = KillRegistry(workdir / "registry")
+        kfile = workdir / "killer-victim.txt"
+        kfile.write_bytes(EICAR)
+        kfindings = scanner.scan_file(kfile)
+        kitem = killer.kill(kfile, kfindings[0])
+        obfuscated = kfile.read_bytes()
+        check("kill obfuscates the file in place (bytes change, path kept)",
+              kfile.exists() and obfuscated != EICAR
+              and kfile.name == "killer-victim.txt",
+              f"len={len(obfuscated)}")
+        check("kill stores key + IV in the registry",
+              len(kitem.key) == 64 and len(kitem.iv) == 32
+              and any(e.id == kitem.id for e in killer.entries()),
+              f"key={kitem.key[:8]}… iv={kitem.iv[:8]}…")
+        check("kill is reversible with the stored key/IV",
+              transform(obfuscated, bytes.fromhex(kitem.key),
+                        bytes.fromhex(kitem.iv)) == EICAR)
+        # A rescan must treat the killed file as inert (not re-flag it).
+        scanner.neutralized = {e.ciphertext_sha256: e.id
+                               for e in killer.entries()}
+        rescanned = scanner.scan_file(kfile)
+        check("rescan does not re-flag a killed (neutralized) file",
+              rescanned == [],
+              str(sorted({f.name for f in rescanned})))
+        _revived, rtarget = killer.revive(kitem.id)
+        check("kill revive restores the exact original bytes",
+              rtarget.exists() and rtarget.read_bytes() == EICAR
+              and all(e.id != kitem.id for e in killer.entries()))
+        # purge: kill again, then destroy file + entry
+        scanner.neutralized = {}
+        kitem2 = killer.kill(kfile, scanner.scan_file(kfile)[0])
+        killer.purge(kitem2.id)
+        check("kill purge destroys file and registry entry",
+              not kfile.exists()
+              and all(e.id != kitem2.id for e in killer.entries()))
+        scanner.neutralized = {}
+
         # -- custom signature --------------------------------------------------------
         marker = "SELFTEST-UNIQUE-MARKER-42"
         db.add(Signature(

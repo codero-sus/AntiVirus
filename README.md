@@ -74,6 +74,14 @@ watches folders for new/changed files, and writes JSON + text reports.
   packed/encrypted files
 - **Quarantine** — infected files are moved to a sandboxed directory with a
   JSON manifest; list, restore or purge them later
+- **Kill engine** — the `kill` action neutralizes a threat **in place**:
+  its bytes are obfuscated with a one-time stdlib-only keystream cipher so
+  the binary can no longer run or match its own signatures, while the
+  256-bit key + IV are stored in the AntiVirus **registry**
+  (`registry/kill.json`) — `kill revive` restores the exact original
+  bytes, `kill purge` destroys file + material. Rescans treat killed
+  files as *neutralized* (inert, not re-flagged); threats inside archives
+  are neutralized by obfuscating the container
 - **Directory monitor** — polls a tree and scans every new/changed file
 - **Reports** — every scan writes a JSON report and a human-readable text
   report
@@ -442,9 +450,10 @@ live environment.
 
 ```console
 $ antivirus rescue build [--out DIR] [--iso FILE | --no-iso]
-$ antivirus rescue run TARGET [--action detect|quarantine|remove]
+$ antivirus rescue run TARGET [--action detect|quarantine|kill|delete]
                 [--fast] [--since FILE] [--exclude SPEC ...]
-                [--rescue-quarantine DIR] [--rescue-reports DIR] [--json]
+                [--rescue-quarantine DIR] [--rescue-reports DIR]
+                [--rescue-registry DIR] [--json]
 $ antivirus rescue verify KIT
 ```
 
@@ -453,12 +462,62 @@ signatures=...)`, `antivirus.run_rescue(target, action=..., ...)` and
 `Antivirus.rescue_build(...)`; helpers `antivirus.rescue.verify_kit` and
 `build_iso9660`. Web API: `POST /api/rescue/build`, `GET /api/rescue`.
 
+## Kill engine
+
+Beyond **quarantine** (move the file away) and **delete** (destroy it), the
+`kill` action **neutralizes a threat in place** — the file stays exactly
+where it is, but its bytes are rendered inert:
+
+* **Obfuscation** — the file is XOR-ed with a one-time keystream
+  (`SHA-512(key ‖ IV  counter)`, a counter-mode stream cipher built only
+  from the standard library). The original binary becomes unreadable,
+  non-executable garbage that no longer matches its own SHA-256 signature
+  or behavioural patterns.
+* **The registry** — the 256-bit **key** and 128-bit **IV** that undo the
+  obfuscation are stored in the **AntiVirus registry**
+  (`registry/kill.json`), alongside the original hash, the ciphertext hash,
+  the path, size, time and the reason it was killed. The registry is the
+  single source of recovery material and never touches the scanned volume.
+
+```console
+$ antivirus scan C:\downloads --action kill
+  [CRITICAL] EICAR-Test-File   (signature-hash)
+    file:   C:\downloads\x.txt
+    action: killed in place (registry: 275a021bbfb6-…-a1b2c3)
+
+$ antivirus kill list                 # what's neutralized + where its key/IV live
+$ antivirus kill revive 275a021bbfb6  # restore the exact original bytes
+$ antivirus kill purge 275a021bbfb6   # destroy file + registry entry (final)
+```
+
+Because it is built on the same action pipeline as quarantine/delete,
+`kill` works everywhere: CLI, module API, web console, TUI, the directory
+monitor and rescue runs (where the registry lives on the **live side**,
+never on the scanned volume).
+
+Scan improvements that come with it:
+
+* **Registry-aware rescans** — a file that was already killed is counted as
+  *neutralized* and is **not re-flagged** (no false positive on the inert
+  bytes), so `… | rescan` goes clean.
+* **Archive-aware actions** — a threat reported *inside* an archive
+  (`bundle.zip!entry`) is neutralized by acting on the **container**, and
+  one physical file is acted on only once even if several layers flag it.
+* **Per-file threat rollup** — the scan summary adds a ranked
+  *Top threats by file* list (worst severity first) on top of the full
+  per-finding detail.
+
+> **Security note.** The registry holds the material that *revives* a
+> killed file — protect `registry/kill.json` with the same care you'd give
+> the key to a safe. Obfuscation here is a neutralization mechanism for a
+> detected file, not a general-purpose encryption service.
+
 ## Command reference
 
 | Command | Description |
 | --- | --- |
-| `scan TARGET [--action detect\|quarantine\|delete] [--threads N] [--no-behavior] [--fast] [--no-cache] [--no-archives] [--exclude GLOB] [--since DURATION] [--baseline FILE] [--json]` | Scan a file or directory tree (`--threads`: auto, N, or 1; `--fast`: hash+pattern only; `--exclude` repeatable; `--since 30m/2h/1d`: only recently modified files; `--baseline`: integrity check vs a manifest) |
-| `monitor TARGET [--action ...] [--interval 2] [--no-behavior] [--no-archives] [--exclude GLOB] [--since DURATION] [--json]` | Watch a directory, scan new/changed files (`--json`: one JSON object per event) |
+| `scan TARGET [--action detect\|quarantine\|kill\|delete] [--threads N] [--no-behavior] [--fast] [--no-cache] [--no-archives] [--exclude GLOB] [--since DURATION] [--baseline FILE] [--json]` | Scan a file or directory tree (`--threads`: auto, N, or 1; `--fast`: hash+pattern only; `--exclude` repeatable; `--since 30m/2h/1d`: only recently modified files; `--baseline`: integrity check vs a manifest; `kill`: obfuscate in place, key/IV to the registry) |
+| `monitor TARGET [--action ...] [--interval 2] [--no-behavior] [--no-archives] [--exclude GLOB] [--since DURATION] [--json]` | Watch a directory, scan new/changed files (`--json`: one JSON object per event; actions include `kill`) |
 | `hash FILE… [--json]` | Print SHA-256 / MD5 / SHA-1 digests + size of each file |
 | `behavior analyze FILE [--json]` | Show what one file appears to do (static behavioural analysis) |
 | `pe analyze FILE [--json]` | Full static PE dissection ("debug report") + red-flag indicators |
@@ -466,6 +525,9 @@ signatures=...)`, `antivirus.run_rescue(target, action=..., ...)` and
 | `quarantine list` | Show everything that is quarantined |
 | `quarantine restore ID` | Restore a quarantined file (prefix ok) |
 | `quarantine purge ID` | Permanently delete a quarantined file |
+| `kill list` | List in-place killed files and their registry entries (key/IV) |
+| `kill revive ID` | Restore a killed file's original bytes using the registry's key/IV (prefix ok) |
+| `kill purge ID` | Permanently delete a killed file and its registry entry (irreversible) |
 | `sig show` | List signatures in the database |
 | `sig add --id … --name … [--sha256/--md5/--pattern …]` | Add a signature |
 | `sig remove ID` | Remove a signature from the database |
@@ -485,7 +547,7 @@ signatures=...)`, `antivirus.run_rescue(target, action=..., ...)` and
 | `fileinfo FILE…` | Identify files: type (magic), size, mtime, SHA-256/MD5 |
 
 Common options (most commands): `--signatures FILE`, `--quarantine-dir DIR`,
-`--report-dir DIR`, `--max-size BYTES`.
+`--report-dir DIR`, `--registry-dir DIR`, `--max-size BYTES`.
 
 ## Using it as a module
 
@@ -518,6 +580,14 @@ av.verify("some/dir", "baseline.json")   # fast hash-only diff -> [Finding, …]
 av.quarantine.restore("275a021b-…")
 av.remove_signature("AV-MINE-001")
 
+# --- kill engine (neutralize in place, key/IV in the registry) -------------
+result = av.scan("some/dir", action="kill")
+print(result.notes)                     # {path: "killed in place (registry: …)"}
+for entry in av.kill_list():            # what's neutralized + its key/IV
+    print(entry.id, entry.original_path)
+av.kill_revive("275a021b-…")            # restore the exact original bytes
+av.kill_purge("275a021b-…")             # destroy file + registry entry
+
 # --- rescue disk -----------------------------------------------------------
 manifest = antivirus.rescue_build(out_dir="/usb/kit",
                                   iso_path="/usb/rescue.iso")
@@ -546,7 +616,7 @@ python3 -m antivirus web --port 8420
 
 The dashboard (single page, no external assets, dark theme) offers:
 
-- **Scan jobs** — target + action (detect / quarantine / delete),
+- **Scan jobs** — target + action (detect / quarantine / kill / delete),
   `fast` / `since` options and an integrity-baseline selector; each scan
   runs in a background thread and the UI polls **live progress and a
   running findings feed**. Past jobs stay clickable in the job list.
@@ -583,6 +653,9 @@ JSON API (useful for scripting / your own front-end):
 | `/api/stats` | GET | engine statistics (signatures, cache, quarantine, reports) |
 | `/api/rescue/build` | POST | `{"out"?, "iso"?}` — build the rescue kit + ISO image |
 | `/api/rescue` | GET | last rescue build (404 until one exists) |
+| `/api/kill` | GET | kill registry — in-place killed files + stored key/IV |
+| `/api/kill/revive` | POST | `{"id"}` — restore a killed file's original bytes |
+| `/api/kill/purge` | POST | `{"id"}` — destroy a killed file and its registry entry |
 | `/api/docs` | GET | in-browser API documentation |
 
 The console binds to `0.0.0.0` by default and has **no authentication** —
@@ -602,9 +675,10 @@ A curses screen (standard library, Unix-like systems) with a live
 progress line, a scrollable severity-coloured findings list (findings
 appear while the scan runs) and per-finding detail. Keys: `s` scan,
 `e` edit target, `j/k` move, `g/G` top/bottom, `t` fast, `a` cycle
-action, `f` incremental window, `?` help, `q` quit. The TUI shares the
-web console's job engine, so every feature (quarantine, signatures,
-baselines) works identically in all front-ends.
+action (detect → quarantine → kill → delete), `f` incremental window,
+`?` help, `q` quit. The TUI shares the web console's job engine, so every
+feature (quarantine, the kill engine, signatures, baselines) works
+identically in all front-ends.
 
 ## Project layout
 
@@ -625,6 +699,7 @@ antivirus/
 ├── pe.py            # PE32/PE32+ dissection ("debug report") + indicators
 ├── fileinfo.py      # file identification (magic + digests)
 ├── integrity.py     # file-integrity baselines (manifest + diff + fast verify)
+├── kill.py          # kill engine: in-place obfuscation cipher + registry
 ├── rescue.py        # rescue kit + ISO 9660 writer + rescue scan runner
 ├── samples.py       # builder for the inert demo samples (fake PE/ELF,
 │                    #   sneaky ZIP/TAR.GZ, `samples` tree)

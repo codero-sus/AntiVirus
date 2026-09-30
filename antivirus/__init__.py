@@ -14,6 +14,9 @@ Features
 * Directory monitoring (polling based, no external dependencies)
 * JSON + human readable scan reports, report diff & summary, CSV/JSONL export
 * Fast integrity checks (verify), plain-text IOC imports, engine statistics
+* Kill engine: neutralize threats *in place* (std-only keystream
+  obfuscation) with the key/IV stored in the AntiVirus registry —
+  revivable, auditable, and rescan-aware (killed files stay inert)
 * Rescue disk: self-contained kit + ISO 9660 image for scanning a system
   from a live environment (quarantine stays on the rescue side)
 * Multiple front-ends: CLI, Tkinter GUI, curses TUI, web console —
@@ -44,7 +47,7 @@ Everything is standard library only (Tkinter/curses are optional and used
 only by their respective front-ends).
 """
 
-__version__ = "2.1.0"
+__version__ = "2.2.0"
 
 from .api import (  # noqa: E402
     Antivirus,
@@ -54,9 +57,12 @@ from .api import (  # noqa: E402
     scan,
     scan_file,
 )
+from .kill import KillItem, KillRegistry  # noqa: E402
 
 __all__ = [
     "Antivirus",
+    "KillItem",
+    "KillRegistry",
     "apply_actions",
     "rescue_build",
     "run_rescue",

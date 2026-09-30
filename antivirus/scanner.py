@@ -68,6 +68,7 @@ class ScanResult:
     files_scanned: int = 0
     files_skipped: int = 0
     files_cached: int = 0
+    files_neutralized: int = 0
     bytes_scanned: int = 0
     errors: List[str] = field(default_factory=list)
     findings: List[Finding] = field(default_factory=list)
@@ -102,6 +103,7 @@ class ScanResult:
             "files_scanned": self.files_scanned,
             "files_skipped": self.files_skipped,
             "files_cached": self.files_cached,
+            "files_neutralized": self.files_neutralized,
             "bytes_scanned": self.bytes_scanned,
             "errors": list(self.errors),
             "findings": [f.to_dict() for f in self.findings],
@@ -218,6 +220,10 @@ class Scanner:
         #: Optional ``(done, total)`` callback, invoked after every file
         #: finishes (cached or freshly scanned). Used for progress bars.
         self.on_progress: Optional[Callable[[int, int], None]] = None
+        #: Hashes of files already neutralized by the kill engine
+        #: ``{ciphertext_sha256: registry entry id}`` — such files are
+        #: counted as neutralized and produce no findings.
+        self.neutralized: Optional[Dict[str, str]] = None
         self._patterns: List[Tuple[Signature, "re.Pattern[bytes]"]] = []
         self._combined: Optional["re.Pattern[bytes]"] = None
         self._name_to_sig: Dict[str, Signature] = {}
@@ -384,6 +390,7 @@ class Scanner:
                     _tick()
                 result.files_scanned += local.files_scanned
                 result.files_skipped += local.files_skipped
+                result.files_neutralized += local.files_neutralized
                 result.bytes_scanned += local.bytes_scanned
                 if local.errors:
                     result.errors.extend(local.errors)
@@ -466,6 +473,14 @@ class Scanner:
         result.files_scanned += 1
         result.file_meta[str(path)] = {"sha256": sha256, "size": size}
         result.bytes_scanned += size
+
+        # Already neutralized by the kill engine (its registry maps the
+        # ciphertext's hash to a registry entry): the file is inert, so it
+        # is counted but not re-flagged by any layer.
+        if self.neutralized and sha256 in self.neutralized:
+            result.files_neutralized += 1
+            result.scanned_paths[str(path)] = []
+            return
 
         # NOTE: verdicts are collected in a *per-file* list.  The heuristic
         # guard must never look at ``result.findings`` – that list is shared

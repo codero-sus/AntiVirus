@@ -16,6 +16,7 @@ htmlcov/
 quarantine/
 reports/
 .av-cache
+registry/
 
 # Rescue disk build output (rescue build)
 rescue-kit/

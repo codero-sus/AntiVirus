@@ -36,7 +36,7 @@ from typing import Dict, List, Optional
 from . import __version__
 from .web import WebApp
 
-ACTIONS = ("detect", "quarantine", "delete")
+ACTIONS = ("detect", "quarantine", "kill", "delete")
 
 
 class TuiModel:

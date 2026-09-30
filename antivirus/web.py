@@ -19,6 +19,9 @@ Serves a single-page dashboard plus a small JSON API:
     GET  /api/stats            engine statistics (sigs/cache/quarantine)
     POST /api/rescue/build     build the rescue kit + ISO image
     GET  /api/rescue           last rescue build (404 until one exists)
+    GET  /api/kill             kill registry (key/IV entries)
+    POST /api/kill/revive      {"id"} – restore a killed file's bytes
+    POST /api/kill/purge       {"id"} – destroy a killed file + entry
 
 Scans run in background threads (jobs) so the UI can poll live progress.
 This is a *local* tool: there is no authentication – bind it to an
@@ -39,6 +42,7 @@ from urllib.parse import unquote, urlsplit
 
 from . import __version__
 from .config import Config
+from .kill import KillRegistry
 from .quarantine import Quarantine
 from .scanner import ScanResult, Scanner
 from .signatures import Signature, SignatureDB, VALID_SEVERITIES
@@ -117,6 +121,7 @@ footer a{color:var(--accent)}
         <select id="action">
           <option value="detect">detect</option>
           <option value="quarantine">quarantine</option>
+          <option value="kill">kill (in place)</option>
           <option value="delete">delete</option>
         </select>
         <input id="since" placeholder="since (e.g. 2h) – empty = all">
@@ -206,6 +211,11 @@ footer a{color:var(--accent)}
       <div id="rescue" class="muted">…</div>
       <p class="muted" style="margin-top:8px">Self-contained kit + ISO image: copy to a USB stick, boot any live system (or mount the ISO), then scan the infected volume — threats are quarantined to the rescue media, never into the scanned disk.</p>
     </section>
+    <section style="margin-top:14px">
+      <h2>Killed in place <button class="ghost small" style="float:right" onclick="loadKill()">refresh</button></h2>
+      <div id="kill" class="muted">…</div>
+      <p class="muted" style="margin-top:8px">The <b>kill</b> action obfuscates a threat's bytes right where it sits (key + IV stored in the AntiVirus registry) — the file is inert but <b>revivable</b>. Revive restores the exact original bytes; purge destroys both.</p>
+    </section>
   </div>
 </main>
 <footer id="footer"></footer>
@@ -232,7 +242,7 @@ async function init() {
   $("footer").innerHTML = "AntiVirus Web Console · " + (h.data.version || "") +
     ' · <a href="/api/docs">API documentation</a>';
   loadJobs(); loadQuarantine(); loadSigs(); loadBaselines(); loadReports();
-  loadStats(); loadRescue();
+  loadStats(); loadRescue(); loadKill();
   setInterval(() => { $("clock").textContent = new Date().toLocaleTimeString(); }, 1000);
   $("filter").addEventListener("input", renderFindings);
 }
@@ -570,6 +580,12 @@ a{color:#2f81f7}
     the signature count</td></tr>
 <tr><td><code>/api/rescue</code></td><td>GET</td><td>last rescue build (404 until
     one exists)</td></tr>
+<tr><td><code>/api/kill</code></td><td>GET</td><td>kill registry — every
+    in-place killed file with its stored key/IV</td></tr>
+<tr><td><code>/api/kill/revive</code></td><td>POST</td><td><code>{"id"}</code> —
+    restore a killed file's original bytes using the registry's key/IV</td></tr>
+<tr><td><code>/api/kill/purge</code></td><td>POST</td><td><code>{"id"}</code> —
+    permanently delete a killed file and its registry entry</td></tr>
 <tr><td><code>/api/docs</code></td><td>GET</td><td>this page</td></tr>
 </table>
 <h2>Example (curl)</h2>
@@ -590,7 +606,8 @@ class ScanJob:
     def __init__(self, scanner: Scanner, target: Path, action: str = "detect",
                  quarantine: Optional[Quarantine] = None,
                  baseline: Optional[Path] = None,
-                 report_writer=None) -> None:
+                 report_writer=None,
+                 kill_registry: Optional[KillRegistry] = None) -> None:
         self.id = uuid.uuid4().hex[:12]
         self.target = str(target)
         self.action = action
@@ -604,6 +621,7 @@ class ScanJob:
         self._scanner = scanner
         self._target = Path(target)
         self._quarantine = quarantine
+        self._kill_registry = kill_registry
         self._baseline = baseline
         self._report_writer = report_writer
         self.report_path = None
@@ -611,6 +629,9 @@ class ScanJob:
 
     def _run(self) -> None:
         try:
+            from .api import neutralized_map
+
+            self._scanner.neutralized = neutralized_map(self._kill_registry)
             self._scanner.scan_path(self._target, result=self.result)
             if self._baseline is not None and self._target.is_dir():
                 from .integrity import (
@@ -628,7 +649,8 @@ class ScanJob:
                 from .api import apply_actions
 
                 self.notes = apply_actions(self.result, self._quarantine,
-                                           self.action)
+                                           self.action,
+                                           kill_registry=self._kill_registry)
             if self._report_writer is not None:
                 self.report_path = self._report_writer.save(
                     self.result, action=self.action,
@@ -685,6 +707,7 @@ class WebApp:
         self.db = db
         self.scanner = scanner
         self.quarantine = quarantine
+        self.kill_registry = KillRegistry(config.registry_dir)
         self.jobs: Dict[str, ScanJob] = {}
         self._lock = threading.Lock()
 
@@ -718,7 +741,8 @@ class WebApp:
 
         job = ScanJob(scanner, target, action, self.quarantine,
                       baseline=baseline_path,
-                      report_writer=ReportWriter(self.config.report_dir))
+                      report_writer=ReportWriter(self.config.report_dir),
+                      kill_registry=self.kill_registry)
         with self._lock:
             self.jobs[job.id] = job
             if len(self.jobs) > 64:  # keep the job table bounded
@@ -965,6 +989,10 @@ class _Handler(BaseHTTPRequestHandler):
                     self._json(404, {"error": "no rescue kit built yet"})
                 else:
                     self._json(200, status)
+            elif path == "/api/kill":
+                items = [asdict(i) for i in self.app.kill_registry.entries()]
+                self._json(200, {"items": items,
+                                 "registry": str(self.app.kill_registry.path)})
             elif path == "/api/docs":
                 self._send(200, DOCS_PAGE.encode("utf-8"),
                            "text/html; charset=utf-8")
@@ -980,6 +1008,8 @@ class _Handler(BaseHTTPRequestHandler):
                 self._scan()
             elif path == "/api/rescue/build":
                 self._rescue_build()
+            elif path in ("/api/kill/revive", "/api/kill/purge"):
+                self._kill_op("revive" if path.endswith("revive") else "purge")
             elif path == "/api/baselines":
                 self._baseline_create()
             elif path == "/api/quarantine/restore":
@@ -1009,7 +1039,7 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(404, {"error": f"no such file or directory: {target}"})
             return
         action = str(body.get("action") or "detect")
-        if action not in ("detect", "quarantine", "delete"):
+        if action not in ("detect", "quarantine", "kill", "delete"):
             self._json(400, {"error": f"invalid action: {action}"})
             return
         options = {
@@ -1109,6 +1139,24 @@ class _Handler(BaseHTTPRequestHandler):
             else:
                 self.app.quarantine.purge(qid)
                 self._json(200, {"ok": True, "id": qid})
+        except (KeyError, ValueError, FileNotFoundError) as exc:
+            self._json(404, {"error": str(exc)})
+
+    def _kill_op(self, op: str) -> None:
+        body = self._body()
+        kid = str((body or {}).get("id") or "").strip()
+        if not kid:
+            self._json(400, {"error": "id is required"})
+            return
+        try:
+            if op == "revive":
+                item, target = self.app.kill_registry.revive(kid)
+                self._json(200, {"ok": True, "id": item.id,
+                                 "revived_to": str(target),
+                                 "size": item.size})
+            else:
+                self.app.kill_registry.purge(kid)
+                self._json(200, {"ok": True, "id": kid})
         except (KeyError, ValueError, FileNotFoundError) as exc:
             self._json(404, {"error": str(exc)})
 

@@ -88,6 +88,8 @@ def _common_options(parser: argparse.ArgumentParser) -> None:
                         help="quarantine directory")
     parser.add_argument("--report-dir", default="reports",
                         help="report directory")
+    parser.add_argument("--registry-dir", default="registry",
+                        help="kill registry directory (key/IV store)")
     parser.add_argument("--max-size", type=int, default=0, metavar="BYTES",
                         help="skip files larger than BYTES")
 
@@ -127,6 +129,14 @@ def cmd_scan(args) -> int:
         print(paint(f"error: no such file or directory: {target}", RED), file=sys.stderr)
         return 2
 
+    # Kill registry: the scanner must know what was already neutralized
+    # *before* it starts, so killed files are counted, not re-flagged.
+    from .api import neutralized_map
+    from .kill import KillRegistry
+
+    kill_registry = KillRegistry(Path(args.registry_dir))
+    scanner.neutralized = neutralized_map(kill_registry)
+
     if getattr(args, "baseline", None) and target.is_dir():
         if config.cache_enabled:
             # A baseline comparison needs the *current* hash of every file.
@@ -159,28 +169,10 @@ def cmd_scan(args) -> int:
                 f" Integrity vs baseline: {changed} changed, "
                 f"{missing} missing, {new} new", YELLOW))
 
-    notes: dict = {}
-    if args.action != "detect":
-        handled = set()
-        for finding in result.findings:
-            if finding.path in handled:
-                continue
-            handled.add(finding.path)
-            path = Path(finding.path)
-            if not path.exists():
-                notes[finding.path] = "already gone"
-            elif args.action == "quarantine":
-                try:
-                    item = quarantine.put(path, finding)
-                    notes[finding.path] = f"quarantined as {item.id}"
-                except OSError as exc:
-                    notes[finding.path] = f"quarantine failed: {exc}"
-            else:  # delete
-                try:
-                    path.unlink()
-                    notes[finding.path] = "deleted"
-                except OSError as exc:
-                    notes[finding.path] = f"delete failed: {exc}"
+    from .api import apply_actions
+
+    notes = apply_actions(result, quarantine, args.action,
+                          kill_registry=kill_registry)
 
     writer = ReportWriter(config.report_dir)
     report_path = writer.save(result, action=args.action, actions_taken=notes)
@@ -210,6 +202,9 @@ def _print_scan_summary(result: ScanResult, action: str, notes: dict,
     cached = f"  [{result.files_cached} from scan cache]" if result.files_cached else ""
     print(f" Files scanned:  {result.files_scanned}{cached}  ({human_size(result.bytes_scanned)})")
     print(f" Skipped:        {result.files_skipped}")
+    if getattr(result, "files_neutralized", 0):
+        print(f" Neutralized:    {result.files_neutralized}  "
+              f"(already killed – inert, not re-flagged)")
     print(f" Errors:         {len(result.errors)}")
     print(f" Threads:        {workers} ({'parallel' if workers > 1 else 'sequential'})")
     print(f" Duration:       {result.elapsed:.2f} s")
@@ -227,13 +222,40 @@ def _print_scan_summary(result: ScanResult, action: str, notes: dict,
             if finding.path in notes:
                 print(f"    action: {notes[finding.path]}")
         print(paint("-" * 62, BOLD))
+        _print_top_threats(result)
     else:
         print(paint(" No threats found.", GREEN))
     for err in result.errors[:5]:
         print(paint(f" warning: {err}", YELLOW))
     print(f" Result: {paint('CLEAN' if result.clean else 'INFECTED', GREEN if result.clean else RED)}")
+    if action == "kill":
+        killed = [n for n in notes.values() if n.startswith("killed")]
+        if killed:
+            print(f" {paint(str(len(killed)), BOLD)} file(s) killed in place – "
+                  f"key/IV stored in the registry (see: antivirus kill list)")
     print(f" Report: {report_path}")
     print(paint(bar, BOLD))
+
+
+def _print_top_threats(result: ScanResult) -> None:
+    """One line per infected file, ranked by worst severity, then size."""
+    order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+    by_file: Dict[str, List[Finding]] = {}
+    for f in result.findings:
+        by_file.setdefault(f.path, []).append(f)
+
+    def worst_key(path: str):
+        sev = min(order.get(f.severity, 9) for f in by_file[path])
+        return (sev, -len(by_file[path]))
+
+    ranked = sorted(by_file, key=worst_key)
+    print(paint(" Top threats by file:", BOLD))
+    for i, path in enumerate(ranked, 1):
+        sev = min((f.severity for f in by_file[path]),
+                  key=lambda s: order.get(s, 9))
+        color = SEVERITY_COLOR.get(sev, YELLOW)
+        print(f"  {i}. {paint(f'[{sev.upper()}]', color)}  {path}  "
+              f"({len(by_file[path])} finding(s))")
 
 
 # ------------------------------------------------------------------ monitor
@@ -243,6 +265,11 @@ def cmd_monitor(args) -> int:
     if not target.exists():
         print(paint(f"error: no such file or directory: {target}", RED), file=sys.stderr)
         return 2
+    from .api import neutralized_map
+    from .kill import KillRegistry
+
+    kill_registry = KillRegistry(Path(args.registry_dir))
+    scanner.neutralized = neutralized_map(kill_registry)
     if args.json:
         # Machine-readable mode: one JSON object per event on stdout,
         # human messages suppressed.
@@ -251,10 +278,12 @@ def cmd_monitor(args) -> int:
 
         watcher = DirectoryWatcher(
             scanner, quarantine, action=args.action, interval=args.interval,
-            log=lambda level, message: None, on_event=_emit)
+            log=lambda level, message: None, on_event=_emit,
+            kill_registry=kill_registry)
     else:
         watcher = DirectoryWatcher(scanner, quarantine, action=args.action,
-                                   interval=args.interval)
+                                   interval=args.interval,
+                                   kill_registry=kill_registry)
         print(paint(f"Monitoring {target} – press Ctrl+C to stop", CYAN))
     try:
         watcher.run(target)
@@ -286,6 +315,42 @@ def cmd_quarantine(args) -> int:
             return 0
         quarantine.purge(args.id)
         print(paint(f"Purged {args.id}", GREEN))
+        return 0
+    except (KeyError, ValueError, FileNotFoundError) as exc:
+        print(paint(f"error: {exc}", RED), file=sys.stderr)
+        return 2
+
+
+# ----------------------------------------------------------------------- kill
+def cmd_kill(args) -> int:
+    from .kill import KillRegistry
+
+    registry = KillRegistry(Path(args.registry_dir))
+    if args.kaction == "list":
+        items = registry.entries()
+        if not items:
+            print("Kill registry is empty (nothing neutralized yet).")
+            return 0
+        for item in items:
+            print(f"{item.id}")
+            print(f"   when:    {item.killed_at}")
+            print(f"   path:    {item.original_path}")
+            print(f"   size:    {human_size(item.size)}")
+            print(f"   reason:  {item.reason}")
+            print(f"   key:     {item.key[:8]}…  iv: {item.iv[:8]}…  "
+                  f"(stored in {registry.path})")
+            print()
+        return 0
+    try:
+        if args.kaction == "revive":
+            item, target = registry.revive(args.id)
+            print(paint(f"Revived {item.id} -> {target} "
+                        f"({human_size(item.size)}, original bytes restored)",
+                        GREEN))
+            return 0
+        registry.purge(args.id)
+        print(paint(f"Purged {args.id} (file deleted, registry entry removed "
+                    f"– irreversible)", GREEN))
         return 0
     except (KeyError, ValueError, FileNotFoundError) as exc:
         print(paint(f"error: {exc}", RED), file=sys.stderr)
@@ -747,7 +812,8 @@ def cmd_rescue_run(args) -> int:
             since=str(args.since) if args.since else "",
             exclude=tuple(args.exclude) if args.exclude else (),
             quarantine_dir=args.rescue_quarantine,
-            report_dir=args.rescue_reports)
+            report_dir=args.rescue_reports,
+            registry_dir=args.rescue_registry)
     except (OSError, ValueError) as exc:
         print(paint(f"error: {exc}", RED), file=sys.stderr)
         return 2
@@ -759,6 +825,7 @@ def cmd_rescue_run(args) -> int:
         data["actions_taken"] = info["notes"]
         data["rescue"] = {
             "quarantine_dir": info["quarantine_dir"],
+            "registry_dir": info["registry_dir"],
             "report": str(info["report"]) if info["report"] else None,
             "signatures": info["signatures_file"],
         }
@@ -767,8 +834,12 @@ def cmd_rescue_run(args) -> int:
         _print_scan_summary(result, args.action, info["notes"],
                             info["report"])
         print(paint(
-            f" Quarantine lives on the rescue side: {info['quarantine_dir']}"
-            f"  (outside the scanned tree)", YELLOW))
+            f" Quarantine lives on the rescue side: {info['quarantine_dir']} "
+            f"(outside the scanned tree)", YELLOW))
+        if args.action == "kill":
+            print(paint(
+                f" Kill registry (key/IV) lives on the rescue side: "
+                f"{info['registry_dir']}", YELLOW))
     return 0 if result.clean else 1
 
 
@@ -1060,8 +1131,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("scan", help="scan a file or directory")
     _common_options(p)
     p.add_argument("target", help="file or directory to scan")
-    p.add_argument("--action", choices=("detect", "quarantine", "delete"),
-                   default="detect", help="what to do with threats")
+    p.add_argument("--action", choices=("detect", "quarantine", "kill", "delete"),
+                   default="detect",
+                   help="what to do with threats (kill = obfuscate in place, "
+                        "key/IV go to the registry)")
     p.add_argument("--threads", default="auto", metavar="N",
                    help="worker threads for directory scans: auto (default), "
                         "a number, or 1/0 for fully sequential")
@@ -1090,8 +1163,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("monitor", help="watch a directory and scan new/changed files")
     _common_options(p)
     p.add_argument("target", help="directory to watch")
-    p.add_argument("--action", choices=("detect", "quarantine", "delete"),
-                   default="detect", help="what to do with threats")
+    p.add_argument("--action", choices=("detect", "quarantine", "kill", "delete"),
+                   default="detect",
+                   help="what to do with threats (kill = obfuscate in place)")
     p.add_argument("--interval", type=float, default=2.0,
                    help="poll interval in seconds (default 2)")
     p.add_argument("--no-behavior", action="store_true",
@@ -1116,6 +1190,21 @@ def build_parser() -> argparse.ArgumentParser:
     pr.add_argument("id", help="quarantine id (a prefix is enough)")
     pp = qsub.add_parser("purge", help="permanently delete a quarantined file")
     pp.add_argument("id", help="quarantine id (a prefix is enough)")
+
+    p = sub.add_parser("kill",
+                       help="list, revive or purge in-place killed files "
+                            "(key/IV registry)")
+    _common_options(p)
+    ksub = p.add_subparsers(dest="kaction", required=True)
+    ksub.add_parser("list", help="list neutralized files and their registry entries")
+    kr = ksub.add_parser("revive",
+                         help="restore a killed file's original bytes using "
+                              "the registry's key/IV")
+    kr.add_argument("id", help="kill registry id (a prefix is enough)")
+    kp = ksub.add_parser("purge",
+                         help="permanently delete a killed file and its "
+                              "registry entry (irreversible)")
+    kp.add_argument("id", help="kill registry id (a prefix is enough)")
 
     p = sub.add_parser("sig", help="inspect or extend the signature database")
     _common_options(p)
@@ -1291,8 +1380,11 @@ def build_parser() -> argparse.ArgumentParser:
                     "the rescue side, never into the scanned tree")
     _common_options(rr)
     rr.add_argument("target", help="mounted volume / directory to scan")
-    rr.add_argument("--action", choices=("detect", "quarantine", "delete"),
-                    default="detect", help="what to do with threats")
+    rr.add_argument("--action",
+                    choices=("detect", "quarantine", "kill", "delete"),
+                    default="detect",
+                    help="what to do with threats (kill = obfuscate in "
+                         "place, key/IV on the live side)")
     rr.add_argument("--fast", action="store_true",
                     help="hash + pattern layers only")
     rr.add_argument("--since", type=_argparse_since, default=0.0,
@@ -1307,6 +1399,9 @@ def build_parser() -> argparse.ArgumentParser:
                          "./rescue-quarantine)")
     rr.add_argument("--rescue-reports", default="rescue-reports",
                     metavar="DIR", help="report dir on the live side")
+    rr.add_argument("--rescue-registry", default="rescue-registry",
+                    metavar="DIR",
+                    help="kill registry (key/IV store) on the live side")
     rr.add_argument("--json", action="store_true",
                     help="machine readable output")
     rv = rsub.add_parser(
@@ -1321,6 +1416,7 @@ _COMMANDS = {
     "scan": cmd_scan,
     "monitor": cmd_monitor,
     "quarantine": cmd_quarantine,
+    "kill": cmd_kill,
     "sig": cmd_sig,
     "behavior": cmd_behavior,
     "pe": cmd_pe,

@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
 from .config import Config
+from .kill import KillRegistry
 from .quarantine import Quarantine
 from .scanner import Scanner, walk_files
 
@@ -38,9 +39,11 @@ class DirectoryWatcher:
         interval: float = 2.0,
         log: Optional[LogFn] = None,
         on_event: Optional[EventFn] = None,
+        kill_registry: Optional["KillRegistry"] = None,
     ) -> None:
         self.scanner = scanner
         self.quarantine = quarantine
+        self.kill_registry = kill_registry
         self.action = action
         self.interval = max(float(interval), 0.1)
         self.log: LogFn = log or self._default_log
@@ -155,6 +158,18 @@ class DirectoryWatcher:
             except OSError as exc:
                 self.log("error", f"quarantine failed: {exc}")
                 self._emit("error", path=str(path), detail=str(exc))
+        elif self.action == "kill":
+            if self.kill_registry is None:
+                self.log("error", "kill needs a registry (not configured)")
+                self._emit("error", path=str(path), detail="no registry")
+            else:
+                try:
+                    item = self.kill_registry.kill(path, worst)
+                    self.log("ok", f"killed in place (registry: {item.id})")
+                    self._emit("killed", path=str(path), id=item.id)
+                except OSError as exc:
+                    self.log("error", f"kill failed: {exc}")
+                    self._emit("error", path=str(path), detail=str(exc))
         elif self.action == "delete":
             try:
                 path.unlink()

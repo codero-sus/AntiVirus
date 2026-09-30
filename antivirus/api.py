@@ -40,6 +40,7 @@ from .config import Config
 from .fileinfo import file_info
 from .integrity import build_manifest as _build_manifest
 from .integrity import save_manifest as _save_manifest
+from .kill import KillRegistry
 from .models import Finding
 from .quarantine import Quarantine
 from .report import ReportWriter
@@ -104,22 +105,51 @@ def engine_stats(config: Config, db: SignatureDB, quarantine: Quarantine,
     return stats
 
 
+def action_target(finding: Finding) -> Path:
+    """The path an action actually acts on for *finding*.
+
+    Findings for entries *inside* an archive are reported as
+    ``archive.zip!entry`` — the action is applied to the **container**,
+    so neutralizing it really neutralizes the threat.
+    """
+    path = finding.path
+    if "!" in path:
+        path = path.split("!", 1)[0]
+    return Path(path)
+
+
+def neutralized_map(kill_registry: Optional["KillRegistry"]) -> Dict[str, str]:
+    """``{ciphertext_sha256: entry id}`` for the scanner's neutralized set."""
+    if kill_registry is None:
+        return {}
+    return {e.ciphertext_sha256: e.id for e in kill_registry.entries()}
+
+
 def apply_actions(result: ScanResult, quarantine: Quarantine,
-                  action: str) -> Dict[str, str]:
-    """Apply *action* (detect / quarantine / delete) to a scan result.
+                  action: str,
+                  kill_registry: Optional["KillRegistry"] = None
+                  ) -> Dict[str, str]:
+    """Apply *action* (detect / quarantine / kill / delete) to a scan result.
 
     Returns a ``{path: note}`` map describing what happened to each file.
-    Shared by the module API, the web console and (conceptually) the CLI.
+    Shared by the module API, the CLI and the web console.  ``kill`` needs
+    a *kill_registry* (the AntiVirus registry that stores key/IV pairs).
     """
     notes: Dict[str, str] = {}
     if action == "detect":
         return notes
-    handled = set()
+    handled_paths = set()
+    handled_targets = set()
     for finding in result.findings:
-        if finding.path in handled:
+        if finding.path in handled_paths:
             continue
-        handled.add(finding.path)
-        path = Path(finding.path)
+        handled_paths.add(finding.path)
+        path = action_target(finding)
+        # Several findings can point at one physical file (e.g. a container
+        # hit by pattern + its entry hit by hash): act on it only once.
+        if str(path) in handled_targets:
+            continue
+        handled_targets.add(str(path))
         if not path.exists():
             notes[finding.path] = "already gone"
         elif action == "quarantine":
@@ -128,6 +158,15 @@ def apply_actions(result: ScanResult, quarantine: Quarantine,
                 notes[finding.path] = f"quarantined as {item.id}"
             except OSError as exc:
                 notes[finding.path] = f"quarantine failed: {exc}"
+        elif action == "kill":
+            if kill_registry is None:
+                notes[finding.path] = "kill skipped (no registry configured)"
+            else:
+                try:
+                    item = kill_registry.kill(path, finding)
+                    notes[finding.path] = f"killed in place (registry: {item.id})"
+                except OSError as exc:
+                    notes[finding.path] = f"kill failed: {exc}"
         else:  # delete
             try:
                 path.unlink()
@@ -163,6 +202,7 @@ class Antivirus:
             config.signatures_file = base_path / "data" / "signatures.json"
             config.cache_dir = base_path / ".av-cache"
             config.baseline_dir = base_path / "baselines"
+            config.registry_dir = base_path / "registry"
         if signatures is not None:
             config.signatures_file = Path(os.path.expanduser(str(signatures)))
         config.resolve_paths(base_path)
@@ -179,6 +219,7 @@ class Antivirus:
         self.db = SignatureDB(config.signatures_file)
         self.scanner = Scanner(config, self.db, threads=threads)
         self.quarantine = Quarantine(config.quarantine_dir)
+        self.kill_registry = KillRegistry(config.registry_dir)
         self.report_writer = ReportWriter(config.report_dir)
 
     # ------------------------------------------------------------- scanning
@@ -201,7 +242,7 @@ class Antivirus:
         *baseline* may be a manifest file path, or a baseline id previously
         stored with :meth:`save_manifest`.
         """
-        if action not in ("detect", "quarantine", "delete"):
+        if action not in ("detect", "quarantine", "kill", "delete"):
             raise ValueError(f"invalid action: {action}")
         from .utils import parse_since
 
@@ -224,6 +265,7 @@ class Antivirus:
 
         result: Optional[ScanResult] = None
         try:
+            self.scanner.neutralized = neutralized_map(self.kill_registry)
             target_path = Path(os.path.expanduser(str(target)))
             if not target_path.exists():
                 raise FileNotFoundError(str(target))
@@ -243,7 +285,9 @@ class Antivirus:
                     manifest, current_from_result(result, target_path))
                 result.findings.extend(extra)
             if action != "detect" and result is not None:
-                result.notes = apply_actions(result, self.quarantine, action)  # type: ignore[attr-defined]
+                result.notes = apply_actions(  # type: ignore[attr-defined]
+                    result, self.quarantine, action,
+                    kill_registry=self.kill_registry)
             elif result is not None:
                 result.notes = {}  # type: ignore[attr-defined]
             if save_report and result is not None:
@@ -259,6 +303,7 @@ class Antivirus:
 
     def scan_file(self, path) -> List[Finding]:
         """Scan a single file; returns its findings (empty when clean)."""
+        self.scanner.neutralized = neutralized_map(self.kill_registry)
         return self.scanner.scan_file(Path(path))
 
     def save_report(self, result: ScanResult, action: str = "detect") -> Path:
@@ -309,6 +354,19 @@ class Antivirus:
         manifest = load_manifest(bpath)
         return verify_tree(Path(os.path.expanduser(str(target))),
                            manifest, self.config)
+
+    # ----------------------------------------------------------- kill engine
+    def kill_list(self):
+        """Everything currently neutralized (key/IV held in the registry)."""
+        return self.kill_registry.entries()
+
+    def kill_revive(self, item_id) -> "tuple":
+        """Restore a killed file's original bytes (key/IV from registry)."""
+        return self.kill_registry.revive(str(item_id))
+
+    def kill_purge(self, item_id):
+        """Permanently delete a killed file and its registry entry."""
+        return self.kill_registry.purge(str(item_id))
 
     def rescue_build(self, out_dir=None, iso_path=None) -> Dict:
         """Build the rescue kit + ISO, using this engine's signature DB.

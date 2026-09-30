@@ -7,6 +7,7 @@ Run with either:
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -40,11 +41,17 @@ class App:
         self.config.signatures_file = base / "signatures.json"
         self.config.cache_dir = base / ".av-cache"
         self.config.baseline_dir = base / "baselines"
+        self.config.registry_dir = base / "registry"
         if BUNDLED_DB.exists():
+            self.config.signatures_file.parent.mkdir(parents=True,
+                                                      exist_ok=True)
             shutil.copyfile(BUNDLED_DB, self.config.signatures_file)
         self.db = SignatureDB(self.config.signatures_file)
         self.scanner = Scanner(self.config, self.db)
         self.quarantine = Quarantine(self.config.quarantine_dir)
+        from antivirus.kill import KillRegistry
+
+        self.kill_registry = KillRegistry(self.config.registry_dir)
 
 
 class ScannerTests(unittest.TestCase):
@@ -2585,6 +2592,345 @@ class VbsBehaviorTests(unittest.TestCase):
                     if f.path.endswith("harmless-vbs.vbs")]
         self.assertGreaterEqual(len(dropper), 3)
         self.assertEqual(harmless, [])
+
+
+class KillCipherTests(unittest.TestCase):
+    """v2.2: the kill keystream cipher (stdlib-only, reversible)."""
+
+    KEY = bytes(range(32))
+    IV = bytes(range(100, 116))
+
+    def test_round_trip_and_determinism(self):
+        from antivirus.kill import transform
+
+        data = os.urandom(3 * 1024 * 1024)  # 3 MiB
+        a = transform(data, self.KEY, self.IV)
+        b = transform(data, self.KEY, self.IV)
+        self.assertEqual(a, b)                     # deterministic
+        self.assertNotEqual(a, data)               # actually obfuscated
+        self.assertEqual(transform(a, self.KEY, self.IV), data)
+
+    def test_empty(self):
+        from antivirus.kill import transform
+
+        self.assertEqual(transform(b"", self.KEY, self.IV), b"")
+
+    def test_wrong_key_does_not_restore(self):
+        from antivirus.kill import transform
+
+        data = os.urandom(4096)
+        cipher = transform(data, self.KEY, self.IV)
+        self.assertNotEqual(transform(cipher, bytes(32), self.IV), data)
+        self.assertNotEqual(transform(cipher, self.KEY, bytes(16)), data)
+
+    def test_new_key_iv_sizes(self):
+        from antivirus.kill import IV_SIZE, KEY_SIZE, new_key_iv
+
+        key, iv = new_key_iv()
+        self.assertEqual(len(key), KEY_SIZE)
+        self.assertEqual(len(iv), IV_SIZE)
+
+
+class KillRegistryTests(unittest.TestCase):
+    """v2.2: the registry — key/IV store with kill/revive/purge."""
+
+    def setUp(self):
+        base = Path(tempfile.mkdtemp(prefix="av-kill-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        self.base = base
+        self.registry_dir = base / "registry"
+        from antivirus.kill import KillRegistry
+
+        self.registry = KillRegistry(self.registry_dir)
+
+    def _victim(self, name="virus.bin"):
+        p = self.base / name
+        p.write_bytes(EICAR)
+        app = App(self.base / "app")
+        app.scanner.config.cache_enabled = False
+        return p, app.scanner.scan_file(p)[0]
+
+    def test_kill_revive_purge_cycle(self):
+        p, finding = self._victim()
+        item = self.registry.kill(p, finding)
+        self.assertTrue(p.exists())                    # stays in place
+        self.assertNotEqual(p.read_bytes(), EICAR)    # but is obfuscated
+        self.assertEqual(len(self.registry.entries()), 1)
+        entry = self.registry.by_ciphertext_sha256(
+            hashlib.sha256(p.read_bytes()).hexdigest())
+        self.assertEqual(entry["id"], item.id)
+
+        _revived, target = self.registry.revive(item.id)
+        self.assertEqual(target.read_bytes(), EICAR)  # exact original bytes
+        self.assertEqual(self.registry.entries(), [])  # entry consumed
+
+        p, finding = self._victim("virus2.bin")
+        item2 = self.registry.kill(p, finding)
+        self.registry.purge(item2.id[:8])
+        self.assertFalse(p.exists())
+        self.assertEqual(self.registry.entries(), [])
+
+    def test_revive_refuses_tampered_file(self):
+        p, finding = self._victim()
+        item = self.registry.kill(p, finding)
+        p.write_bytes(b"attacker tampering")
+        with self.assertRaises(ValueError):
+            self.registry.revive(item.id)
+        self.assertEqual(len(self.registry.entries()), 1)  # entry kept
+
+    def test_revive_missing_file(self):
+        p, finding = self._victim()
+        item = self.registry.kill(p, finding)
+        p.unlink()
+        with self.assertRaises(FileNotFoundError):
+            self.registry.revive(item.id)
+
+    def test_id_prefix_and_ambiguity(self):
+        pa, fa = self._victim("a.bin")
+        a = self.registry.kill(pa, fa)
+        pb, fb = self._victim("b.bin")
+        b = self.registry.kill(pb, fb)
+        # both victims are EICAR -> ids share the 12-hex sha prefix
+        common = a.id[:12]
+        self.assertTrue(b.id.startswith(common))
+        with self.assertRaises(ValueError):
+            self.registry.revive(common)  # ambiguous
+        with self.assertRaises(KeyError):
+            self.registry.revive("deadbeef")  # unknown
+        # the full id is always unambiguous
+        self.assertEqual(self.registry.revive(a.id)[0].id, a.id)
+        self.registry.purge(b.id)
+
+
+class KillScanTests(unittest.TestCase):
+    """v2.2: kill as a scan action + registry-aware rescans."""
+
+    def setUp(self):
+        base = Path(tempfile.mkdtemp(prefix="av-kscan-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        self.base = base
+        self.app = App(base)
+        self.app.scanner.config.cache_enabled = False
+
+    def _antivirus(self):
+        from antivirus import Antivirus
+
+        av = Antivirus(config=self.app.config, signatures=None)
+        av.scanner.config.cache_enabled = False
+        return av
+
+    def test_kill_action_via_module_api(self):
+        av = self._antivirus()
+        (self.base / "virus.txt").write_bytes(EICAR)
+        result = av.scan(self.base, action="kill")
+        self.assertFalse(result.clean)
+        self.assertTrue(any(n.startswith("killed in place")
+                            for n in result.notes.values()))
+        self.assertNotIn(EICAR, (self.base / "virus.txt").read_bytes())
+        items = av.kill_list()
+        self.assertEqual(len(items), 1)
+        # rescan: inert (neutralized), no findings
+        again = av.scan(self.base, cache=False)
+        self.assertTrue(again.clean)
+        self.assertEqual(again.files_neutralized, 1)
+        # revive
+        item, target = av.kill_revive(items[0].id)
+        self.assertEqual(target.read_bytes(), EICAR)
+        self.assertEqual(av.kill_list(), [])
+
+    def test_kill_invalid_action_rejected(self):
+        av = self._antivirus()
+        with self.assertRaises(ValueError):
+            av.scan(self.base, action="nuke")
+
+    def test_archive_entry_kill_hits_container_once(self):
+        import zipfile
+
+        z = self.base / "bundle.zip"
+        with zipfile.ZipFile(z, "w") as zf:
+            zf.writestr("payload/eicar.txt", EICAR)
+            zf.writestr("clean.txt", b"ok\n")
+        av = self._antivirus()
+        result = av.scan(z, action="kill", cache=False)
+        self.assertFalse(result.clean)
+        # two findings (container pattern + entry hash), ONE kill
+        self.assertEqual(len([n for n in result.notes.values()
+                              if n.startswith("killed")]), 1)
+        self.assertEqual(len(av.kill_list()), 1)
+        self.assertFalse(zipfile.is_zipfile(z))  # container obfuscated
+        item, target = av.kill_revive(av.kill_list()[0].id)
+        self.assertEqual(target.read_bytes(), z.read_bytes())
+        self.assertTrue(zipfile.is_zipfile(z))    # restored intact
+
+    def test_scan_json_reports_neutralized_count(self):
+        av = self._antivirus()
+        (self.base / "v.txt").write_bytes(EICAR)
+        av.scan(self.base, action="kill", cache=False)
+        again = av.scan(self.base, cache=False)
+        data = again.to_dict()
+        self.assertEqual(data["files_neutralized"], 1)
+        self.assertTrue(again.clean)
+
+    def test_tui_action_cycle_includes_kill(self):
+        from antivirus.tui import ACTIONS
+
+        self.assertEqual(ACTIONS, ("detect", "quarantine", "kill", "delete"))
+
+
+class KillCLITests(unittest.TestCase):
+    """v2.2: `antivirus scan --action kill` + `antivirus kill …`."""
+
+    def setUp(self):
+        self.base = Path(tempfile.mkdtemp(prefix="av-kcli-"))
+        self.addCleanup(lambda: shutil.rmtree(self.base, ignore_errors=True))
+
+    def _run(self, *argv):
+        from antivirus.cli import main
+
+        self.rc = None
+        out, err = io.StringIO(), io.StringIO()
+        old = os.getcwd()
+        os.chdir(self.base)
+        try:
+            with contextlib.redirect_stdout(out), \
+                    contextlib.redirect_stderr(err):
+                self.rc = main(list(argv))
+        finally:
+            os.chdir(old)
+        return self.rc, out.getvalue(), err.getvalue()
+
+    def test_full_kill_flow(self):
+        (self.base / "virus.txt").write_bytes(EICAR)
+        rc, out, _ = self._run("scan", ".", "--action", "kill",
+                               "--no-cache")
+        self.assertEqual(rc, 1)  # infected
+        self.assertIn("killed in place", out)
+        self.assertIn("Top threats by file", out)
+        self.assertNotIn(EICAR, (self.base / "virus.txt").read_bytes())
+
+        rc, out, _ = self._run("kill", "list")
+        self.assertEqual(rc, 0)
+        self.assertIn("stored in registry/kill.json", out)
+        item_id = out.splitlines()[0].strip()
+
+        rc, out, _ = self._run("scan", ".", "--no-cache")
+        self.assertEqual(rc, 0)  # now clean (inert)
+        self.assertIn("Neutralized:", out)
+
+        rc, out, _ = self._run("kill", "revive", item_id[:12])
+        self.assertEqual(rc, 0)
+        self.assertEqual((self.base / "virus.txt").read_bytes(), EICAR)
+
+        # re-kill, then purge
+        self._run("scan", ".", "--action", "kill", "--no-cache")
+        rc, out, _ = self._run("kill", "list")
+        new_id = out.splitlines()[0].strip()
+        rc, out, _ = self._run("kill", "purge", new_id[:12])
+        self.assertEqual(rc, 0)
+        self.assertFalse((self.base / "virus.txt").exists())
+        rc, out, _ = self._run("kill", "list")
+        self.assertIn("empty", out)
+
+    def test_revive_unknown_id(self):
+        rc, out, err = self._run("kill", "revive", "nonexistent")
+        self.assertEqual(rc, 2)
+        self.assertIn("no killed file", err)
+
+
+class KillWebTests(WebConsoleTests):
+    """v2.2: kill action + /api/kill endpoints."""
+
+    def _kill_eicar(self):
+        p = self.base / "virus.txt"
+        p.write_bytes(EICAR)
+        return p
+
+    def _scan(self, **opts):
+        body = {"target": str(self.base)}
+        body.update(opts)
+        status, data = self._req("POST", "/api/scan", body)
+        self.assertEqual(status, 200)
+        job_id = data["job"]["id"]
+        for _ in range(100):
+            status, detail = self._req("GET", f"/api/jobs/{job_id}")
+            if detail["job"]["status"] in ("done", "error"):
+                return detail
+            time.sleep(0.05)
+        self.fail("scan job did not finish")
+
+    def test_kill_action_and_endpoints(self):
+        p = self._kill_eicar()
+        detail = self._scan(action="kill")
+        self.assertEqual(detail["job"]["status"], "done")
+        result = detail["result"]
+        self.assertTrue(any(n.startswith("killed in place")
+                            for n in result["actions_taken"].values()))
+        self.assertNotEqual(p.read_bytes(), EICAR)
+
+        status, data = self._req("GET", "/api/kill")
+        self.assertEqual(status, 200)
+        items = data["items"]
+        self.assertEqual(len(items), 1)
+        self.assertEqual(len(items[0]["key"]), 64)
+        self.assertEqual(len(items[0]["iv"]), 32)
+
+        status, data = self._req("POST", "/api/kill/revive",
+                                 {"id": items[0]["id"][:12]})
+        self.assertEqual(status, 200)
+        self.assertEqual(p.read_bytes(), EICAR)
+
+        status, data = self._req("GET", "/api/kill")
+        self.assertEqual(data["items"], [])
+
+        # purge path
+        p.write_bytes(EICAR)
+        self._scan(action="kill")
+        status, data = self._req("GET", "/api/kill")
+        kid = data["items"][0]["id"]
+        status, data = self._req("POST", "/api/kill/purge", {"id": kid})
+        self.assertEqual(status, 200)
+        self.assertFalse(p.exists())
+
+    def test_revive_unknown_id_404(self):
+        status, data = self._req("POST", "/api/kill/revive", {"id": "nope"})
+        self.assertEqual(status, 404)
+
+    def test_invalid_action_rejected(self):
+        self._kill_eicar()
+        status, data = self._req("POST", "/api/scan",
+                                 {"target": str(self.base),
+                                  "action": "nuke"})
+        self.assertEqual(status, 400)
+
+
+class RescueKillTests(unittest.TestCase):
+    """v2.2: rescue kills stay on the live side (registry outside target)."""
+
+    def test_run_rescue_kill(self):
+        from antivirus.rescue import run_rescue
+
+        base = Path(tempfile.mkdtemp(prefix="av-rkill-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        disk = base / "sda1"
+        (disk / "user").mkdir(parents=True)
+        (disk / "user" / "trojan.txt").write_bytes(EICAR)
+        (disk / "user" / "clean.txt").write_text("fine\n")
+
+        info = run_rescue(disk, action="kill",
+                          quarantine_dir=str(base / "usb-q"),
+                          report_dir=str(base / "usb-r"),
+                          registry_dir=str(base / "usb-reg"))
+        self.assertEqual(len(info["result"].findings), 1)
+        trojan = disk / "user" / "trojan.txt"
+        self.assertTrue(trojan.exists())                  # in place
+        self.assertNotEqual(trojan.read_bytes(), EICAR)   # obfuscated
+        self.assertEqual((disk / "user" / "clean.txt").read_text(),
+                         "fine\n")
+        # registry + report on the live side, never inside the target
+        self.assertTrue((base / "usb-reg" / "kill.json").exists())
+        self.assertEqual(len(info["notes"]), 1)
+        self.assertFalse((disk / "rescue-registry").exists())
+        self.assertTrue(info["report"].exists())
 
 
 class WindowsCompatTests(unittest.TestCase):

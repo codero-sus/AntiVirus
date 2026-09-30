@@ -95,8 +95,11 @@ def main() -> int:
                     + __version__ + ", self-contained kit)")
     parser.add_argument("target", nargs="?",
                         help="mounted system volume to scan (e.g. /mnt/sda1)")
-    parser.add_argument("--action", choices=("detect", "quarantine", "delete"),
-                        default="detect")
+    parser.add_argument("--action",
+                        choices=("detect", "quarantine", "kill", "delete"),
+                        default="detect",
+                        help="kill = obfuscate in place (key/IV on the "
+                             "rescue media)")
     parser.add_argument("--fast", action="store_true",
                         help="hash + pattern layers only")
     parser.add_argument("--since", default="",
@@ -110,6 +113,10 @@ def main() -> int:
     parser.add_argument("--report-dir",
                         default=str(KIT_DIR / "rescue-reports"),
                         help="where the rescue report is written")
+    parser.add_argument("--rescue-registry",
+                        default=str(KIT_DIR / "rescue-registry"),
+                        help="kill registry (key/IV store) — stays on the "
+                             "rescue media")
     parser.add_argument("--signatures", default=None,
                         help="signature database (default: the kit's copy)")
     parser.add_argument("--json", action="store_true")
@@ -123,7 +130,8 @@ def main() -> int:
     info = run_rescue(
         args.target, action=args.action, fast=args.fast, since=args.since,
         exclude=tuple(args.exclude), signatures_file=sig,
-        quarantine_dir=args.quarantine_dir, report_dir=args.report_dir)
+        quarantine_dir=args.quarantine_dir, report_dir=args.report_dir,
+        registry_dir=args.rescue_registry)
     result = info["result"]
     if args.json:
         data = result.to_dict()
@@ -131,6 +139,7 @@ def main() -> int:
         data["actions_taken"] = info["notes"]
         data["rescue"] = {
             "quarantine_dir": info["quarantine_dir"],
+            "registry_dir": info["registry_dir"],
             "report": str(info["report"]) if info["report"] else None,
             "signatures": info["signatures_file"],
         }
@@ -150,6 +159,8 @@ def main() -> int:
             print(f"  [{f.severity.upper()}] {f.name}  {f.path}"
                   + (f"  -> {note}" if note else ""))
         print(f" Quarantine (rescue media): {info['quarantine_dir']}")
+        if info.get("registry_dir"):
+            print(f" Kill registry (rescue media): {info['registry_dir']}")
         if info["report"]:
             print(f" Report: {info['report']}")
         print(f" Result: {state}")
@@ -448,15 +459,17 @@ def run_rescue(target, action: str = "detect", fast: bool = False,
                signatures_file: Optional[str] = None,
                quarantine_dir: Optional[str] = None,
                report_dir: Optional[str] = None,
+               registry_dir: Optional[str] = None,
                threads: "str | int" = "auto") -> Dict:
     """Scan a *foreign* tree (a mounted volume) as a rescue operation.
 
     Unlike a regular scan, the defaults live **outside the target**:
-    quarantine and reports go to ``rescue-quarantine`` / ``rescue-reports``
-    under the CWD (the live media), and the scan cache is always
-    disabled — a cache sitting on the scanned system is untrusted.
+    quarantine, the kill registry and reports go to ``rescue-quarantine`` /
+    ``rescue-registry`` / ``rescue-reports`` under the CWD (the live
+    media), and the scan cache is always disabled — a cache sitting on the
+    scanned system is untrusted.
     """
-    if action not in ("detect", "quarantine", "delete"):
+    if action not in ("detect", "quarantine", "kill", "delete"):
         raise ValueError(f"invalid action: {action}")
     from .api import apply_actions
     from .utils import parse_since
@@ -475,6 +488,8 @@ def run_rescue(target, action: str = "detect", fast: bool = False,
                              else Path.cwd() / "rescue-quarantine")
     config.report_dir = (Path(report_dir) if report_dir
                          else Path.cwd() / "rescue-reports")
+    config.registry_dir = (Path(registry_dir) if registry_dir
+                           else Path.cwd() / "rescue-registry")
     config.resolve_paths(Path.cwd())
 
     if not config.signatures_file.exists():
@@ -484,20 +499,27 @@ def run_rescue(target, action: str = "detect", fast: bool = False,
             config.signatures_file.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(bundled, config.signatures_file)
 
+    from .api import neutralized_map
+    from .kill import KillRegistry
+
     db = SignatureDB(config.signatures_file)
     scanner = Scanner(config, db, threads=threads)
     quarantine = Quarantine(config.quarantine_dir)
+    kill_registry = KillRegistry(config.registry_dir)
+    scanner.neutralized = neutralized_map(kill_registry)
     target_path = Path(target)
     if not target_path.exists():
         raise FileNotFoundError(f"no such file or directory: {target}")
     result = scanner.scan_path(target_path)
-    notes = apply_actions(result, quarantine, action)
+    notes = apply_actions(result, quarantine, action,
+                          kill_registry=kill_registry)
     report_path = ReportWriter(config.report_dir).save(result, action, notes)
     return {
         "result": result,
         "notes": notes,
         "report": report_path,
         "quarantine_dir": str(config.quarantine_dir),
+        "registry_dir": str(config.registry_dir),
         "signatures_file": str(config.signatures_file),
     }
 
