@@ -3005,5 +3005,291 @@ class WindowsCompatTests(unittest.TestCase):
         self.assertIn("py -3", text)
 
 
+class CachedWalkTests(unittest.TestCase):
+    """v2.3: the guard's incremental walk (unchanged dirs are not relisted)."""
+
+    def setUp(self):
+        from antivirus.monitor import DirectoryWatcher
+
+        base = Path(tempfile.mkdtemp(prefix="av-cwalk-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        self.base = base
+        self.watch = base / "watch"
+        for i in range(6):
+            d = self.watch / f"d{i // 3}" / f"e{i % 3}"
+            d.mkdir(parents=True)
+            (d / f"f{i}.txt").write_text(f"file {i}\n")
+        cfg = Config()
+        cfg.quarantine_dir = base / "quarantine"
+        cfg.report_dir = base / "reports"
+        cfg.signatures_file = base / "signatures.json"
+        if BUNDLED_DB.exists():
+            shutil.copyfile(BUNDLED_DB, cfg.signatures_file)
+        cfg.cache_enabled = False
+        db = SignatureDB(cfg.signatures_file)
+        scanner = Scanner(cfg, db)
+        quarantine = Quarantine(cfg.quarantine_dir)
+        self.watcher = DirectoryWatcher(
+            scanner, quarantine, interval=1, log=lambda *a: None,
+            cached_walk=True)
+        self.watcher.poll(self.watch)  # build the baseline
+
+    # -- reliable on any filesystem (per-file stat of known children) ---
+    def test_detects_content_change(self):
+        (self.watch / "d0" / "e0" / "f0.txt").write_text("CHANGED NOW\n")
+        changed, removed = self.watcher.poll(self.watch)
+        self.assertEqual({p.name for p in changed}, {"f0.txt"})
+        self.assertEqual(removed, [])
+
+    def test_detects_removed_file(self):
+        (self.watch / "d1" / "e0" / "f3.txt").unlink()
+        changed, removed = self.watcher.poll(self.watch)
+        self.assertEqual([p.name for p in removed], ["f3.txt"])
+        self.assertEqual(changed, [])
+
+    # -- new entries: found via the revalidation safety net -------------
+    def test_detects_new_file_via_revalidation(self):
+        # Whether or not the filesystem advanced the directory's mtime, a
+        # revalidation pass lists the directory again and finds the file.
+        self.watcher.revalidate_after = 0.05
+        (self.watch / "d1" / "e2" / "brand-new.txt").write_text("new\n")
+        time.sleep(0.1)
+        changed, removed = self.watcher.poll(self.watch)
+        self.assertIn("brand-new.txt", {p.name for p in changed})
+        self.assertEqual(removed, [])
+
+    def test_detects_new_subdir_via_revalidation(self):
+        self.watcher.revalidate_after = 0.05
+        newdir = self.watch / "d1" / "e0" / "new-nest"
+        newdir.mkdir()
+        (newdir / "x.txt").write_text("x\n")
+        time.sleep(0.1)
+        changed, _removed = self.watcher.poll(self.watch)
+        self.assertIn("x.txt", {p.name for p in changed})
+
+    def _force_coarse_timestamp_race(self, target: Path) -> None:
+        """Simulate a filesystem whose directory timestamps lag: a new file
+        appears while the directory's (mtime, size) pair still matches what
+        the cache recorded."""
+        (target / "sneaky.txt").write_text("sneak\n")
+        st = os.lstat(target)
+        key = str(target)
+        _mtime, _size, files, subdirs, listed_at = self.watcher._dir_cache[key]
+        self.watcher._dir_cache[key] = (
+            st.st_mtime, st.st_size, files, subdirs, listed_at)
+
+    def test_race_revalidated_within_horizon(self):
+        # A new file in a directory that *looks* unchanged is still caught,
+        # because the stale listing is re-validated within the horizon.
+        self.watcher.revalidate_after = 0.05
+        target = self.watch / "d0" / "e0"
+        self._force_coarse_timestamp_race(target)
+        time.sleep(0.06)
+        changed, _removed = self.watcher.poll(self.watch)
+        self.assertIn("sneaky.txt", {p.name for p in changed})
+
+    def test_race_missed_beyond_horizon(self):
+        # Documents the failure mode the revalidation horizon guards
+        # against: with a long horizon the sneaky file waits for the next
+        # re-list.
+        self.watcher.revalidate_after = 999.0
+        target = self.watch / "d0" / "e0"
+        self._force_coarse_timestamp_race(target)
+        changed, _removed = self.watcher.poll(self.watch)
+        self.assertNotIn("sneaky.txt", {p.name for p in changed})
+
+    def test_unchanged_dir_is_not_relisted(self):
+        # Count scandir calls: a warm snapshot of an untouched tree must
+        # not re-list any directory (only stat the known files).
+        import os as _os
+
+        calls = []
+        real_scandir = _os.scandir
+        counting = lambda d: (calls.append(str(d)), real_scandir(d))[1]
+        _os.scandir = counting
+        try:
+            self.watcher.poll(self.watch)
+        finally:
+            _os.scandir = real_scandir
+        self.assertEqual(calls, [],
+                         "unchanged directories must not be re-scandir'ed")
+
+    def test_cache_disabled_uses_plain_snapshot(self):
+        from antivirus.monitor import DirectoryWatcher
+
+        scanner = self.watcher.scanner
+        w = DirectoryWatcher(scanner, self.watcher.quarantine, interval=1,
+                             log=lambda *a: None, cached_walk=False)
+        self.assertFalse(w.cached_walk)
+        w.poll(self.watch)  # baseline
+        changed, removed = w.poll(self.watch)
+        self.assertEqual(changed, [])
+        self.assertEqual(removed, [])
+
+
+class GuardDaemonTests(unittest.TestCase):
+    """v2.3: the detached background guard, end to end."""
+
+    def _setup_dirs(self):
+        base = Path(tempfile.mkdtemp(prefix="av-guard-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        self.base = base
+        self.watch = base / "watch"
+        self.watch.mkdir()
+        (self.watch / "clean.txt").write_text("all good\n")
+        self.state_dir = base / "state"
+        self.sigs = base / "sigs.json"
+        if BUNDLED_DB.exists():
+            shutil.copyfile(BUNDLED_DB, self.sigs)
+
+    def test_full_lifecycle(self):
+        from antivirus.guard import (guard_running, guard_status,
+                                     start_guard, stop_guard)
+        self._setup_dirs()
+        info = start_guard(
+            target=str(self.watch), action="quarantine", interval=0.5,
+            state_dir=str(self.state_dir),
+            signatures=str(self.sigs) if self.sigs.exists() else None,
+            wait=20)
+        self.addCleanup(lambda: stop_guard(str(self.state_dir)))
+        self.assertIsNotNone(info["pid"])
+        self.assertEqual(info["action"], "quarantine")
+        self.assertEqual(info["interval"], 0.5)
+
+        (self.watch / "dropped.txt").write_bytes(EICAR)
+        deadline = time.time() + 25
+        state = {}
+        while time.time() < deadline:
+            state = guard_status(self.state_dir)
+            if state.get("threats_found", 0) >= 1:
+                break
+            time.sleep(0.2)
+        self.assertGreaterEqual(state.get("threats_found", 0), 1,
+                                f"state: {state}")
+        self.assertTrue(state["running"])
+        self.assertFalse((self.watch / "dropped.txt").exists())
+        last = state.get("last_event") or {}
+        self.assertIn(last.get("event"),
+                      ("threat", "quarantined", "killed", "deleted"))
+        self.assertGreaterEqual(state.get("files_scanned", 0), 1)
+
+        self.assertEqual(guard_running(self.state_dir), info["pid"])
+
+        ok = stop_guard(str(self.state_dir))
+        self.assertTrue(ok)
+        self.assertIsNone(guard_running(self.state_dir))
+        state = guard_status(self.state_dir)
+        self.assertFalse(state["running"])
+        self.assertIsNotNone(state.get("stopped_at"))
+        self.assertFalse((self.state_dir / "guard.pid").exists())
+
+    def test_double_start_is_rejected(self):
+        from antivirus.guard import start_guard, stop_guard
+        self._setup_dirs()
+        info = start_guard(target=str(self.watch), interval=0.5,
+                           state_dir=str(self.state_dir),
+                           signatures=str(self.sigs) if self.sigs.exists()
+                           else None, wait=20)
+        self.addCleanup(lambda: stop_guard(str(self.state_dir)))
+        with self.assertRaises(RuntimeError):
+            start_guard(target=str(self.watch), interval=0.5,
+                        state_dir=str(self.state_dir), wait=1)
+        self.assertEqual(info["pid"], info["pid"])  # original still up
+
+    def test_start_missing_target_fails(self):
+        from antivirus.guard import start_guard
+        self._setup_dirs()
+        with self.assertRaises(FileNotFoundError):
+            start_guard(target=str(self.base / "nope"),
+                        state_dir=str(self.state_dir))
+
+    def test_stop_when_not_running_cleans_stale_files(self):
+        from antivirus.guard import guard_running, stop_guard
+        self._setup_dirs()
+        self.state_dir.mkdir()
+        (self.state_dir / "guard.pid").write_text("999999\n")
+        (self.state_dir / "guard.stop").write_text("stale\n")
+        self.assertTrue(stop_guard(str(self.state_dir)))
+        self.assertIsNone(guard_running(self.state_dir))
+        self.assertFalse((self.state_dir / "guard.pid").exists())
+        self.assertFalse((self.state_dir / "guard.stop").exists())
+
+    def test_initial_scan_action(self):
+        from antivirus.guard import guard_status, start_guard, stop_guard
+        self._setup_dirs()
+        (self.watch / "hidden.txt").write_bytes(EICAR)
+        info = start_guard(
+            target=str(self.watch), action="quarantine", interval=0.5,
+            initial=True, state_dir=str(self.state_dir),
+            signatures=str(self.sigs) if self.sigs.exists() else None,
+            wait=20)
+        self.addCleanup(lambda: stop_guard(str(self.state_dir)))
+        deadline = time.time() + 25
+        state = {}
+        while time.time() < deadline:
+            state = guard_status(self.state_dir)
+            if state.get("threats_found", 0) >= 1:
+                break
+            time.sleep(0.2)
+        self.assertGreaterEqual(state.get("threats_found", 0), 1)
+        self.assertFalse((self.watch / "hidden.txt").exists())
+        self.assertIn("initial scan",
+                      (self.state_dir / "guard.log").read_text())
+
+    def test_pid_alive_and_spawning_helpers(self):
+        from antivirus.guard import pid_alive, _spawn_kwargs
+        self.assertTrue(pid_alive(os.getpid()))
+        self.assertFalse(pid_alive(0))
+        self.assertFalse(pid_alive(-3))
+        kw = _spawn_kwargs()
+        if os.name == "nt":
+            flags = kw["creationflags"]
+            self.assertTrue(flags & 0x00000008)    # DETACHED_PROCESS
+            self.assertTrue(flags & 0x08000000)    # CREATE_NO_WINDOW
+        else:
+            import subprocess
+            self.assertTrue(kw["start_new_session"])
+            self.assertEqual(kw["stdout"], subprocess.DEVNULL)
+            self.assertEqual(kw["stdin"], subprocess.DEVNULL)
+
+
+class GuardCliTests(unittest.TestCase):
+    """v2.3: `antivirus guard` command plumbing."""
+
+    def test_parser_accepts_guard_subcommands(self):
+        from antivirus.cli import build_parser
+
+        p = build_parser()
+        args = p.parse_args(["guard", "start", "somewhere",
+                             "--action", "kill", "--interval", "2",
+                             "--initial"])
+        self.assertEqual(args.command, "guard")
+        self.assertEqual(args.gaction, "start")
+        self.assertEqual(args.target, "somewhere")
+        self.assertEqual(args.action, "kill")
+        self.assertEqual(args.interval, 2)
+        self.assertTrue(args.initial)
+
+        args = p.parse_args(["guard", "status"])
+        self.assertEqual(args.gaction, "status")
+        self.assertEqual(args.state_dir, "guard")
+
+        args = p.parse_args(["guard", "log", "--lines", "7"])
+        self.assertEqual(args.gaction, "log")
+        self.assertEqual(args.lines, 7)
+
+        args = p.parse_args(["guard", "_daemon", "--state-dir", "s",
+                             "--target", "t"])
+        self.assertEqual(args.gaction, "_daemon")
+
+    def test_status_without_any_daemon(self):
+        from antivirus.guard import guard_status
+        base = Path(tempfile.mkdtemp(prefix="av-gcli-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        state = guard_status(base / "state")
+        self.assertFalse(state["running"])
+        self.assertIsNone(state.get("pid"))
+
+
 if __name__ == "__main__":
     unittest.main()

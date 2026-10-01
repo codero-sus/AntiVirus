@@ -83,6 +83,13 @@ watches folders for new/changed files, and writes JSON + text reports.
   files as *neutralized* (inert, not re-flagged); threats inside archives
   are neutralized by obfuscating the container
 - **Directory monitor** — polls a tree and scans every new/changed file
+- **Background guard** — `guard start` runs the monitor as a **detached
+  background daemon** (no terminal, no console window): it auto-scans every
+  new/changed file as it appears and acts on threats (quarantine / kill /
+  delete). Lightweight by design: a stat-only **incremental walk** that
+  never re-lists an unchanged directory, no report files (a small rotating
+  `guard.log` instead), and a single Python process — controlled with
+  `guard start | stop | status | log`
 - **Reports** — every scan writes a JSON report and a human-readable text
   report
 - **Signature editor** — add your own signatures from the CLI (hash or
@@ -177,6 +184,11 @@ python3 -m antivirus quarantine purge 275a021bbfb6
 
 # 5. Watch a folder in (near) real time
 python3 -m antivirus monitor . --action quarantine
+
+# 5b. …or run the same protection as a lightweight background daemon
+python3 -m antivirus guard start . --action quarantine
+python3 -m antivirus guard status
+python3 -m antivirus guard stop
 
 # 6. Look at the reports
 python3 -m antivirus report list
@@ -512,12 +524,68 @@ Scan improvements that come with it:
 > the key to a safe. Obfuscation here is a neutralization mechanism for a
 > detected file, not a general-purpose encryption service.
 
+## Background guard
+
+`antivirus guard` runs continuous protection **in the background**: a
+detached daemon watches a directory and scans every file that is created or
+modified — no full rescan on demand, nothing to babysit.
+
+```console
+$ antivirus guard start ~/downloads --action quarantine
+ Guard started in the background (pid 1234)
+  target:   ~/downloads
+  action:   quarantine   interval: 5s
+  state:    guard
+  antivirus guard status | antivirus guard log | antivirus guard stop
+
+$ drop suspicious.exe into ~/downloads …
+
+$ antivirus guard status
+ Guard running  (pid 1234)
+  scanned:  3 new/changed file(s), 1 threat(s)
+  last:     quarantined as 9f3c…-20261001-131200-ab12cd
+
+$ antivirus guard log            # recent log lines
+[2026-10-01T13:12:00Z] [alert] THREAT [CRITICAL] EICAR-Test-File: …
+[2026-10-01T13:12:00Z] [ok] quarantined as 9f3c…
+
+$ antivirus guard stop
+```
+
+How it stays lightweight:
+
+* **Stat-only incremental walk** — each poll stats files instead of reading
+  them, and a directory whose own timestamp/size is unchanged is *not
+  re-listed at all* (its known entries are only stat'ed). A directory is
+  re-listed at least every 10 s as a safety net against filesystems with
+  coarse or lazily-updated directory timestamps.
+* **No initial scan by default** — the first poll only establishes a
+  baseline; add `--initial` for one full scan of the tree at startup.
+* **No report files** — the daemon keeps a small `guard.log` (rotated at
+  1 MiB) and a one-line `guard.json` state; quarantine and the kill registry
+  live inside the state dir too, so everything the guard owns is in one
+  place (default `./guard`).
+* **One detached process** — spawned without a terminal (POSIX: new session
+  + `/dev/null` stdio; Windows: `DETACHED_PROCESS | CREATE_NO_WINDOW`), so
+  it survives the shell that started it. `guard stop` sends a graceful stop
+  sentinel (force-kill only as a last resort); `guard start` refuses while
+  a guard is already running for the same state dir.
+
+| Subcommand | What it does |
+| --- | --- |
+| `guard start [TARGET] [--action detect\|quarantine\|kill\|delete] [--interval 5] [--initial] [--state-dir DIR] [--signatures FILE]` | Start the guard in the background (default target `.`) |
+| `guard stop [--state-dir DIR]` | Stop it gracefully (sentinel, then force-kill if stuck) |
+| `guard status [--state-dir DIR]` | Running? pid, target, action, counters, last event |
+| `guard log [--lines N] [--state-dir DIR]` | Show recent log lines |
+
 ## Command reference
 
 | Command | Description |
 | --- | --- |
 | `scan TARGET [--action detect\|quarantine\|kill\|delete] [--threads N] [--no-behavior] [--fast] [--no-cache] [--no-archives] [--exclude GLOB] [--since DURATION] [--baseline FILE] [--json]` | Scan a file or directory tree (`--threads`: auto, N, or 1; `--fast`: hash+pattern only; `--exclude` repeatable; `--since 30m/2h/1d`: only recently modified files; `--baseline`: integrity check vs a manifest; `kill`: obfuscate in place, key/IV to the registry) |
 | `monitor TARGET [--action ...] [--interval 2] [--no-behavior] [--no-archives] [--exclude GLOB] [--since DURATION] [--json]` | Watch a directory, scan new/changed files (`--json`: one JSON object per event; actions include `kill`) |
+| `guard start [TARGET] [--action …] [--interval 5] [--initial] [--state-dir DIR]` | Start the background guard: auto-scan new/changed files, detached, lightweight |
+| `guard stop` / `guard status` / `guard log [--lines N]` | Stop / inspect / tail the background guard |
 | `hash FILE… [--json]` | Print SHA-256 / MD5 / SHA-1 digests + size of each file |
 | `behavior analyze FILE [--json]` | Show what one file appears to do (static behavioural analysis) |
 | `pe analyze FILE [--json]` | Full static PE dissection ("debug report") + red-flag indicators |
@@ -706,7 +774,9 @@ antivirus/
 ├── scanner.py       # single-pass hashing, patterns, behaviour, heuristics
 ├── signatures.py    # JSON signature database (load/add/save) + IOC parser
 ├── quarantine.py    # quarantine store with manifest, restore, purge
-├── monitor.py       # polling directory watcher (structured events)
+├── monitor.py       # polling directory watcher (structured events,
+│                    #   incremental cached walk for the guard)
+├── guard.py         # background guard: detached daemon + start/stop/status
 ├── report.py        # JSON + text report writer, diff, summary, export
 ├── selftest.py      # built-in end-to-end self test
 ├── output.py        # tiny ANSI colour helper

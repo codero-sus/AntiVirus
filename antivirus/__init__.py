@@ -19,6 +19,8 @@ Features
   revivable, auditable, and rescan-aware (killed files stay inert)
 * Rescue disk: self-contained kit + ISO 9660 image for scanning a system
   from a live environment (quarantine stays on the rescue side)
+* Background guard: detached, lightweight real-time watch that auto-scans
+  new/changed files (stat-only incremental walk, no external deps)
 * Multiple front-ends: CLI, Tkinter GUI, curses TUI, web console —
   and a plain-module API for embedding in your own code
 * Runs on Windows, Linux and macOS (the curses TUI is Unix-only; the
@@ -47,7 +49,7 @@ Everything is standard library only (Tkinter/curses are optional and used
 only by their respective front-ends).
 """
 
-__version__ = "2.2.0"
+__version__ = "2.3.0"
 
 from .api import (  # noqa: E402
     Antivirus,

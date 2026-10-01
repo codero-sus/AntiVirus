@@ -321,6 +321,82 @@ def cmd_quarantine(args) -> int:
         return 2
 
 
+# ---------------------------------------------------------------------- guard
+def cmd_guard(args) -> int:
+    from .guard import (
+        guard_running,
+        guard_status,
+        run_daemon_cli,
+        start_guard,
+        stop_guard,
+        tail_log,
+    )
+
+    if args.gaction == "_daemon":  # spawned by `guard start`; hidden
+        return run_daemon_cli(args)
+
+    if args.gaction == "start":
+        try:
+            info = start_guard(
+                args.target, action=args.action, interval=args.interval,
+                initial=args.initial, state_dir=args.state_dir,
+                signatures=args.signatures)
+        except (OSError, ValueError, RuntimeError, FileNotFoundError) as exc:
+            print(paint(f"error: {exc}", RED), file=sys.stderr)
+            return 2
+        print(paint(f" Guard started in the background (pid {info['pid']})", GREEN))
+        print(f"  target:   {info['target']}")
+        print(f"  action:   {info['action']}   interval: {info['interval']:g}s")
+        print(f"  state:    {info['state_dir']}")
+        print("  antivirus guard status | antivirus guard log | antivirus guard stop")
+        return 0
+
+    status = guard_status(args.state_dir)
+    if args.gaction == "stop":
+        if guard_running(args.state_dir) is None:
+            print("No guard is running.")
+            stop_guard(args.state_dir)  # clean up any stale files
+            return 0
+        print("Stopping guard …", flush=True)
+        ok = stop_guard(args.state_dir)
+        print(paint(" Guard stopped." if ok else
+                    " Guard could not be stopped.",
+                    GREEN if ok else RED))
+        return 0 if ok else 2
+
+    if args.gaction == "status":
+        if not status["running"]:
+            last = status.get("last_event") or {}
+            print("Guard is not running.")
+            if status.get("stopped_at"):
+                print(f" Last run: started {status.get('started_at')}, "
+                      f"stopped {status['stopped_at']}, "
+                      f"{status.get('files_scanned', 0)} file(s) scanned, "
+                      f"{status.get('threats_found', 0)} threat(s).")
+            return 0
+        print(paint(" Guard running", GREEN) + f"  (pid {status['pid']})")
+        print(f"  target:   {status['target']}")
+        print(f"  action:   {status['action']}   interval: "
+              f"{status['interval']:g}s")
+        print(f"  started:  {status['started_at']}")
+        print(f"  scanned:  {status['files_scanned']} new/changed file(s), "
+              f"{status['threats_found']} threat(s)")
+        le = status.get("last_event") or {}
+        if le:
+            print(f"  last:     [{le.get('event')}] {le.get('path', '')}")
+        print(f"  state:    {status['state_dir']}")
+        return 0
+
+    # guard log
+    lines = tail_log(args.state_dir, args.lines)
+    if not lines:
+        print("Guard log is empty.")
+        return 0
+    for line in lines:
+        print(line)
+    return 0
+
+
 # ----------------------------------------------------------------------- kill
 def cmd_kill(args) -> int:
     from .kill import KillRegistry
@@ -1206,6 +1282,50 @@ def build_parser() -> argparse.ArgumentParser:
                               "registry entry (irreversible)")
     kp.add_argument("id", help="kill registry id (a prefix is enough)")
 
+    p = sub.add_parser(
+        "guard", help="background real-time guard: auto-scan new/changed "
+                      "files, detached and lightweight")
+    gsub = p.add_subparsers(dest="gaction", required=True)
+
+    gs = gsub.add_parser("start", help="start the guard in the background")
+    gs.add_argument("target", nargs="?", default=".",
+                    help="directory to watch (default .)")
+    gs.add_argument("--action",
+                    choices=("detect", "quarantine", "kill", "delete"),
+                    default="quarantine",
+                    help="what to do with threats (default quarantine)")
+    gs.add_argument("--interval", type=float, default=5.0, metavar="SECONDS",
+                    help="poll interval in seconds (default 5, min 0.5)")
+    gs.add_argument("--initial", action="store_true",
+                    help="run one full scan of the tree at startup "
+                         "(default: watch new/changed files only)")
+    gs.add_argument("--state-dir", default="guard", metavar="DIR",
+                    help="where pid/state/log/quarantine live (default "
+                         "./guard)")
+    gs.add_argument("--signatures", default=None, metavar="FILE",
+                    help="signature database (default: the usual one)")
+
+    gstop = gsub.add_parser("stop", help="stop the background guard")
+    gstop.add_argument("--state-dir", default="guard", metavar="DIR")
+
+    gstat = gsub.add_parser("status", help="show guard status")
+    gstat.add_argument("--state-dir", default="guard", metavar="DIR")
+
+    gl = gsub.add_parser("log", help="show recent guard log lines")
+    gl.add_argument("--state-dir", default="guard", metavar="DIR")
+    gl.add_argument("--lines", type=int, default=30, metavar="N",
+                    help="how many lines (default 30)")
+
+    gd = gsub.add_parser("_daemon", help=argparse.SUPPRESS)
+    gd.add_argument("--state-dir", default="guard")
+    gd.add_argument("--target", required=True)
+    gd.add_argument("--action",
+                    choices=("detect", "quarantine", "kill", "delete"),
+                    default="quarantine")
+    gd.add_argument("--interval", type=float, default=5.0)
+    gd.add_argument("--initial", action="store_true")
+    gd.add_argument("--signatures", default=None)
+
     p = sub.add_parser("sig", help="inspect or extend the signature database")
     _common_options(p)
     ssub = p.add_subparsers(dest="saction", required=True)
@@ -1417,6 +1537,7 @@ _COMMANDS = {
     "monitor": cmd_monitor,
     "quarantine": cmd_quarantine,
     "kill": cmd_kill,
+    "guard": cmd_guard,
     "sig": cmd_sig,
     "behavior": cmd_behavior,
     "pe": cmd_pe,

@@ -13,6 +13,7 @@ import re
 import shutil
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import List, Optional
 
@@ -471,6 +472,52 @@ def run_selftest(signatures_file: Optional[str] = None) -> int:
               and st["quarantine"]["items"] == len(quarantine.items())
               and st["reports"]["reports"] >= 1,
               str(st.get("signatures")))
+
+        # -- background guard (v2.3) -------------------------------------------
+        from .guard import (
+            guard_running,
+            guard_status,
+            start_guard,
+            stop_guard,
+        )
+
+        guard_dir = workdir / "guard"
+        watch_dir = workdir / "guard-watch"
+        watch_dir.mkdir()
+        (watch_dir / "clean.txt").write_text("nothing to see here\n")
+        try:
+            info = start_guard(
+                target=str(watch_dir), action="quarantine", interval=0.5,
+                state_dir=str(guard_dir),
+                signatures=str(config.signatures_file))
+            check("guard: daemon starts detached and reports its pid",
+                  info.get("pid") is not None
+                  and guard_running(guard_dir) == info["pid"],
+                  str(info))
+            (watch_dir / "dropped.txt").write_bytes(EICAR)
+            deadline = time.time() + 20
+            state = {}
+            while time.time() < deadline:
+                state = guard_status(guard_dir)
+                if state.get("threats_found", 0) >= 1:
+                    break
+                time.sleep(0.2)
+            check("guard: dropped EICAR auto-quarantined within 20 s",
+                  state.get("threats_found", 0) >= 1
+                  and not (watch_dir / "dropped.txt").exists(),
+                  str(state))
+            last = state.get("last_event") or {}
+            check("guard: state records the threat and the counters",
+                  state.get("action") == "quarantine"
+                  and last.get("event") in ("threat", "quarantined",
+                                            "killed", "deleted")
+                  and state.get("files_scanned", 0) >= 1,
+                  str(state))
+            check("guard: stop returns and clears the pid",
+                  stop_guard(str(guard_dir))
+                  and guard_running(guard_dir) is None)
+        except Exception as exc:  # keep the self test informative
+            check("guard: daemon lifecycle", False, repr(exc))
 
         # -- rescue disk (v2.0) ------------------------------------------------
         from .rescue import (
