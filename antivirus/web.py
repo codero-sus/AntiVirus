@@ -22,6 +22,8 @@ Serves a single-page dashboard plus a small JSON API:
     GET  /api/kill             kill registry (key/IV entries)
     POST /api/kill/revive      {"id"} – restore a killed file's bytes
     POST /api/kill/purge       {"id"} – destroy a killed file + entry
+    GET  /api/webshield        ?url=… – score URL(s), or the intel DB
+    GET  /api/firewall         live connection snapshot + alerts
 
 Scans run in background threads (jobs) so the UI can poll live progress.
 This is a *local* tool: there is no authentication – bind it to an
@@ -586,6 +588,10 @@ a{color:#2f81f7}
     restore a killed file's original bytes using the registry's key/IV</td></tr>
 <tr><td><code>/api/kill/purge</code></td><td>POST</td><td><code>{"id"}</code> —
     permanently delete a killed file and its registry entry</td></tr>
+<tr><td><code>/api/webshield</code></td><td>GET</td><td><code>?url=…</code>
+    (repeatable) — web shield verdicts; without a URL: the threat-intel DB</td></tr>
+<tr><td><code>/api/firewall</code></td><td>GET</td><td>live network-connection
+    snapshot + security alerts (501 when the platform has no table)</td></tr>
 <tr><td><code>/api/docs</code></td><td>GET</td><td>this page</td></tr>
 </table>
 <h2>Example (curl)</h2>
@@ -993,6 +999,10 @@ class _Handler(BaseHTTPRequestHandler):
                 items = [asdict(i) for i in self.app.kill_registry.entries()]
                 self._json(200, {"items": items,
                                  "registry": str(self.app.kill_registry.path)})
+            elif path == "/api/webshield":
+                self._webshield()
+            elif path == "/api/firewall":
+                self._firewall()
             elif path == "/api/docs":
                 self._send(200, DOCS_PAGE.encode("utf-8"),
                            "text/html; charset=utf-8")
@@ -1089,6 +1099,35 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(404, {"error": f"no such file: {path}"})
             return
         self._json(200, info)
+
+    def _webshield(self) -> None:
+        from urllib.parse import parse_qs
+
+        from . import webshield
+
+        query = parse_qs(urlsplit(self.path).query)
+        intel = self.scanner.threat_intel()
+        urls = [u for u in query.get("url", [])][:10]
+        if urls:
+            reports = [webshield.check_url(u, intel) for u in urls]
+            self._json(200, {"reports": reports, "intel": intel.summary()})
+        else:
+            self._json(200, {
+                "intel": intel.summary(),
+                "domains": sorted(intel.domains),
+                "ips": sorted(intel.ips),
+                "ports": intel.ports,
+                "listen_ports": intel.listen_ports,
+                "user_file": str(intel.path),
+            })
+
+    def _firewall(self) -> None:
+        from . import firewall
+
+        try:
+            self._json(200, firewall.scan())
+        except RuntimeError as exc:
+            self._json(501, {"error": str(exc)})
 
     def _verify(self) -> None:
         from urllib.parse import parse_qs

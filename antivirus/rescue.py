@@ -43,8 +43,8 @@ from .signatures import SignatureDB
 
 #: Files the kit always contains (besides the ``antivirus/`` package dir).
 KIT_FILES = ("run-rescue.py", "bootstrap.sh", "bootstrap.bat",
-             "signatures.json", "antivirus.zip", "rescue-manifest.json",
-             "README-RESCUE.txt")
+             "signatures.json", "threat_intel.json", "antivirus.zip",
+             "rescue-manifest.json", "README-RESCUE.txt")
 
 RUN_RESCUE_SCRIPT = '''#!/usr/bin/env python3
 """AntiVirus rescue runner — scan a mounted system volume from a live system.
@@ -334,6 +334,20 @@ def build_rescue_kit(out_dir: Path,
     else:
         shutil.copyfile(sig_src, sig_dst)
     sig_count = len(SignatureDB(sig_dst).list())
+
+    # Threat-intel snapshot (web shield + firewall), same fallback chain.
+    intel_candidates = [Path.cwd() / "data" / "threat_intel.json",
+                        pkg_src.parent / "data" / "threat_intel.json"]
+    intel_src = next((p for p in intel_candidates if p.is_file()), None)
+    intel_dst = kit / "threat_intel.json"
+    if intel_src is not None:
+        shutil.copyfile(intel_src, intel_dst)
+    else:  # pragma: no cover - the bundled file always exists
+        intel_dst.write_text(
+            json.dumps({"version": 1, "domains": [], "ips": [],
+                        "ports": {}, "listen_ports": {},
+                        "shorteners": []}, indent=2) + "\n",
+            encoding="utf-8")
 
     zip_bytes = _package_zip_bytes()
     (kit / "antivirus.zip").write_bytes(zip_bytes)

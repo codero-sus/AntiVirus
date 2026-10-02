@@ -90,6 +90,22 @@ watches folders for new/changed files, and writes JSON + text reports.
   never re-lists an unchanged directory, no report files (a small rotating
   `guard.log` instead), and a single Python process — controlled with
   `guard start | stop | status | log`
+- **Suspicion engine** — a signature-independent 0-100 risk score from what
+  a file *looks* like (document-disguised binaries, double extensions,
+  malware-typical name words, random names, suspicious locations, high
+  entropy): suspicious new files are flagged — and the guard quarantines
+  them — with no known signature at all
+- **Web shield** — every scanned file is read for URLs and each URL is
+  scored (threat-intel blocklist, URL shorteners, IP hosts, embedded
+  credentials, executable-looking links, backdoor ports); malicious URLs
+  in a file are a high-severity finding; `urlcheck` / `webshield add|show`
+  manage it, `GET /api/webshield` in the console
+- **Firewall** — a live, no-root connection-table audit that flags backdoor
+  ports (4444/4431/5555/31337/…), blocklisted remote IPs, risky listeners
+  (telnet/FTP/VNC/RDP/SMB) and odd outbound ports; `firewall scan|monitor`,
+  `GET /api/firewall`
+- **Benchmark** — `benchmark` runs the fully-labelled 25-file sample corpus
+  and reports recall + false positives (100% / 0 on the bundled set)
 - **Reports** — every scan writes a JSON report and a human-readable text
   report
 - **Signature editor** — add your own signatures from the CLI (hash or
@@ -189,6 +205,12 @@ python3 -m antivirus monitor . --action quarantine
 python3 -m antivirus guard start . --action quarantine
 python3 -m antivirus guard status
 python3 -m antivirus guard stop
+
+# 5c. Score how suspicious a file looks / check URLs / audit the network
+python3 -m antivirus risk invoice.pdf.exe
+python3 -m antivirus urlcheck http://c2node.evilcorp.invalid/x
+python3 -m antivirus firewall scan
+python3 -m antivirus benchmark          # 100% recall, 0 false positives
 
 # 6. Look at the reports
 python3 -m antivirus report list
@@ -310,13 +332,24 @@ For every regular file (symlinks, build dirs and VCS metadata are skipped):
    expansion beyond the 64 MiB budget are flagged. Gzip streams are
    decompressed in memory and, if they contain a TAR, are scanned member
    by member. Nothing is ever extracted to disk.
+5b. **Web shield** – the file's bytes are also scanned for `http(s)` /
+   `ftp` URLs and each one is scored against the threat-intel blocklist +
+   heuristics (shorteners, IP hosts, credentials, executable-looking
+   links, backdoor ports). A malicious URL is a high-severity
+   `malicious_url` finding, a suspicious one a `suspicious_url`.
+5c. **Suspicion engine** – if still nothing matched, the file's risk score
+   (document-disguised binaries, double extensions, malware-typical name
+   words, random names, suspicious locations, entropy) is computed;
+   ≥ 45 is reported as `suspicious` (medium, high at ≥ 70) – the layer
+   that lets the guard act on odd new files with no known signature.
 6. If still nothing matched, the **heuristic** verdict is made from the
    already-collected histogram: ≥ 7.5 bits/byte on files ≥ 256 KiB is
    reported as "may be packed or encrypted".
 
    **Scan cache:** before any of the above, a file whose size *and* mtime
    are unchanged since the last scan (and whose engine profile – signature
-   DB version, behaviour/entropy/archive settings – is the same) reuses
+   DB version, behaviour/entropy/archive/risk/web-shield settings – is the
+   same) reuses
    its cached verdict without being read at all. The cache lives in
    `.av-cache` (JSON, atomically written) and is bypassed with
    `--no-cache`; `--fast` runs layers 1–2 only.
@@ -578,6 +611,122 @@ How it stays lightweight:
 | `guard status [--state-dir DIR]` | Running? pid, target, action, counters, last event |
 | `guard log [--lines N] [--state-dir DIR]` | Show recent log lines |
 
+## Suspicion engine
+
+Signatures only catch what you already know. The **risk engine** scores how
+suspicious a file *looks*, independently of any signature match:
+
+| Signal | Weight |
+| --- | --- |
+| claims to be a document/image but contains a PE / ZIP / ELF / OLE2 binary | +35 |
+| double extension (`invoice.pdf.exe`), +document disguise | +30 (+15) |
+| executable / script extension | +12 |
+| malware-typical name words (`crack`, `keygen`, `update`, …) | up to +16 |
+| random-looking filename (high name entropy) | +8 |
+| suspicious parent directory (Downloads, temp, …) | +8 |
+| very high entropy ≥ 7.6 bits/byte (packed / encrypted) | +25 |
+| executable bit on a "data" file / stub-size `.exe` | +6 |
+
+A file scoring **≥ 45** (`Config.risk_threshold`) produces a `suspicious`
+finding (medium, or high at ≥ 70) — and since the scanner emits it like any
+other layer, **the background guard quarantines suspicious drops
+automatically**, with no known signature involved:
+
+```console
+$ antivirus guard start ~/downloads --action quarantine
+$ antivirus guard log
+[03:09:14Z] [alert] THREAT [HIGH] SuspiciousFile: downloads/invoice.pdf.exe
+[03:09:14Z] [ok] quarantined as 7d0d394357eb-…
+```
+
+```bash
+antivirus risk invoice.pdf.exe
+  71/100 [SUSPICIOUS] [##############······]  invoice.pdf.exe
+        +30  double extension ('.pdf.exe') - classic disguise
+        +15  disguised as a common document type ('.pdf')
+        +12  executable/script extension '.exe'
+```
+
+## Web shield
+
+The file-scanner half of a web filter: **every file we scan is also read
+for URLs** (scripts, notes, PE resource strings – the regex runs on raw
+bytes, so it works anywhere), and each URL is scored against a
+threat-intel database plus heuristics:
+
+* domain / parent-zone / IP in the **blocklist** → malicious (decisive)
+* **URL shorteners** (bit.ly, tinyurl, …) → suspicious
+* **IP literal** instead of a domain, **embedded credentials**, `ftp://`
+* **executable-looking link** (`…/update.exe`), long random path token
+* remote port on a **known backdoor port** (4444, 5555, 31337, …)
+
+Malicious URLs in a file produce a `malicious_url` finding (high),
+suspicious ones a `suspicious_url` (medium) — again visible to every
+front-end, including the guard.
+
+```bash
+antivirus urlcheck http://c2node.evilcorp.invalid/drop/x.exe
+  MALICIOUS (100) http://c2node.evilcorp.invalid/drop/x.exe
+             - domain 'c2node.evilcorp.invalid' is in the threat-intel blocklist
+antivirus urlcheck --from notes.txt    # extract + check every URL in a file
+antivirus webshield add my-bad-host.invalid   # extend the blocklist
+antivirus webshield show
+```
+
+The bundled `data/threat_intel.json` is **educational**: domains use the
+reserved `.invalid` / `example` TLDs (RFC 2606 – they can never resolve)
+and IPs use reserved documentation ranges. Add real indicators with
+`webshield add` (persisted to `intel/user_intel.json`) or a plain-text IOC
+import. Web console: `GET /api/webshield?url=…`.
+
+## Firewall
+
+A live **network-connection audit** — a monitor, not a packet filter.
+Reading the OS connection table needs no privileges, so it runs as any
+user (Linux: `/proc/net/tcp{,6}`; elsewhere: `netstat` fallback):
+
+* **backdoor port** — remote peer on 4444 / 4431 / 5555 / 31337 / 1337 /
+  6667 (high)
+* **blocklisted IP** — remote peer in the threat-intel IP list (high)
+* **risky listener** — telnet, FTP, VNC, RDP, SMB, MS-RPC listening
+  (medium)
+* **odd outbound port** — established TCP to a non-standard port (low)
+
+```console
+$ antivirus firewall scan
+Connections:  59 (source: proc)
+Intel:        6 domains, 2 IPs, 7 risky ports
+Alerts:       none – nothing looks wrong
+$ antivirus firewall monitor --interval 5
+[14:22:31] [   HIGH]  backdoor_port: remote peer on port 4444 (classic reverse shell / Metasploit default)
+             tcp6 10.0.0.5:51234 <-> 192.0.2.10:4444 [ESTABLISHED]
+```
+
+Same intel database as the web shield, so `webshield add` feeds both. Web
+console: `GET /api/firewall`.
+
+## Benchmark – can it beat AVG / Avast?
+
+`antivirus benchmark` runs the bundled, **fully-labelled sample corpus**
+(25 files: EICAR string, behavioural scripts, code-less PE/ELF images,
+sneaky archives, disguised doubles, packed blobs, malicious links + clean
+documents/images) through the full engine and reports recall and false
+positives:
+
+```console
+$ antivirus benchmark
+ 15/15 threats detected, 0 false positives  (0.014 s)
+```
+
+The honest framing: on *this* corpus it scores perfectly, which proves the
+layers work together and gives you a regression check when you add
+signatures or intel. It is **not** a claim of commercial parity — real
+detection coverage comes from a large, continuously updated signature and
+intelligence base, which this educational engine replaces with *your own*
+signatures, IOCs and the heuristic layers above (plus the kill engine,
+guard, quarantine and rescue workflows commercial products also charge
+for). Extend it, benchmark again, and watch the numbers move.
+
 ## Command reference
 
 | Command | Description |
@@ -586,6 +735,12 @@ How it stays lightweight:
 | `monitor TARGET [--action ...] [--interval 2] [--no-behavior] [--no-archives] [--exclude GLOB] [--since DURATION] [--json]` | Watch a directory, scan new/changed files (`--json`: one JSON object per event; actions include `kill`) |
 | `guard start [TARGET] [--action …] [--interval 5] [--initial] [--state-dir DIR]` | Start the background guard: auto-scan new/changed files, detached, lightweight |
 | `guard stop` / `guard status` / `guard log [--lines N]` | Stop / inspect / tail the background guard |
+| `risk FILE… [--threshold N] [--json]` | Score how suspicious files *look* (0-100 + reasons, no signatures) |
+| `urlcheck URL… [--from FILE] [--json]` | Web shield: check URLs – or every URL found inside a file |
+| `webshield show` / `webshield add DOMAIN\|IP\|PORT [--note …]` | View / extend the threat-intel database |
+| `firewall scan [--json] [--quiet]` | Live connection audit (no root): backdoor ports, blocklisted IPs, risky listeners |
+| `firewall monitor [--interval 5]` | Watch for new suspicious connections |
+| `benchmark [--samples DIR] [--json]` | Run the labelled sample corpus: recall + false positives |
 | `hash FILE… [--json]` | Print SHA-256 / MD5 / SHA-1 digests + size of each file |
 | `behavior analyze FILE [--json]` | Show what one file appears to do (static behavioural analysis) |
 | `pe analyze FILE [--json]` | Full static PE dissection ("debug report") + red-flag indicators |
@@ -645,6 +800,11 @@ av.file_info("suspicious.bin")        # type (magic), size, mtime, sha256, md5
 baseline = av.manifest("some/dir")    # integrity baseline (dict)
 av.save_manifest(baseline, "baseline.json")
 av.verify("some/dir", "baseline.json")   # fast hash-only diff -> [Finding, …]
+av.risk("invoice.pdf.exe")            # -> {score, suspicious, reasons}
+av.check_url("http://c2node.evilcorp.invalid/x")  # web shield verdict
+av.extract_urls(data)                 # every URL found in bytes
+av.firewall_scan()                    # live connections + alerts (no root)
+av.threat_intel().add_domain("bad.host")  # extend the blocklist
 av.quarantine.restore("275a021b-…")
 av.remove_signature("AV-MINE-001")
 
@@ -724,6 +884,8 @@ JSON API (useful for scripting / your own front-end):
 | `/api/kill` | GET | kill registry — in-place killed files + stored key/IV |
 | `/api/kill/revive` | POST | `{"id"}` — restore a killed file's original bytes |
 | `/api/kill/purge` | POST | `{"id"}` — destroy a killed file and its registry entry |
+| `/api/webshield` | GET | `?url=…` (repeatable) — URL verdicts; no URL: the threat-intel DB |
+| `/api/firewall` | GET | live connection snapshot + security alerts |
 | `/api/docs` | GET | in-browser API documentation |
 
 The console binds to `0.0.0.0` by default and has **no authentication** —
@@ -777,16 +939,23 @@ antivirus/
 ├── monitor.py       # polling directory watcher (structured events,
 │                    #   incremental cached walk for the guard)
 ├── guard.py         # background guard: detached daemon + start/stop/status
+├── risk.py          # suspicion engine: 0-100 risk score per file
+├── webshield.py     # web shield: URL extraction + reputation scoring
+├── firewall.py      # live connection-table audit (no root needed)
+├── benchmark.py     # labelled-corpus detection benchmark
 ├── report.py        # JSON + text report writer, diff, summary, export
 ├── selftest.py      # built-in end-to-end self test
 ├── output.py        # tiny ANSI colour helper
 └── utils.py         # shared helpers
 data/
-└── signatures.json  # bundled signature database (EICAR test string)
+├── signatures.json    # bundled signature database (EICAR test string)
+└── threat_intel.json  # bundled threat intel (blocklist domains/IPs/ports)
 samples/
-├── eicar-test.txt   # the standard 68-byte harmless AV test string
+├── eicar-test.txt     # the standard 68-byte harmless AV test string
 ├── clean.txt
-└── behavior/        # inert behavioural demo samples (scripts + fake PE)
+├── behavior/          # inert behavioural demo samples (scripts + fake PE)
+├── suspicious/        # risk-engine + web-shield corpus (inert)
+└── clean/             # labelled-clean corpus (images, CSV, notes, script)
 tests/
 └── test_antivirus.py
 ```

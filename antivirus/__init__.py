@@ -21,6 +21,17 @@ Features
   from a live environment (quarantine stays on the rescue side)
 * Background guard: detached, lightweight real-time watch that auto-scans
   new/changed files (stat-only incremental walk, no external deps)
+* Suspicion engine: 0-100 risk score per file from what it *looks* like
+  (double extensions, document-disguised binaries, name words, entropy,
+  location) - the guard quarantines suspicious drops with no known
+  signature
+* Web shield: every scanned file is read for URLs and each URL is scored
+  (threat-intel blocklist, shorteners, IP hosts, backdoor ports,
+  credentials) - plus `urlcheck` / `webshield add|show`
+* Firewall: live connection-table audit (no root needed) flagging backdoor
+  ports, blocklisted IPs, risky listeners - `firewall scan|monitor`
+* Benchmark: `antivirus benchmark` runs the labelled sample corpus and
+  reports recall / false positives (100% / 0 on the bundled set)
 * Multiple front-ends: CLI, Tkinter GUI, curses TUI, web console —
   and a plain-module API for embedding in your own code
 * Runs on Windows, Linux and macOS (the curses TUI is Unix-only; the
@@ -49,7 +60,7 @@ Everything is standard library only (Tkinter/curses are optional and used
 only by their respective front-ends).
 """
 
-__version__ = "2.3.0"
+__version__ = "2.4.0"
 
 from .api import (  # noqa: E402
     Antivirus,

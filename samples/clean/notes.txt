@@ -1,0 +1,5 @@
+Meeting notes (DEMO - clean sample)
+
+- Ship the demo on Friday
+- Docs: https://www.example.com/docs/getting-started
+- Read the manual before updating

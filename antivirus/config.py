@@ -47,6 +47,18 @@ class Config:
     # Heuristics.
     entropy_threshold: float = 7.5              # bits/byte
     entropy_min_size: int = 256 * 1024          # only test files >= 256 KiB
+
+    # Suspicion engine (v2.4): score how *suspicious* a file looks,
+    # independent of any signature match (extension tricks, name words,
+    # content/type mismatch, entropy, location, …).
+    risk_enabled: bool = True
+    risk_threshold: int = 45                    # score that triggers a finding
+
+    # Web shield (v2.4): score every URL found inside files against the
+    # threat-intel DB + heuristics (shorteners, IP hosts, backdoor ports).
+    webshield_enabled: bool = True
+    threat_intel_file: Path = Path("data/threat_intel.json")
+    intel_user_file: Path = Path("intel/user_intel.json")
     # 256 KiB of samples is statistically enough to estimate byte entropy
     # within ~0.01 bits/byte, and keeps the in-pass histogram cheap.
     entropy_sample_size: int = 256 * 1024

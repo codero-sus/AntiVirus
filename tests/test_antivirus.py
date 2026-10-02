@@ -2320,7 +2320,8 @@ class RescueKitTests(unittest.TestCase):
             __import__("hashlib").sha256(EICAR).hexdigest()))
 
     def test_iso_variant_verify(self):
-        from antivirus.rescue import build_rescue_disk, verify_kit
+        from antivirus.rescue import (KIT_FILES, build_rescue_disk,
+                                      verify_kit)
 
         base = Path(tempfile.mkdtemp(prefix="av-riso-"))
         self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
@@ -2331,9 +2332,7 @@ class RescueKitTests(unittest.TestCase):
         # simulate an ISO mount: zip variant, no antivirus/ directory
         mounted = base / "mounted"
         mounted.mkdir()
-        for name in ("antivirus.zip", "run-rescue.py", "signatures.json",
-                     "rescue-manifest.json", "bootstrap.sh",
-                     "bootstrap.bat", "README-RESCUE.txt"):
+        for name in KIT_FILES:
             shutil.copyfile(kit / name, mounted / name)
         self.assertEqual(verify_kit(mounted), [])
 
@@ -3251,6 +3250,405 @@ class GuardDaemonTests(unittest.TestCase):
             self.assertTrue(kw["start_new_session"])
             self.assertEqual(kw["stdout"], subprocess.DEVNULL)
             self.assertEqual(kw["stdin"], subprocess.DEVNULL)
+
+
+class RiskEngineTests(unittest.TestCase):
+    """v2.4: the suspicion engine (signature-independent risk scoring)."""
+
+    def _file(self, name: str, blob: bytes,
+              parent: str = "work") -> Path:
+        base = Path(tempfile.mkdtemp(prefix="av-risk-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        d = base / parent
+        d.mkdir()
+        p = d / name
+        p.write_bytes(blob)
+        return p
+
+    def test_disguised_double_extension_is_suspicious(self):
+        from antivirus.risk import assess_risk
+
+        p = self._file("invoice.pdf.exe", b"MZ" + b"pad " * 200)
+        r = assess_risk(p, p.lstat(), p.read_bytes()[:65536])
+        self.assertGreaterEqual(r.score, 70)
+        self.assertTrue(any("double extension" in d for _w, d in r.reasons))
+        self.assertTrue(any("document" in d for _w, d in r.reasons))
+
+    def test_plain_text_is_clean(self):
+        from antivirus.risk import assess_risk
+
+        p = self._file("notes.txt", b"nothing to see here\n")
+        r = assess_risk(p, p.lstat(), p.read_bytes())
+        self.assertEqual(r.score, 0)
+
+    def test_high_entropy_exe_is_suspicious(self):
+        from antivirus.risk import assess_risk
+
+        import random
+
+        rng = random.Random(7)
+        blob = bytes(rng.getrandbits(8) for _ in range(150 * 1024))
+        p = self._file("drop_9f2a1c.exe", blob)
+        r = assess_risk(p, p.lstat(), blob[:65536])
+        self.assertGreaterEqual(r.score, 45)
+        self.assertTrue(any("entropy" in d for _w, d in r.reasons))
+
+    def test_fake_document_binary_mismatch(self):
+        from antivirus.risk import assess_risk
+
+        p = self._file("photo.png", b"\x7fELF" + b"xxx" * 300)
+        r = assess_risk(p, p.lstat(), p.read_bytes())
+        self.assertTrue(any("contains a" in d for _w, d in r.reasons))
+
+    def test_name_ioc_words(self):
+        from antivirus.risk import assess_risk
+
+        p = self._file("crack-keygen.exe", b"MZ" + b"pad " * 200)
+        r = assess_risk(p, p.lstat(), p.read_bytes())
+        self.assertTrue(any("suspicious word" in d for _w, d in r.reasons))
+
+    def test_suspicious_parent_dir(self):
+        from antivirus.risk import assess_risk
+
+        p = self._file("blob_8f3a.exe", b"MZ" + b"pad " * 200,
+                       parent="downloads")
+        r = assess_risk(p, p.lstat(), p.read_bytes())
+        self.assertTrue(any("downloads" in d for _w, d in r.reasons))
+
+    def test_scanner_emits_suspicious_finding(self):
+        from antivirus.config import Config
+        from antivirus.scanner import Scanner
+        from antivirus.signatures import SignatureDB
+
+        base = Path(tempfile.mkdtemp(prefix="av-risk-sc-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        (base / "downloads").mkdir()
+        p = base / "downloads" / "report.doc.exe"
+        p.write_bytes(b"MZ" + b"body " * 300)
+        cfg = Config()
+        cfg.quarantine_dir = base / "q"
+        cfg.report_dir = base / "r"
+        cfg.signatures_file = base / "s.json"
+        if BUNDLED_DB.exists():
+            shutil.copyfile(BUNDLED_DB, cfg.signatures_file)
+        cfg.cache_enabled = False
+        cfg.risk_enabled = True
+        cfg.webshield_enabled = False
+        sc = Scanner(cfg, SignatureDB(cfg.signatures_file))
+        findings = sc.scan_file(p)
+        kinds = {f.kind for f in findings}
+        self.assertIn("suspicious", kinds)
+
+    def test_risk_layer_can_be_disabled(self):
+        from antivirus.config import Config
+        from antivirus.scanner import Scanner
+        from antivirus.signatures import SignatureDB
+
+        base = Path(tempfile.mkdtemp(prefix="av-risk-off-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        p = base / "report.doc.exe"
+        p.write_bytes(b"MZ" + b"body " * 300)
+        cfg = Config()
+        cfg.quarantine_dir = base / "q"
+        cfg.report_dir = base / "r"
+        cfg.signatures_file = base / "s.json"
+        if BUNDLED_DB.exists():
+            shutil.copyfile(BUNDLED_DB, cfg.signatures_file)
+        cfg.cache_enabled = False
+        cfg.risk_enabled = False
+        sc = Scanner(cfg, SignatureDB(cfg.signatures_file))
+        kinds = {f.kind for f in sc.scan_file(p)}
+        self.assertNotIn("suspicious", kinds)
+
+
+class WebshieldTests(unittest.TestCase):
+    """v2.4: URL/domain reputation + in-file URL detection."""
+
+    @classmethod
+    def setUpClass(cls):
+        from antivirus.webshield import ThreatIntel
+
+        cls.intel = ThreatIntel.load()
+
+    def test_blocklisted_domain_is_malicious(self):
+        from antivirus.webshield import check_url
+
+        r = check_url("http://c2node.evilcorp.invalid/x", self.intel)
+        self.assertEqual(r["verdict"], "malicious")
+        self.assertGreaterEqual(r["score"], 100)
+
+    def test_subdomain_of_blocklisted_zone(self):
+        from antivirus.webshield import check_url
+
+        r = check_url("http://deep.c2node.evilcorp.invalid/x", self.intel)
+        self.assertEqual(r["verdict"], "malicious")
+
+    def test_blocklisted_ip_with_backdoor_port(self):
+        from antivirus.webshield import check_url
+
+        r = check_url("http://192.0.2.10:4444/p", self.intel)
+        self.assertEqual(r["verdict"], "malicious")
+        self.assertTrue(any("4444" in s for s in r["reasons"]))
+
+    def test_shortener_is_suspicious_not_malicious(self):
+        from antivirus.webshield import check_url
+
+        r = check_url("https://bit.ly/abc", self.intel)
+        self.assertEqual(r["verdict"], "suspicious")
+
+    def test_ordinary_site_is_safe(self):
+        from antivirus.webshield import check_url
+
+        r = check_url("https://www.example.com/docs/page", self.intel)
+        self.assertEqual(r["verdict"], "safe")
+        self.assertEqual(r["score"], 0)
+
+    def test_ip_literal_host_is_flagged(self):
+        from antivirus.webshield import check_url
+
+        r = check_url("http://203.0.113.9/folder/file.exe", self.intel)
+        self.assertTrue(any("IP address" in s for s in r["reasons"]))
+        self.assertTrue(any(".exe" in s for s in r["reasons"]))
+
+    def test_credentials_in_url(self):
+        from antivirus.webshield import check_url
+
+        r = check_url("http://user:pass@example.net/x", self.intel)
+        self.assertTrue(any("credentials" in s for s in r["reasons"]))
+
+    def test_extract_urls(self):
+        from antivirus.webshield import extract_urls
+
+        data = (b"see https://a.example/one and http://b.example/two "
+                b"and https://a.example/one again")
+        urls = extract_urls(data)
+        self.assertEqual(urls, ["https://a.example/one",
+                                "http://b.example/two"])
+
+    def test_user_intel_additions(self):
+        from antivirus.webshield import ThreatIntel, check_url
+
+        base = Path(tempfile.mkdtemp(prefix="av-ws-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        intel = ThreatIntel.load(None, base / "user.json")
+        intel.add_domain("bad.custom.invalid")
+        intel.add_ip("192.0.2.99")
+        intel.add_port(7777, "test")
+        self.assertTrue((base / "user.json").exists())
+        # reload from disk -> additions persist
+        intel2 = ThreatIntel.load(None, base / "user.json")
+        self.assertEqual(check_url("http://bad.custom.invalid/x",
+                                   intel2)["verdict"], "malicious")
+        self.assertEqual(check_url("http://192.0.2.99/",
+                                   intel2)["verdict"], "malicious")
+        self.assertIn("7777", intel2.ports)
+
+    def test_scanner_flags_malicious_url_in_file(self):
+        from antivirus.config import Config
+        from antivirus.scanner import Scanner
+        from antivirus.signatures import SignatureDB
+
+        base = Path(tempfile.mkdtemp(prefix="av-ws-sc-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        p = base / "links.txt"
+        p.write_text("update: http://c2node.evilcorp.invalid/d/x.exe\n")
+        cfg = Config()
+        cfg.quarantine_dir = base / "q"
+        cfg.report_dir = base / "r"
+        cfg.signatures_file = base / "s.json"
+        if BUNDLED_DB.exists():
+            shutil.copyfile(BUNDLED_DB, cfg.signatures_file)
+        cfg.cache_enabled = False
+        cfg.risk_enabled = False
+        sc = Scanner(cfg, SignatureDB(cfg.signatures_file))
+        kinds = {f.kind for f in sc.scan_file(p)}
+        self.assertIn("malicious_url", kinds)
+
+    def test_clean_url_not_flagged(self):
+        from antivirus.config import Config
+        from antivirus.scanner import Scanner
+        from antivirus.signatures import SignatureDB
+
+        base = Path(tempfile.mkdtemp(prefix="av-ws-cl-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        p = base / "notes.txt"
+        p.write_text("docs: https://www.example.com/docs/index\n")
+        cfg = Config()
+        cfg.quarantine_dir = base / "q"
+        cfg.report_dir = base / "r"
+        cfg.signatures_file = base / "s.json"
+        if BUNDLED_DB.exists():
+            shutil.copyfile(BUNDLED_DB, cfg.signatures_file)
+        cfg.cache_enabled = False
+        cfg.risk_enabled = False
+        sc = Scanner(cfg, SignatureDB(cfg.signatures_file))
+        self.assertEqual(sc.scan_file(p), [])
+
+
+class FirewallTests(unittest.TestCase):
+    """v2.4: live connection-table audit (parsed from fixtures)."""
+
+    @classmethod
+    def setUpClass(cls):
+        from antivirus.webshield import ThreatIntel
+
+        cls.intel = ThreatIntel.load()
+
+    def _parse(self, line: str):
+        from antivirus.firewall import parse_proc_net_file
+
+        p = Path(tempfile.mktemp(prefix="av-fw-"))
+        p.write_text(
+            "  sl  local_address rem_address   st tx_queue rx_queue tr "
+            "tm->when retrnsmt   uid  timeout inode\n" + line + "\n")
+        self.addCleanup(p.unlink, missing_ok=True)
+        return parse_proc_net_file(p, "tcp")
+
+    def test_parse_established_backdoor_port(self):
+        conns = self._parse(
+            "   1: 0100007F:1F90 0100007F:115C 01 "
+            "00000000:00000000 00:00000000 00000000     0        0 123 "
+            "1 0000000000000000 100 0 0 10 0")
+        self.assertEqual(len(conns), 1)
+        c = conns[0]
+        self.assertEqual(c.local, ("127.0.0.1", 8080))
+        self.assertEqual(c.remote, ("127.0.0.1", 4444))
+        self.assertEqual(c.state, "ESTABLISHED")
+
+    def test_audit_backdoor_port_alert(self):
+        from antivirus.firewall import audit
+
+        conns = self._parse(
+            "   1: 0100007F:1F90 0100007F:115C 01 "
+            "00000000:00000000 00:00000000 00000000     0        0 123 "
+            "1 0000000000000000 100 0 0 10 0")
+        alerts = audit(conns, self.intel)
+        kinds = {a["kind"] for a in alerts}
+        self.assertIn("backdoor_port", kinds)
+        self.assertTrue(all(a["severity"] == "high"
+                            for a in alerts if a["kind"] == "backdoor_port"))
+
+    def test_audit_intel_ip_alert(self):
+        from antivirus.firewall import audit
+
+        # 192.0.2.10 little-endian hex = 0A0200C0
+        conns = self._parse(
+            "   2: 0100007F:0050 0A0200C0:115C 01 "
+            "00000000:00000000 00:00000000 00000000     0        0 456 "
+            "1 0000000000000000 100 0 0 10 0")
+        alerts = audit(conns, self.intel)
+        self.assertIn("intel_ip", {a["kind"] for a in alerts})
+
+    def test_audit_risky_listener(self):
+        from antivirus.firewall import audit
+
+        # LISTEN (0A) on port 23 (telnet = 0017 hex)
+        conns = self._parse(
+            "   3: 00000000:0017 00000000:0000 0A "
+            "00000000:00000000 00:00000000 00000000     0        0 789 "
+            "1 0000000000000000 100 0 0 10 0")
+        alerts = audit(conns, self.intel)
+        self.assertIn("risky_listener", {a["kind"] for a in alerts})
+
+    def test_benign_https_no_high_alert(self):
+        from antivirus.firewall import audit
+
+        # ESTABLISHED to 93.184.216.34:443 (example.com-ish)
+        conns = self._parse(
+            "   4: 0100007F:C000 22D8B85D:01BB 01 "
+            "00000000:00000000 00:00000000 00000000     0        0 999 "
+            "1 0000000000000000 100 0 0 10 0")
+        alerts = audit(conns, self.intel)
+        self.assertTrue(all(a["severity"] != "high" for a in alerts))
+
+    def test_list_connections_available(self):
+        from antivirus.firewall import list_connections
+
+        try:
+            conns, source = list_connections()
+        except RuntimeError:
+            self.skipTest("no connection-table source on this platform")
+        self.assertIn(source, ("proc", "netstat"))
+        self.assertIsInstance(conns, list)
+        for c in conns:
+            self.assertTrue(isinstance(c.local, tuple))
+            self.assertTrue(isinstance(c.remote, tuple))
+
+
+class BenchmarkTests(unittest.TestCase):
+    """v2.4: the labelled corpus must stay 100% / 0%."""
+
+    def test_full_corpus(self):
+        from antivirus import benchmark
+        from antivirus.config import Config
+
+        samples = ROOT / "samples"
+        base = Path(tempfile.mkdtemp(prefix="av-bench-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        cfg = Config()
+        cfg.quarantine_dir = base / "q"
+        cfg.report_dir = base / "r"
+        cfg.signatures_file = base / "s.json"
+        if BUNDLED_DB.exists():
+            shutil.copyfile(BUNDLED_DB, cfg.signatures_file)
+        cfg.cache_enabled = False
+        result = benchmark.run(samples, cfg)
+        self.assertEqual(result["bad_detected"], result["bad_total"])
+        self.assertEqual(result["clean_flagged"], 0)
+        self.assertEqual(result["recall"], 1.0)
+        missed = [r["file"] for r in result["rows"] if r["verdict"] == "MISSED"]
+        fp = [r["file"] for r in result["rows"]
+              if r["verdict"] == "FALSE POSITIVE"]
+        self.assertEqual(missed, [], f"missed threats: {missed}")
+        self.assertEqual(fp, [], f"false positives: {fp}")
+
+    def test_benchmark_builds_corpus_when_missing(self):
+        from antivirus import benchmark
+
+        base = Path(tempfile.mkdtemp(prefix="av-bench2-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        result = benchmark.run(base / "nonexistent", None)
+        self.assertEqual(result["bad_detected"], result["bad_total"])
+        self.assertEqual(result["clean_flagged"], 0)
+
+
+class NewCliTests(unittest.TestCase):
+    """v2.4: parser plumbing for risk/urlcheck/webshield/firewall/benchmark."""
+
+    def test_parser_accepts_new_commands(self):
+        from antivirus.cli import build_parser
+
+        p = build_parser()
+        args = p.parse_args(["risk", "a.exe", "--threshold", "60"])
+        self.assertEqual(args.command, "risk")
+        self.assertEqual(args.threshold, 60)
+
+        args = p.parse_args(["urlcheck", "http://x.invalid",
+                             "--from", "f.txt"])
+        self.assertEqual(args.command, "urlcheck")
+        self.assertEqual(args.from_file, "f.txt")
+
+        args = p.parse_args(["webshield", "add", "x.invalid"])
+        self.assertEqual(args.waction, "add")
+        args = p.parse_args(["webshield", "show"])
+        self.assertEqual(args.waction, "show")
+
+        args = p.parse_args(["firewall", "scan"])
+        self.assertEqual(args.faction, "scan")
+        args = p.parse_args(["firewall", "monitor", "--interval", "2"])
+        self.assertEqual(args.faction, "monitor")
+        self.assertEqual(args.interval, 2)
+
+        args = p.parse_args(["benchmark", "--samples", "x"])
+        self.assertEqual(args.command, "benchmark")
+
+    def test_scan_flags_disable_new_layers(self):
+        from antivirus.cli import build_parser
+
+        args = build_parser().parse_args(
+            ["scan", ".", "--no-risk", "--no-webshield"])
+        self.assertTrue(args.no_risk)
+        self.assertTrue(args.no_webshield)
 
 
 class GuardCliTests(unittest.TestCase):

@@ -1,0 +1,5 @@
+System update notice (DEMO - inert sample)
+
+A critical update is available. Download it here:
+  http://update.evilcorp.invalid/installer/win-update.exe
+Mirror: http://c2node.evilcorp.invalid/drop/x.exe

@@ -580,6 +580,72 @@ CLEAN_SAMPLE_TEXT = (
     "Nothing malicious in here, promise.\n"
 )
 
+#: v2.4 samples: the *suspicion engine* and *web shield* corpus.
+#: All content is inert; the hosts below are reserved (RFC 2606/5737)
+#: and can never resolve.
+SUSPICIOUS_TEXT_FILES: Dict[str, str] = {
+    # Disguised executable: PE magic under a .pdf.exe name (risk engine).
+    # Written as bytes by build_all_samples (needs a real MZ header).
+    "suspicious/win-update-notes.txt": (
+        "System update notice (DEMO - inert sample)\n"
+        "\n"
+        "A critical update is available. Download it here:\n"
+        "  http://update.evilcorp.invalid/installer/win-update.exe\n"
+        "Mirror: http://c2node.evilcorp.invalid/drop/x.exe\n"
+    ),
+    "suspicious/backdoor-link.txt": (
+        "Shared link (DEMO - inert sample)\n"
+        "\n"
+        "http://192.0.2.10:4444/payload\n"
+    ),
+    "clean/notes.txt": (
+        "Meeting notes (DEMO - clean sample)\n"
+        "\n"
+        "- Ship the demo on Friday\n"
+        "- Docs: https://www.example.com/docs/getting-started\n"
+        "- Read the manual before updating\n"
+    ),
+    "clean/report.csv": (
+        "name,amount,status\n"
+        "alpha,10,ok\n"
+        "beta,20,ok\n"
+        "gamma,30,ok\n"
+    ),
+    "clean/script.py": (
+        "\"\"\"A perfectly ordinary Python script (clean sample).\"\"\"\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    print(\"hello from the clean sample\")\n"
+        "    return 0\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    raise SystemExit(main())\n"
+    ),
+}
+
+
+def build_disguised_exec() -> bytes:
+    """'invoice.pdf.exe': PE magic under a document-style double extension."""
+    body = (b"INERT DEMO - not a real PE; just MZ magic + filler so the\n"
+            b"suspicion engine can score it.  (v2.4 sample)\n")
+    return b"MZ\x90\x00" + body * 40
+
+
+def build_random_blob(seed: int = 1337, size: int = 200 * 1024) -> bytes:
+    """Deterministic high-entropy 'packed' blob (no real code)."""
+    import random as _random
+
+    rng = _random.Random(seed)
+    return bytes(rng.getrandbits(8) for _ in range(size))
+
+
+def build_fake_jpeg() -> bytes:
+    """A file that *claims* to be a JPEG (valid JFIF header, filler body)."""
+    return (b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01"
+            b"\x00\x00INERT DEMO JPEG filler " + b"\x00" * 1900)
+
 
 def build_all_samples(root) -> list:
     """Materialise the complete inert demo sample tree under *root*.
@@ -610,6 +676,13 @@ def build_all_samples(root) -> list:
     write("behavior/clean.elf", build_clean_elf())
     write("behavior/sneaky.zip", build_zip_sample())
     write("behavior/sneaky.tar.gz", build_tar_sample())
+
+    # v2.4: suspicion engine + web shield samples (inert).
+    write("suspicious/invoice.pdf.exe", build_disguised_exec())
+    write("suspicious/blob_7f3a9c2b.exe", build_random_blob())
+    for rel, text in sorted(SUSPICIOUS_TEXT_FILES.items()):
+        write(rel, text.encode("utf-8"))
+    write("clean/photo.jpg", build_fake_jpeg())
 
     # Ship the sample README too, when running from a full checkout.
     repo_readme = Path(__file__).resolve().parent.parent / "samples" / \

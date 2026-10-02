@@ -355,6 +355,46 @@ class Antivirus:
         return verify_tree(Path(os.path.expanduser(str(target))),
                            manifest, self.config)
 
+    # ---------------------------------------------- suspicion / web / network
+    def risk(self, path) -> Dict:
+        """Suspicion-engine report for one file (0-100 score + reasons)."""
+        from . import risk as risk_mod
+
+        p = Path(path)
+        try:
+            st = p.lstat()
+        except OSError as exc:
+            raise FileNotFoundError(f"no such file: {p}") from exc
+        try:
+            with open(p, "rb") as fh:
+                head = fh.read(65536)
+        except OSError:
+            head = b""
+        return risk_mod.assess_risk(p, st, head).to_dict()
+
+    def check_url(self, url: str) -> Dict:
+        """Web shield verdict for one URL (verdict/score/reasons)."""
+        from . import webshield
+
+        return webshield.check_url(url, self.scanner.threat_intel())
+
+    def extract_urls(self, data: bytes) -> List[str]:
+        """Every http(s)/ftp URL found in *data*."""
+        from . import webshield
+
+        return webshield.extract_urls(data)
+
+    def firewall_scan(self) -> Dict:
+        """Live connection snapshot + security alerts (monitor, not a
+        packet filter – no privileges required)."""
+        from . import firewall
+
+        return firewall.scan()
+
+    def threat_intel(self):
+        """The web shield's threat-intel DB (add domains/IPs/ports)."""
+        return self.scanner.threat_intel()
+
     # ----------------------------------------------------------- kill engine
     def kill_list(self):
         """Everything currently neutralized (key/IV held in the registry)."""

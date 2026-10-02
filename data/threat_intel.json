@@ -1,0 +1,46 @@
+{
+  "version": 1,
+  "updated": "2026-10-01",
+  "note": "Bundled educational threat-intel set. Domains use the reserved .invalid / example TLDs (RFC 2606 - they can never resolve); IPs use the reserved documentation ranges (TEST-NET-1/2). Extend with real indicators via `antivirus webshield add DOMAIN|IP` or plain-text IOC import.",
+  "domains": [
+    "malware-sample.example.com",
+    "c2node.evilcorp.invalid",
+    "update.evilcorp.invalid",
+    "payload.dropzone.invalid",
+    "tracker.evilcorp.invalid",
+    "stealer.evilcorp.invalid"
+  ],
+  "ips": [
+    "192.0.2.10",
+    "198.51.100.7"
+  ],
+  "ports": {
+    "4444": "classic reverse shell / Metasploit default",
+    "5554": "Metasploit HTTPS default",
+    "5555": "Metasploit Meterpreter default",
+    "4431": "common backdoor port",
+    "31337": "Back Orifice",
+    "1337": "common backdoor port",
+    "6667": "IRC (classic malware channel)"
+  },
+  "listen_ports": {
+    "21": "FTP (cleartext credentials)",
+    "23": "Telnet (cleartext remote shell)",
+    "5900": "VNC (screen sharing)",
+    "3389": "RDP (remote desktop)",
+    "445": "SMB (classic worm target)",
+    "135": "MS RPC endpoint mapper"
+  },
+  "shorteners": [
+    "bit.ly",
+    "tinyurl.com",
+    "goo.gl",
+    "t.co",
+    "is.gd",
+    "cutt.ly",
+    "rb.gy",
+    "ow.ly",
+    "buff.ly",
+    "shorturl.at"
+  ]
+}

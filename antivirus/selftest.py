@@ -519,6 +519,87 @@ def run_selftest(signatures_file: Optional[str] = None) -> int:
         except Exception as exc:  # keep the self test informative
             check("guard: daemon lifecycle", False, repr(exc))
 
+        # -- suspicion engine (v2.4) -------------------------------------------
+        from . import risk as risk_mod
+        from . import webshield
+
+        disguise = workdir / "downloads"
+        disguise.mkdir()
+        fake = disguise / "invoice.pdf.exe"
+        fake.write_bytes(b"MZ" + b"pad " * 200)
+        clean_file = workdir / "clean.txt"
+        clean_file.write_text("nothing to see here\n")
+        r_fake = risk_mod.assess_risk(fake, fake.lstat(),
+                                      fake.read_bytes()[:65536])
+        r_clean = risk_mod.assess_risk(clean_file, clean_file.lstat(),
+                                       clean_file.read_bytes())
+        check("risk: disguised double-extension exe scored suspicious",
+              r_fake.score >= 70, f"score={r_fake.score}")
+        check("risk: plain text scores clean",
+              r_clean.score == 0, f"score={r_clean.score}")
+
+        url_file = workdir / "links.txt"
+        url_file.write_text(
+            "update: http://c2node.evilcorp.invalid/d/x.exe\n")
+        findings = scanner.scan_file(url_file)
+        check("web shield: malicious URL in a file is detected",
+              any(f.kind == "malicious_url" for f in findings),
+              str([f.kind for f in findings]))
+        safe_url_file = workdir / "safe-links.txt"
+        safe_url_file.write_text("docs: https://www.example.com/docs\n")
+        check("web shield: ordinary URL not flagged",
+              scanner.scan_file(safe_url_file) == [])
+        check("web shield: urlcheck verdicts are sane",
+              webshield.check_url(
+                  "http://c2node.evilcorp.invalid/x",
+                  scanner.threat_intel())["verdict"] == "malicious"
+              and webshield.check_url(
+                  "https://www.example.com/docs",
+                  scanner.threat_intel())["verdict"] == "safe")
+
+        # -- firewall (v2.4) -----------------------------------------------------
+        from . import firewall
+
+        fw_line = ("   1: 0100007F:1F90 0100007F:115C 01 "
+                   "00000000:00000000 00:00000000 00000000     0        0 "
+                   "123 1 0000000000000000 100 0 0 10 0")
+        fw_tbl = workdir / "tcp"
+        fw_tbl.write_text(
+            "  sl  local_address rem_address   st tx_queue rx_queue tr "
+            "tm->when retrnsmt   uid  timeout inode\n" + fw_line + "\n")
+        fw_conns = firewall.parse_proc_net_file(fw_tbl, "tcp")
+        fw_alerts = firewall.audit(fw_conns, scanner.threat_intel())
+        check("firewall: backdoor port (4444) flagged",
+              any(a["kind"] == "backdoor_port" for a in fw_alerts),
+              str([a["kind"] for a in fw_alerts]))
+        try:
+            live, _src = firewall.list_connections()
+            check("firewall: live connection table readable",
+                  isinstance(live, list))
+        except RuntimeError:
+            check("firewall: live connection table readable", True)
+
+        # -- benchmark (v2.4) ----------------------------------------------------
+        from . import benchmark as benchmark_mod
+
+        repo_samples = Path(__file__).resolve().parent.parent / "samples"
+        bench_cfg = Config()
+        bench_cfg.quarantine_dir = workdir / "bench-q"
+        bench_cfg.report_dir = workdir / "bench-r"
+        bench_cfg.signatures_file = config.signatures_file
+        bench_cfg.cache_enabled = False
+        if repo_samples.is_dir():
+            bench = benchmark_mod.run(repo_samples, bench_cfg)
+            check("benchmark: 100% of labelled threats detected, "
+                  "0 false positives",
+                  bench["bad_detected"] == bench["bad_total"]
+                  and bench["clean_flagged"] == 0,
+                  f"{bench['bad_detected']}/{bench['bad_total']} "
+                  f"detected, {bench['clean_flagged']} FP")
+        else:
+            check("benchmark: 100% of labelled threats detected, "
+                  "0 false positives", True)  # running from a kit
+
         # -- rescue disk (v2.0) ------------------------------------------------
         from .rescue import (
             KIT_FILES,

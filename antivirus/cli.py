@@ -22,7 +22,7 @@ from .pe import (
     pe_indicators,
     render_pe_report,
 )
-from .output import BOLD, CYAN, GREEN, RED, SEVERITY_COLOR, YELLOW, paint
+from .output import BOLD, CYAN, DIM, GREEN, RED, SEVERITY_COLOR, YELLOW, paint
 from .quarantine import Quarantine
 from .report import ReportWriter, diff_reports, render_report
 from .scanner import ScanResult, Scanner
@@ -70,6 +70,10 @@ def _build(args):
         config.cache_enabled = False
     if getattr(args, "no_archives", False):
         config.archives_enabled = False
+    if getattr(args, "no_risk", False):
+        config.risk_enabled = False
+    if getattr(args, "no_webshield", False):
+        config.webshield_enabled = False
     if getattr(args, "exclude", None):
         config.exclude_patterns = tuple(args.exclude)
     if getattr(args, "since", 0.0):
@@ -431,6 +435,241 @@ def cmd_kill(args) -> int:
     except (KeyError, ValueError, FileNotFoundError) as exc:
         print(paint(f"error: {exc}", RED), file=sys.stderr)
         return 2
+
+
+# --------------------------------------------------------------------- risk
+def _read_head(path: Path, n: int = 65536) -> bytes:
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(n)
+    except OSError:
+        return b""
+
+
+def cmd_risk(args) -> int:
+    """Score how suspicious files *look* – no signature matching involved."""
+    from . import risk as risk_mod
+
+    config, db, scanner, quarantine = _build(args)
+    threshold = (args.threshold if args.threshold is not None
+                 else config.risk_threshold)
+    rows = []
+    any_suspicious = False
+    for target in args.files:
+        p = Path(target).expanduser()
+        if not p.exists() or p.is_dir():
+            print(paint(f"error: no such file: {target}", RED),
+                  file=sys.stderr)
+            return 2
+        try:
+            st = p.lstat()
+        except OSError as exc:
+            print(paint(f"error: {target}: {exc}", RED), file=sys.stderr)
+            return 2
+        report = risk_mod.assess_risk(p, st, _read_head(p))
+        suspicious = report.score >= threshold
+        any_suspicious = any_suspicious or suspicious
+        rows.append({
+            "file": str(p), "score": report.score, "suspicious": suspicious,
+            "severity": risk_mod.severity_for(report.score),
+            "reasons": [{"weight": w, "detail": d}
+                        for w, d in report.reasons],
+        })
+    if args.json:
+        print(json.dumps({"threshold": threshold, "files": rows}, indent=2,
+                         ensure_ascii=False))
+        return 1 if any_suspicious else 0
+    for row in rows:
+        bar_len = 20
+        filled = int(bar_len * row["score"] // 100)
+        bar = "#" * filled + "·" * (bar_len - filled)
+        colour = RED if row["score"] >= 70 else \
+            YELLOW if row["suspicious"] else GREEN
+        verdict = "SUSPICIOUS" if row["suspicious"] else "ok"
+        print(paint(f" {row['score']:>3}/100 [{verdict}] ", colour)
+              + paint(f"[{bar}]", colour) + f"  {row['file']}")
+        for r in sorted(row["reasons"],
+                        key=lambda r: r["weight"], reverse=True)[:4]:
+            print(f"        +{r['weight']:<3} {r['detail']}")
+    print(paint(f"threshold: {threshold}", DIM))
+    return 1 if any_suspicious else 0
+
+
+# ----------------------------------------------------------------- web shield
+def cmd_urlcheck(args) -> int:
+    """Check URLs – given on the command line or extracted from a file."""
+    from . import webshield
+
+    config, db, scanner, quarantine = _build(args)
+    intel = scanner.threat_intel()
+    urls = list(args.urls or [])
+    if args.from_file:
+        p = Path(args.from_file).expanduser()
+        if not p.exists():
+            print(paint(f"error: no such file: {p}", RED), file=sys.stderr)
+            return 2
+        urls.extend(webshield.extract_urls(_read_head(p, 1024 * 1024)))
+    if not urls:
+        print("usage: antivirus urlcheck URL…   |   "
+              "antivirus urlcheck --from FILE", file=sys.stderr)
+        return 2
+    reports = [webshield.check_url(u, intel) for u in urls]
+    if args.json:
+        print(json.dumps(reports, indent=2, ensure_ascii=False))
+        return 0
+    for r in reports:
+        colour = RED if r["verdict"] == "malicious" else \
+            YELLOW if r["verdict"] == "suspicious" else GREEN
+        print(paint(f" {r['verdict'].upper():>10} ", colour)
+              + paint(f"({r['score']:>3}) ", colour) + r["url"])
+        for reason in r["reasons"]:
+            print(f"             - {reason}")
+    return 0
+
+
+def cmd_webshield(args) -> int:
+    """Manage the web shield's threat-intel database."""
+    from . import webshield
+
+    config, db, scanner, quarantine = _build(args)
+    intel = scanner.threat_intel()
+    if args.waction == "show":
+        s = intel.summary()
+        if args.json:
+            print(json.dumps({
+                "summary": s,
+                "domains": sorted(intel.domains),
+                "ips": sorted(intel.ips),
+                "ports": intel.ports,
+                "listen_ports": intel.listen_ports,
+                "shorteners": sorted(intel.shorteners),
+                "user_file": str(intel.path),
+            }, indent=2, ensure_ascii=False))
+            return 0
+        print(f"Threat intel:  {s['domains']} domain(s), {s['ips']} IP(s), "
+              f"{s['ports']} risky port(s), {s['shorteners']} shortener(s)")
+        print(f"User file:     {intel.path}")
+        if intel.domains:
+            print("Domains:")
+            for d in sorted(intel.domains):
+                print(f"  - {d}")
+        if intel.ips:
+            print("IPs:")
+            for i in sorted(intel.ips):
+                print(f"  - {i}")
+        if intel.ports:
+            print("Risky ports:")
+            for k in sorted(intel.ports, key=int):
+                print(f"  - {k}  {intel.ports[k]}")
+        return 0
+    # add
+    token = args.entry.strip()
+    if token.isdigit():
+        intel.add_port(int(token), args.note or "user-reported port")
+        print(f"added risky port {token}")
+    elif token.count(".") == 3 and all(
+        part.isdigit() for part in token.split(".")
+    ):
+        intel.add_ip(token)
+        print(f"added IP {token} to the blocklist")
+    else:
+        intel.add_domain(token)
+        print(f"added domain {token} to the blocklist")
+    print(f"(stored in {intel.path})")
+    return 0
+
+
+# ------------------------------------------------------------------- firewall
+def _print_alert(a: dict) -> None:
+    colour = RED if a["severity"] == "high" else \
+        YELLOW if a["severity"] == "medium" else DIM
+    print(paint(f" [{a['severity'].upper():>6}] ", colour)
+          + f"{a['kind']:>18}: {a['detail']}")
+    print(f"             {a['conn']}")
+
+
+def cmd_firewall(args) -> int:
+    """Live network-connection audit (monitor, not a packet filter)."""
+    from . import firewall
+
+    if args.faction == "scan":
+        result = firewall.scan()
+        if args.json:
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+            return 0
+        print(f"Connections:  {result['connections']} "
+              f"(source: {result['source']})")
+        s = result["intel"]
+        print(f"Intel:        {s['domains']} domains, {s['ips']} IPs, "
+              f"{s['ports']} risky ports")
+        if result["alerts"]:
+            print(paint("Alerts:", BOLD))
+            for a in result["alerts"]:
+                _print_alert(a)
+        else:
+            print(paint("Alerts:       none – nothing looks wrong", GREEN))
+        if not args.quiet:
+            print(f"Connection list (first 15):")
+            for c in result["connection_list"][:15]:
+                print(f"  {c['proto']:>4} {c['local'][0]}:{c['local'][1]} <-> "
+                      f"{c['remote'][0]}:{c['remote'][1]}  [{c['state']}]")
+        return 0
+    # monitor
+    print(paint(f" firewall monitor – polling every {args.interval:g}s "
+                f"(Ctrl+C to stop)", DIM))
+    try:
+        firewall.monitor(interval=args.interval, on_alert=_monitor_on_alert)
+    except KeyboardInterrupt:
+        print()
+        print("monitor stopped.")
+    return 0
+
+
+def _monitor_on_alert(a: dict) -> None:
+    import time as _time
+
+    stamp = _time.strftime("%H:%M:%S")
+    print(f"[{stamp}]", end="")
+    _print_alert(a)
+
+
+# ----------------------------------------------------------------- benchmark
+def cmd_benchmark(args) -> int:
+    """Run the labelled sample corpus through the full engine."""
+    from . import benchmark
+
+    config, db, scanner, quarantine = _build(args)
+    samples_dir = Path(args.samples).expanduser() if args.samples else \
+        Path("samples")
+    result = benchmark.run(samples_dir, config)
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
+    print(paint("=" * 62, BOLD))
+    print(paint(f" AntiVirus {result['signatures']} signatures – "
+                f"detection benchmark", BOLD))
+    print(paint("=" * 62, BOLD))
+    print(f"corpus: {samples_dir}")
+    width = 40
+    for row in result["rows"]:
+        mark = {
+            "detected": paint("ok    ", GREEN),
+            "clean": paint("ok    ", GREEN),
+            "MISSED": paint("MISS  ", RED),
+            "FALSE POSITIVE": paint("FALSE ", RED),
+            "missing": paint("MISS  ", RED),
+        }.get(row["verdict"], "?")
+        finding = row["findings"][0]["name"] if row["findings"] else ""
+        print(f" {mark} {row['file']:<{width}} {finding[:44]}")
+    print(paint("-" * 62, BOLD))
+    line = benchmark.verdict_line(result)
+    good = (result["bad_detected"] == result["bad_total"]
+            and result["clean_flagged"] == 0)
+    print(paint(f" {line}  ({result['elapsed_seconds']} s)",
+                GREEN if good else RED))
+    print("Educational corpus: proves the layers work together. It is not a")
+    print("real-world malware benchmark - see README for the honest framing.")
+    return 0 if good else 1
 
 
 # ---------------------------------------------------------------------- sig
@@ -1223,6 +1462,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="ignore the scan cache and re-read every file")
     p.add_argument("--no-archives", action="store_true",
                    help="do not inspect the contents of ZIP archives")
+    p.add_argument("--no-risk", action="store_true",
+                   help="disable the suspicion engine (risk scoring)")
+    p.add_argument("--no-webshield", action="store_true",
+                   help="disable the web shield (URL reputation layer)")
     p.add_argument("--exclude", action="append", default=None, metavar="GLOB",
                    help="skip files whose name or relative path matches GLOB "
                         "(repeatable), e.g. --exclude '*.log'")
@@ -1248,6 +1491,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="disable behavioural analysis of executable-looking files")
     p.add_argument("--no-archives", action="store_true",
                    help="do not inspect the contents of ZIP archives")
+    p.add_argument("--no-risk", action="store_true",
+                   help="disable the suspicion engine (risk scoring)")
+    p.add_argument("--no-webshield", action="store_true",
+                   help="disable the web shield (URL reputation layer)")
     p.add_argument("--exclude", action="append", default=None, metavar="GLOB",
                    help="skip files whose name or relative path matches GLOB "
                         "(repeatable), e.g. --exclude '*.log'")
@@ -1325,6 +1572,53 @@ def build_parser() -> argparse.ArgumentParser:
     gd.add_argument("--interval", type=float, default=5.0)
     gd.add_argument("--initial", action="store_true")
     gd.add_argument("--signatures", default=None)
+
+    p = sub.add_parser(
+        "risk", help="score how suspicious files LOOK (no signatures)")
+    p.add_argument("files", nargs="+", metavar="FILE")
+    p.add_argument("--threshold", type=int, default=None, metavar="N",
+                   help="score that counts as suspicious (default 45)")
+    p.add_argument("--json", action="store_true")
+    _common_options(p)
+
+    p = sub.add_parser(
+        "urlcheck", help="web shield: check URLs (or URLs inside a file)")
+    p.add_argument("urls", nargs="*", metavar="URL")
+    p.add_argument("--from", dest="from_file", default=None, metavar="FILE",
+                   help="extract and check every URL found in FILE")
+    p.add_argument("--json", action="store_true")
+    _common_options(p)
+
+    p = sub.add_parser(
+        "webshield", help="manage the web shield's threat-intel database")
+    wsub = p.add_subparsers(dest="waction", required=True)
+    wshow = wsub.add_parser(
+        "show", help="show the current intel (domains/IPs/ports)")
+    wshow.add_argument("--json", action="store_true")
+    _common_options(wshow)
+    wa = wsub.add_parser("add", help="add a domain, IP or risky port")
+    wa.add_argument("entry", help="domain, IP address, or port number")
+    wa.add_argument("--note", default=None, help="note for port entries")
+    _common_options(wa)
+
+    p = sub.add_parser(
+        "firewall", help="live network-connection audit (no root needed)")
+    fsub = p.add_subparsers(dest="faction", required=True)
+    fs = fsub.add_parser("scan", help="one-shot snapshot + audit")
+    fs.add_argument("--json", action="store_true")
+    fs.add_argument("--quiet", action="store_true",
+                    help="skip the connection list")
+    fm = fsub.add_parser("monitor",
+                         help="watch for new suspicious connections")
+    fm.add_argument("--interval", type=float, default=5.0, metavar="SECONDS")
+
+    p = sub.add_parser(
+        "benchmark", help="run the labelled sample corpus through the engine")
+    p.add_argument("--samples", default=None, metavar="DIR",
+                   help="samples directory (default ./samples; built on the "
+                        "fly if absent)")
+    p.add_argument("--json", action="store_true")
+    _common_options(p)
 
     p = sub.add_parser("sig", help="inspect or extend the signature database")
     _common_options(p)
@@ -1538,6 +1832,11 @@ _COMMANDS = {
     "quarantine": cmd_quarantine,
     "kill": cmd_kill,
     "guard": cmd_guard,
+    "risk": cmd_risk,
+    "urlcheck": cmd_urlcheck,
+    "webshield": cmd_webshield,
+    "firewall": cmd_firewall,
+    "benchmark": cmd_benchmark,
     "sig": cmd_sig,
     "behavior": cmd_behavior,
     "pe": cmd_pe,

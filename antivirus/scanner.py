@@ -44,6 +44,9 @@ from .behavior import analyze_file as behavior_analyze_file
 from .behavior import looks_executable as behavior_looks_executable
 from .cache import ScanCache
 from .config import Config
+from . import risk as risk_mod
+from . import webshield as webshield_mod
+from .webshield import ThreatIntel
 from .models import (  # noqa: F401  (re-exported for backwards compatibility)
     Finding,
     shannon_entropy,
@@ -229,6 +232,40 @@ class Scanner:
         self._name_to_sig: Dict[str, Signature] = {}
         self._overlap = 64
         self._cached_version: Optional[int] = None
+        #: Threat-intel DB for the web shield (lazy-loaded).
+        self._intel: Optional[ThreatIntel] = None
+
+    def threat_intel(self) -> ThreatIntel:
+        """The web shield's threat-intel DB (lazy, cached).
+
+        Looks for the database in the configured location, next to the
+        package (``data/``), and next to the package root (rescue-kit
+        layout) before giving up.
+        """
+        if self._intel is None:
+            cfg = self.config
+            pkg_root = Path(webshield_mod.__file__).resolve().parent.parent
+            candidates = [Path(cfg.threat_intel_file),
+                          pkg_root / "data" / "threat_intel.json",
+                          pkg_root / "threat_intel.json"]
+            src = next((p for p in candidates if p.exists()), None)
+            self._intel = ThreatIntel.load(src, Path(cfg.intel_user_file))
+        return self._intel
+
+    def _risk_finding(self, path_str: str, p: Path, st, data: bytes,
+                      sha256: str, size: int, cfg: Config) -> Optional[Finding]:
+        """Suspicion-engine layer: one finding when the risk score crosses
+        the threshold (v2.4)."""
+        report = risk_mod.assess_risk(p, st, data)
+        if report.score < cfg.risk_threshold:
+            return None
+        return Finding(
+            path=path_str, kind="suspicious", name="SuspiciousFile",
+            severity=risk_mod.severity_for(report.score),
+            message=(f"risk score {report.score}/100: "
+                     + "; ".join(report.top_reasons(3))),
+            sha256=sha256, size=size,
+        )
 
     # ------------------------------------------------------------- public API
     def scan_path(self, path: Path,
@@ -338,6 +375,8 @@ class Scanner:
             "fast": cfg.fast_mode,
             "archives": cfg.archives_enabled,
             "entropy_threshold": cfg.entropy_threshold,
+            "risk": [cfg.risk_enabled, cfg.risk_threshold],
+            "webshield": cfg.webshield_enabled,
             "max_file_size": cfg.max_file_size,
         }
 
@@ -534,6 +573,27 @@ class Scanner:
         ):
             local.extend(behavior_analyze_file(path, st, content))
 
+        # Layer 2.6 – web shield: URLs inside the file vs threat-intel (v2.4).
+        if self.config.webshield_enabled and not self.config.fast_mode:
+            head = content if content is not None else \
+                self._peek_bytes(path, 262144)
+            local.extend(webshield_mod.audit_bytes(
+                str(path), head, self.threat_intel()))
+
+        # Layer 2.65 – suspicion engine: how suspicious does the file *look*,
+        # independent of any signature match (v2.4).  This is what makes the
+        # background guard act on odd new files with no known signature.
+        if (
+            self.config.risk_enabled
+            and not self.config.fast_mode
+            and not local
+        ):
+            head = content if content is not None else \
+                self._peek_bytes(path, 65536)
+            local.append(self._risk_finding(str(path), path, st, head,
+                                            sha256, size, self.config))
+        local = [f for f in local if f is not None]
+
         # Layer 2.75 – archive contents (ZIP / TAR / GZIP, in memory only).
         if (
             self.config.archives_enabled
@@ -627,6 +687,15 @@ class Scanner:
             and behavior_looks_executable(p, data)
         ):
             local.extend(behavior_analyze_file(p, None, data))
+
+        # Web shield + suspicion engine (v2.4) – same layers as on disk.
+        if cfg.webshield_enabled and not cfg.fast_mode:
+            local.extend(webshield_mod.audit_bytes(name, data,
+                                                   self.threat_intel()))
+        if cfg.risk_enabled and not cfg.fast_mode and not local:
+            f = self._risk_finding(name, p, None, data, sha256, len(data), cfg)
+            if f is not None:
+                local.append(f)
 
         if (
             not local
