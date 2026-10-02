@@ -3612,6 +3612,37 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(result["clean_flagged"], 0)
 
 
+class WebshieldApiTests(WebConsoleTests):
+    """v2.4: /api/webshield + /api/firewall endpoints."""
+
+    def test_webshield_url_report(self):
+        code, data = self._req(
+            "GET", "/api/webshield?url=http%3A%2F%2Fc2node.evilcorp.invalid%2Fx"
+                  "&url=https%3A%2F%2Fwww.example.com%2Fdocs")
+        self.assertEqual(code, 200)
+        reports = {r["url"].split("//")[1].split("/")[0]: r["verdict"]
+                   for r in data["reports"]}
+        self.assertEqual(reports.get("c2node.evilcorp.invalid"), "malicious")
+        self.assertEqual(reports.get("www.example.com"), "safe")
+        self.assertGreater(data["intel"]["domains"], 0)
+
+    def test_webshield_intel_listing(self):
+        code, data = self._req("GET", "/api/webshield")
+        self.assertEqual(code, 200)
+        self.assertIn("domains", data)
+        self.assertIn("c2node.evilcorp.invalid", data["domains"])
+        self.assertIn("4444", data["ports"])
+
+    def test_firewall_endpoint(self):
+        code, data = self._req("GET", "/api/firewall")
+        if code == 501:
+            self.skipTest("no connection-table source on this platform")
+        self.assertEqual(code, 200)
+        self.assertIsInstance(data["connections"], int)
+        self.assertIsInstance(data["alerts"], list)
+        self.assertIn(data["source"], ("proc", "netstat"))
+
+
 class NewCliTests(unittest.TestCase):
     """v2.4: parser plumbing for risk/urlcheck/webshield/firewall/benchmark."""
 

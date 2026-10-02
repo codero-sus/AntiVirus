@@ -177,7 +177,8 @@ def audit(conns: List[Connection], intel: ThreatIntel) -> List[Dict]:
                 **base, "severity": "high", "kind": "intel_ip",
                 "detail": f"remote IP {r_ip} is in the threat-intel blocklist",
             })
-        if (c.state == "ESTABLISHED" and c.proto == "tcp"
+        loopback = l_ip.startswith("127.") and r_ip.startswith("127.")
+        if (c.state == "ESTABLISHED" and c.proto == "tcp" and not loopback
                 and r_port >= 1024 and r_port not in _COMMON_OUTBOUND_PORTS):
             alerts.append({
                 **base, "severity": "low", "kind": "odd_outbound_port",

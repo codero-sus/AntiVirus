@@ -1106,7 +1106,7 @@ class _Handler(BaseHTTPRequestHandler):
         from . import webshield
 
         query = parse_qs(urlsplit(self.path).query)
-        intel = self.scanner.threat_intel()
+        intel = self.app.scanner.threat_intel()
         urls = [u for u in query.get("url", [])][:10]
         if urls:
             reports = [webshield.check_url(u, intel) for u in urls]
