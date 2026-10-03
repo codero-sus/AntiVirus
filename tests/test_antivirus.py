@@ -3720,5 +3720,216 @@ class GuardCliTests(unittest.TestCase):
         self.assertIsNone(state.get("pid"))
 
 
+class V25ApiTests(unittest.TestCase):
+    """v2.5: module API – engine_report / perf / compare on Antivirus."""
+
+    def setUp(self):
+        base = Path(tempfile.mkdtemp(prefix="av-v25api-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        self.base = base
+        self.app = App(base)
+
+    def _av(self):
+        from antivirus import Antivirus
+
+        return Antivirus(config=self.app.config, signatures=None)
+
+    def test_engine_report_api(self):
+        av = self._av()
+        f = self.base / "eicar.txt"
+        f.write_bytes(EICAR)
+        r = av.engine_report(f)
+        self.assertGreaterEqual(r["engines_detected"], 2)
+        self.assertEqual(r["overall_severity"], "critical")
+
+    def test_perf_api(self):
+        av = self._av()
+        r = av.perf(files_per_tier=15, keep_corpus=False)
+        self.assertGreater(r["files"], 0)
+        self.assertGreater(r["cache_speedup"], 1.0)
+
+    def test_compare_api_no_perf(self):
+        av = self._av()
+        r = av.compare(measure_perf=False)
+        self.assertEqual(r["performance"], None)
+        self.assertTrue(r["features"])
+
+
+class EngineTests(unittest.TestCase):
+    """v2.5: VirusTotal-style per-layer engine report."""
+
+    def setUp(self):
+        base = Path(tempfile.mkdtemp(prefix="av-engine-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        self.base = base
+        self.app = App(base)
+
+    def test_eicar_detected_by_hash_and_pattern(self):
+        from antivirus import engine
+
+        f = self.base / "eicar.txt"
+        f.write_bytes(EICAR)
+        r = engine.engine_report(f, self.app.scanner, self.app.config)
+        self.assertGreaterEqual(r["engines_detected"], 2)
+        self.assertEqual(r["overall_severity"], "critical")
+        self.assertIn("of 7", r["consensus"])
+        by = {l["engine"]: l for l in r["layers"]}
+        self.assertEqual(by["hash"]["verdict"], "flagged")
+        self.assertEqual(by["pattern"]["verdict"], "flagged")
+        self.assertEqual(len(r["layers"]), 7)
+
+    def test_clean_file_not_detected(self):
+        from antivirus import engine
+
+        f = self.base / "notes.txt"
+        f.write_bytes(b"nothing to see here, just a note.\n")
+        r = engine.engine_report(f, self.app.scanner, self.app.config)
+        self.assertEqual(r["engines_detected"], 0)
+        self.assertEqual(r["overall_severity"], "clean")
+        self.assertEqual(r["consensus"], "not detected by any engine")
+        self.assertTrue(all(l["verdict"] != "flagged" for l in r["layers"]))
+
+    def test_disguised_file_flagged_by_risk_layer(self):
+        from antivirus import engine
+
+        f = self.base / "invoice.pdf.exe"
+        f.write_bytes(b"pretending to be a pdf but really an executable")
+        r = engine.engine_report(f, self.app.scanner, self.app.config)
+        by = {l["engine"]: l for l in r["layers"]}
+        self.assertEqual(by["risk"]["verdict"], "flagged")
+        self.assertGreaterEqual(r["engines_detected"], 1)
+
+    def test_report_is_json_serializable(self):
+        import json as _json
+
+        from antivirus import engine
+
+        f = self.base / "eicar.txt"
+        f.write_bytes(EICAR)
+        r = engine.engine_report(f, self.app.scanner, self.app.config)
+        self.assertIsInstance(_json.dumps(r), str)
+        for key in ("file", "size", "sha256", "md5", "engines_total",
+                    "consensus", "overall_severity", "layers"):
+            self.assertIn(key, r)
+
+    def test_missing_file_returns_error(self):
+        from antivirus import engine
+
+        r = engine.engine_report(self.base / "nope.bin",
+                                 self.app.scanner, self.app.config)
+        self.assertIn("error", r)
+
+
+class PerfTests(unittest.TestCase):
+    """v2.5: measured performance harness (small corpus)."""
+
+    def test_run_cold_warm_and_latency(self):
+        from antivirus import perf
+
+        base = Path(tempfile.mkdtemp(prefix="av-perf-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        cfg = App(base).config
+        r = perf.run(config=cfg, files_per_tier=20, keep_corpus=False)
+        self.assertGreater(r["files"], 0)
+        self.assertGreater(r["cold"]["seconds"], 0)
+        self.assertEqual(r["cold"]["findings"], r["warm"]["findings"])
+        self.assertEqual(r["warm"]["files_cached"], r["files"])
+        self.assertGreater(r["cache_speedup"], 1.0)
+        lat = r["per_file_latency_s"]
+        self.assertGreaterEqual(lat["p99_ms"], lat["p50_ms"])
+        self.assertIn("cache speedup", perf.summary_line(r))
+
+
+class CompareTests(unittest.TestCase):
+    """v2.5: honest feature + positioning comparison."""
+
+    def test_run_structure(self):
+        from antivirus import compare
+
+        r = compare.run(perf_result=None)
+        self.assertEqual(r["version"], __import__("antivirus").__version__)
+        self.assertEqual(len(r["features"]), 13)
+        for f in r["features"]:
+            self.assertTrue(f["feature"])
+            self.assertTrue(f["detail"])
+        self.assertEqual(len(r["positioning"]), 7)
+        for row in r["positioning"]:
+            for key in ("axis", "this", "commercial"):
+                self.assertTrue(row[key])
+        self.assertIn("coverage", r["honesty_note"])
+        self.assertIn("VirusTotal", r["compared_against"])
+
+    def test_summary_lines(self):
+        from antivirus import compare
+
+        fake = {"files": 100, "megabytes": 40.0,
+                "cold": {"files_per_sec": 50.0, "mb_per_sec": 20.0},
+                "warm": {"files_per_sec": 5000.0, "files_cached": 100},
+                "cache_speedup": 100.0}
+        lines = compare.summary_lines({"performance": fake})
+        self.assertEqual(len(lines), 1)
+        self.assertIn("cache speedup", lines[0])
+        none_lines = compare.summary_lines({"performance": None})
+        self.assertEqual(none_lines, ["performance: (skipped)"])
+
+
+class EngineApiTests(WebConsoleTests):
+    """v2.5: /api/engine endpoint."""
+
+    def test_engine_report_endpoint(self):
+        from urllib.parse import quote
+
+        f = self.base / "eicar.txt"
+        f.write_bytes(EICAR)
+        code, data = self._req(
+            "GET", "/api/engine?path=" + quote(str(f)))
+        self.assertEqual(code, 200)
+        self.assertGreaterEqual(data["engines_detected"], 2)
+        self.assertEqual(data["overall_severity"], "critical")
+        self.assertEqual(len(data["layers"]), 7)
+
+    def test_engine_missing_param(self):
+        code, data = self._req("GET", "/api/engine")
+        self.assertEqual(code, 400)
+        self.assertIn("error", data)
+
+    def test_engine_not_found(self):
+        from urllib.parse import quote
+
+        code, data = self._req(
+            "GET", "/api/engine?path="
+                  + quote(str(self.base / "does-not-exist.bin")))
+        self.assertEqual(code, 404)
+        self.assertIn("error", data)
+
+
+class V25CliTests(unittest.TestCase):
+    """v2.5: parser plumbing for perf / engine / compare."""
+
+    def test_parser_accepts_v25_commands(self):
+        from antivirus.cli import build_parser
+
+        p = build_parser()
+        args = p.parse_args(["perf", "--files", "5"])
+        self.assertEqual(args.command, "perf")
+        self.assertEqual(args.files, 5)
+
+        args = p.parse_args(["engine", "some-file.exe", "--json"])
+        self.assertEqual(args.command, "engine")
+        self.assertEqual(args.file, "some-file.exe")
+        self.assertTrue(args.json)
+
+        args = p.parse_args(["compare", "--no-perf", "--perf-files", "7"])
+        self.assertEqual(args.command, "compare")
+        self.assertTrue(args.no_perf)
+        self.assertEqual(args.perf_files, 7)
+
+    def test_commands_registered(self):
+        from antivirus.cli import _COMMANDS
+
+        for name in ("perf", "engine", "compare"):
+            self.assertIn(name, _COMMANDS)
+
+
 if __name__ == "__main__":
     unittest.main()

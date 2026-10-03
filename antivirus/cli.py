@@ -6,6 +6,7 @@ import hashlib
 import json
 import shutil
 import sys
+import textwrap
 import time
 from pathlib import Path
 from typing import Dict, Optional
@@ -670,6 +671,131 @@ def cmd_benchmark(args) -> int:
     print("Educational corpus: proves the layers work together. It is not a")
     print("real-world malware benchmark - see README for the honest framing.")
     return 0 if good else 1
+
+
+# ----------------------------------------------------------------------- perf
+def cmd_perf(args) -> int:
+    """Measured throughput benchmark: cold vs warm + per-file latency."""
+    from . import perf
+
+    config, db, scanner, quarantine = _build(args)
+    result = perf.run(config=config, files_per_tier=args.files,
+                      keep_corpus=args.keep_corpus)
+    if args.json:
+        result = dict(result, version=__version__)
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
+    print(paint("=" * 62, BOLD))
+    print(paint(f" AntiVirus {__version__} – performance benchmark", BOLD))
+    print(paint("=" * 62, BOLD))
+    cold, warm = result["cold"], result["warm"]
+    print(f"corpus: {result['files']} files / {result['megabytes']:.1f} MiB"
+          f"  (corpus dir: {result['corpus']})")
+    print(f"  cold scan : {cold['seconds']:7.3f} s   "
+          f"{cold['files_per_sec']:9.1f} files/s   {cold['mb_per_sec']:8.2f} MB/s"
+          f"   findings {cold['findings']}")
+    print(f"  warm scan : {warm['seconds']:7.3f} s   "
+          f"{warm['files_per_sec']:9.1f} files/s   {warm['mb_per_sec']:8.2f} MB/s"
+          f"   cached {warm['files_cached']}")
+    speed = result["cache_speedup"]
+    lat = result["per_file_latency_s"]
+    print(f"  cache speedup : {speed:7.1f}x")
+    print(f"  per-file latency (single file, cache warm): "
+          f"p50 {lat['p50_ms']:.1f} ms   p99 {lat['p99_ms']:.1f} ms   "
+          f"mean {lat['mean_ms']:.1f} ms   (n={lat['sample']})")
+    print("-" * 62)
+    print(paint(" Numbers are measured on this machine, for tuning and", GREEN))
+    print(paint(" regression, not a like-for-like claim vs optimized native", GREEN))
+    print(paint(" C++/kernel antivirus engines.", GREEN))
+    return 0
+
+
+# --------------------------------------------------------------------- engine
+def cmd_engine(args) -> int:
+    """VirusTotal-style per-layer engine report for one file."""
+    from . import engine as engine_mod
+
+    config, db, scanner, quarantine = _build(args)
+    path = Path(args.file).expanduser()
+    if not path.exists():
+        print(paint(f"error: no such file: {path}", RED), file=sys.stderr)
+        return 2
+    report = engine_mod.engine_report(path, scanner, config)
+    if args.json:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+        return 0
+    sev_color = {"critical": RED, "high": RED, "medium": YELLOW,
+                 "low": YELLOW, "clean": GREEN}
+    print(paint("=" * 62, BOLD))
+    print(paint(f" Engine report – {report['file']}", BOLD))
+    print(paint("=" * 62, BOLD))
+    print(f"sha256: {report['sha256']}")
+    print(f"md5   : {report['md5']}")
+    print(f"size  : {report['size']:,} bytes")
+    line = report["consensus"]
+    color = sev_color.get(report["overall_severity"], "")
+    print(f"{paint('consensus: ', BOLD)}{paint(line, color)}")
+    print()
+    print(f" {'engine':<10} {'verdict':<10} {'severity':<9} details")
+    print(" " + "-" * 58)
+    for layer in report["layers"]:
+        verdict = {"flagged": paint("FLAG", RED), "clean": "clean",
+                   "info": "info", "n/a": "n/a"}[layer["verdict"]]
+        sev = layer["severity"] or "-"
+        detail = (layer["details"][0] if layer["details"] else "")[:46]
+        print(f" {layer['engine']:<10} {verdict:<10} {sev:<9} {detail}")
+    print(paint("-" * 62, BOLD))
+    print(" Each 'engine' is one detection layer of this tool, shown in the")
+    print(" VirusTotal style. Not 70+ independent third-party AV engines.")
+    return 0
+
+
+# --------------------------------------------------------------------- compare
+def cmd_compare(args) -> int:
+    """Honest feature + positioning comparison, with measured performance."""
+    from . import compare as compare_mod
+    from . import perf as perf_mod
+
+    perf_result = None
+    if not args.no_perf:
+        config, db, scanner, quarantine = _build(args)
+        perf_result = perf_mod.run(config=config,
+                                   files_per_tier=args.perf_files,
+                                   keep_corpus=False)
+
+    result = compare_mod.run(perf_result=perf_result)
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
+
+    against = ", ".join(result["compared_against"])
+    print(paint("=" * 62, BOLD))
+    print(paint(f" AntiVirus {result['version']} – feature & performance "
+                f"comparison", BOLD))
+    print(paint(f" vs {against}", BOLD))
+    print(paint("=" * 62, BOLD))
+
+    print(paint("\n Features (all in this tool):", BOLD))
+    for f in result["features"]:
+        print(f"   • {f['feature']}")
+        print(f"       {f['detail']}")
+
+    print(paint("\n Where it stands on the axes that matter:", BOLD))
+    print(f" {'axis':<38} THIS TOOL  /  commercial free tier")
+    print(" " + "-" * 60)
+    for row in result["positioning"]:
+        print(f" {row['axis']:<38}")
+        print(f"   this      : {row['this']}")
+        print(f"   commercial: {row['commercial']}")
+
+    print(paint("\n Measured performance:", BOLD))
+    for line in compare_mod.summary_lines(result):
+        print(f"   {line}")
+
+    print(paint("\n Honest note:", BOLD))
+    for chunk in textwrap.wrap(result["honesty_note"], 60):
+        print(f"   {chunk}")
+    return 0
 
 
 # ---------------------------------------------------------------------- sig
@@ -1620,6 +1746,35 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true")
     _common_options(p)
 
+    p = sub.add_parser(
+        "perf",
+        help="measured performance: cold vs warm throughput + per-file latency")
+    p.add_argument("--files", type=int, default=150, metavar="N",
+                   help="files per size tier (default 150; "
+                        "~3N files + 5 EICAR total)")
+    p.add_argument("--keep-corpus", action="store_true",
+                   help="keep the generated corpus on disk (default: remove)")
+    p.add_argument("--json", action="store_true")
+    _common_options(p)
+
+    p = sub.add_parser(
+        "engine",
+        help="VirusTotal-style per-layer engine report for one file")
+    _common_options(p)
+    p.add_argument("file", help="file to report on")
+    p.add_argument("--json", action="store_true")
+
+    p = sub.add_parser(
+        "compare",
+        help="honest feature + performance comparison vs AVG / Avast / "
+             "Malwarebytes / VirusTotal")
+    p.add_argument("--no-perf", action="store_true",
+                   help="skip the (slow) live performance measurement")
+    p.add_argument("--perf-files", type=int, default=100, metavar="N",
+                   help="files per tier for the perf measurement (default 100)")
+    p.add_argument("--json", action="store_true")
+    _common_options(p)
+
     p = sub.add_parser("sig", help="inspect or extend the signature database")
     _common_options(p)
     ssub = p.add_subparsers(dest="saction", required=True)
@@ -1837,6 +1992,9 @@ _COMMANDS = {
     "webshield": cmd_webshield,
     "firewall": cmd_firewall,
     "benchmark": cmd_benchmark,
+    "perf": cmd_perf,
+    "engine": cmd_engine,
+    "compare": cmd_compare,
     "sig": cmd_sig,
     "behavior": cmd_behavior,
     "pe": cmd_pe,

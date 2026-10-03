@@ -21,3 +21,7 @@ registry/
 # Rescue disk build output (rescue build)
 rescue-kit/
 rescue.iso
+
+# Performance benchmark artefacts (perf / compare)
+.av-perf-corpus/
+.av-cache-perf/

@@ -32,6 +32,13 @@ Features
   ports, blocklisted IPs, risky listeners - `firewall scan|monitor`
 * Benchmark: `antivirus benchmark` runs the labelled sample corpus and
   reports recall / false positives (100% / 0 on the bundled set)
+* Engine report: `antivirus engine FILE` - a VirusTotal-style table of each
+  detection layer's verdict (hash / pattern / behaviour / url / risk /
+  entropy / archive) with a "detected by N of M engines" consensus
+* Performance: `antivirus perf` - measured cold/warm throughput (files/s,
+  MB/s), cache speedup and per-file latency (p50/p99) on a synthetic corpus
+* Comparison: `antivirus compare` - honest feature + positioning comparison
+  vs AVG / Avast / Malwarebytes / VirusTotal with live perf numbers
 * Multiple front-ends: CLI, Tkinter GUI, curses TUI, web console —
   and a plain-module API for embedding in your own code
 * Runs on Windows, Linux and macOS (the curses TUI is Unix-only; the
@@ -60,7 +67,7 @@ Everything is standard library only (Tkinter/curses are optional and used
 only by their respective front-ends).
 """
 
-__version__ = "2.4.0"
+__version__ = "2.5.0"
 
 from .api import (  # noqa: E402
     Antivirus,

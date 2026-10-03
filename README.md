@@ -106,6 +106,15 @@ watches folders for new/changed files, and writes JSON + text reports.
   `GET /api/firewall`
 - **Benchmark** — `benchmark` runs the fully-labelled 25-file sample corpus
   and reports recall + false positives (100% / 0 on the bundled set)
+- **Performance benchmark** — `perf` measures real throughput: cold vs
+  warm scan (files/s, MB/s), the **cache speedup**, and per-file latency
+  (p50/p99) on a synthetic corpus
+- **Engine report** — `engine FILE` gives a VirusTotal-style per-layer
+  verdict table (hash / pattern / behaviour / url / risk / entropy /
+  archive) with a "detected by N of M engines" consensus, in one read pass
+- **Comparison** — `compare` prints the honest feature + positioning
+  picture vs AVG / Avast / Malwarebytes / VirusTotal, with live `perf`
+  numbers (no inflated "beats commercial AV" claims)
 - **Reports** — every scan writes a JSON report and a human-readable text
   report
 - **Signature editor** — add your own signatures from the CLI (hash or
@@ -705,7 +714,9 @@ $ antivirus firewall monitor --interval 5
 Same intel database as the web shield, so `webshield add` feeds both. Web
 console: `GET /api/firewall`.
 
-## Benchmark – can it beat AVG / Avast?
+## Performance & comparison
+
+### Detection benchmark (`benchmark`)
 
 `antivirus benchmark` runs the bundled, **fully-labelled sample corpus**
 (25 files: EICAR string, behavioural scripts, code-less PE/ELF images,
@@ -723,9 +734,68 @@ layers work together and gives you a regression check when you add
 signatures or intel. It is **not** a claim of commercial parity — real
 detection coverage comes from a large, continuously updated signature and
 intelligence base, which this educational engine replaces with *your own*
-signatures, IOCs and the heuristic layers above (plus the kill engine,
-guard, quarantine and rescue workflows commercial products also charge
-for). Extend it, benchmark again, and watch the numbers move.
+signatures, IOCs and the heuristic layers above.
+
+### Throughput benchmark (`perf`)
+
+`antivirus perf` measures scan throughput on a synthetic corpus
+(three size tiers, 2 KiB / 64 KiB text + 1 MiB binary, plus a few known
+threats). It does a **cold** pass (fresh empty cache — every file read +
+analysed + recorded) and a **warm** pass (second run, unchanged files
+served from the verdict cache), and samples per-file latency:
+
+```console
+$ antivirus perf --files 150
+ corpus: 455 files / 159.7 MiB
+   cold scan :   6.289 s        72.3 files/s      25.39 MB/s   findings 155
+   warm scan :   0.037 s     12447.7 files/s    4368.15 MB/s   cached 455
+   cache speedup :   172.1x
+   per-file latency (single file, cache warm): p50 35.4 ms  p99 42.4 ms  mean 28.2 ms
+```
+
+These are real numbers, measured on your machine — use them to tune
+`--threads` and to catch regressions. They are **not** a like-for-like
+claim against optimized native C++ / kernel antivirus engines, which are a
+different category. The headline is the *cache speedup*: rescans of
+unchanged files are nearly free, which is exactly what makes the background
+`guard` and repeated `verify` runs cheap.
+
+### Per-layer engine report (`engine`)
+
+`antivirus engine FILE` gives a **VirusTotal-style table** for one file:
+each detection layer runs as its own "engine" and reports its verdict,
+plus a consensus line —
+
+```console
+$ antivirus engine eicar-test.txt
+ engine     verdict    severity  details
+ hash       FLAG       critical  matches 'EICAR-STD-2014' (EICAR-Test-File)
+ pattern    FLAG       critical  pattern of 'EICAR-STD-2014' found
+ behaviour  clean      info      ...
+ url        clean      info      ...
+ risk       FLAG       high      score 71/100
+ entropy    clean      info      ...
+ archive    clean      info      ...
+ consensus: detected by 2 of 7 engines
+```
+
+The seven "engines" are this tool's layers — `hash`, `pattern`,
+`behaviour`, `url` (web shield), `risk` (suspicion engine), `entropy`,
+`archive` — shown in the VT style so you can see *which* layers agree. The
+file is read once. (They are not 70+ independent third-party AV vendors.)
+
+### How does it stack up? (`compare`)
+
+`antivirus compare` prints the concrete feature set, an honest
+positioning table against **AVG (free), Avast (free), Malwarebytes (free)
+and VirusTotal**, and live `perf` numbers. Where this tool genuinely
+leads: open source & auditable, **zero telemetry** (nothing leaves the
+machine), a clean scriptable Python + JSON API, fully offline, and a set
+of operational features — guard, kill+revive, FIM baselines, rescue disk,
+SIEM-ready export, in-file URL/web shield, no-root firewall audit — in the
+free core. Where the commercial engines genuinely lead: **real-world
+malware coverage** (huge continuously-updated signature + cloud + ML) and
+scale. `antivirus compare` says all of this plainly.
 
 ## Command reference
 
@@ -741,6 +811,9 @@ for). Extend it, benchmark again, and watch the numbers move.
 | `firewall scan [--json] [--quiet]` | Live connection audit (no root): backdoor ports, blocklisted IPs, risky listeners |
 | `firewall monitor [--interval 5]` | Watch for new suspicious connections |
 | `benchmark [--samples DIR] [--json]` | Run the labelled sample corpus: recall + false positives |
+| `perf [--files N] [--keep-corpus] [--json]` | Measured throughput: cold vs warm (files/s, MB/s), cache speedup, per-file p50/p99 |
+| `engine FILE [--json]` | VirusTotal-style per-layer engine report + "detected by N of M" consensus |
+| `compare [--no-perf] [--perf-files N] [--json]` | Honest feature + performance comparison vs AVG / Avast / Malwarebytes / VirusTotal |
 | `hash FILE… [--json]` | Print SHA-256 / MD5 / SHA-1 digests + size of each file |
 | `behavior analyze FILE [--json]` | Show what one file appears to do (static behavioural analysis) |
 | `pe analyze FILE [--json]` | Full static PE dissection ("debug report") + red-flag indicators |
@@ -943,6 +1016,9 @@ antivirus/
 ├── webshield.py     # web shield: URL extraction + reputation scoring
 ├── firewall.py      # live connection-table audit (no root needed)
 ├── benchmark.py     # labelled-corpus detection benchmark
+├── engine.py        # VirusTotal-style per-layer engine report (consensus)
+├── perf.py          # measured throughput benchmark (cold/warm + latency)
+├── compare.py       # honest feature + positioning comparison
 ├── report.py        # JSON + text report writer, diff, summary, export
 ├── selftest.py      # built-in end-to-end self test
 ├── output.py        # tiny ANSI colour helper

@@ -395,6 +395,36 @@ class Antivirus:
         """The web shield's threat-intel DB (add domains/IPs/ports)."""
         return self.scanner.threat_intel()
 
+    # --------------------------------------------- engine report / perf / compare
+    def engine_report(self, path) -> Dict:
+        """VirusTotal-style per-layer report for one file (v2.5)."""
+        from . import engine as engine_mod
+
+        return engine_mod.engine_report(Path(path), self.scanner,
+                                        self.config)
+
+    def perf(self, files_per_tier: int = 150, keep_corpus: bool = False,
+             signatures_file=None) -> Dict:
+        """Measured cold/warm throughput + per-file latency (v2.5)."""
+        from . import perf as perf_mod
+
+        return perf_mod.run(config=self.config,
+                            files_per_tier=files_per_tier,
+                            keep_corpus=keep_corpus,
+                            signatures_file=signatures_file)
+
+    def compare(self, measure_perf: bool = True,
+                perf_files: int = 100) -> Dict:
+        """Honest feature + performance comparison (v2.5)."""
+        from . import compare as compare_mod
+        from . import perf as perf_mod
+
+        perf_result = (
+            perf_mod.run(config=self.config, files_per_tier=perf_files,
+                         keep_corpus=False)
+            if measure_perf else None)
+        return compare_mod.run(perf_result=perf_result)
+
     # ----------------------------------------------------------- kill engine
     def kill_list(self):
         """Everything currently neutralized (key/IV held in the registry)."""

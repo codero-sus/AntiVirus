@@ -600,6 +600,41 @@ def run_selftest(signatures_file: Optional[str] = None) -> int:
             check("benchmark: 100% of labelled threats detected, "
                   "0 false positives", True)  # running from a kit
 
+        # -- engine report + perf + compare (v2.5) ----------------------------
+        from . import compare as compare_mod
+        from . import engine as engine_mod
+        from . import perf as perf_mod
+
+        eng_file = workdir / "eicar-engine.txt"
+        eng_file.write_bytes(EICAR)
+        eng_report = engine_mod.engine_report(eng_file, scanner, config)
+        check("engine: EICAR flagged by >=2 of 7 layers, consensus present",
+              eng_report["engines_detected"] >= 2
+              and eng_report["overall_severity"] == "critical"
+              and len(eng_report["layers"]) == 7
+              and "of 7" in eng_report["consensus"],
+              str(eng_report.get("consensus")))
+
+        clean_file = workdir / "clean-engine.txt"
+        clean_file.write_text("totally ordinary text\n")
+        clean_report = engine_mod.engine_report(clean_file, scanner, config)
+        check("engine: clean file reported by 0 of 7 engines",
+              clean_report["engines_detected"] == 0
+              and clean_report["overall_severity"] == "clean")
+
+        perf_result = perf_mod.run(config=config, files_per_tier=20,
+                                   keep_corpus=False)
+        check("perf: warm scan served from cache, speedup > 1",
+              perf_result["warm"]["files_cached"] == perf_result["files"]
+              and perf_result["cache_speedup"] > 1.0,
+              perf_mod.summary_line(perf_result))
+
+        comp = compare_mod.run(perf_result=None)
+        check("compare: feature matrix + positioning + honesty note",
+              len(comp["features"]) >= 10
+              and len(comp["positioning"]) >= 5
+              and "coverage" in comp["honesty_note"])
+
         # -- rescue disk (v2.0) ------------------------------------------------
         from .rescue import (
             KIT_FILES,

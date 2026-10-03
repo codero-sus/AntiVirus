@@ -24,6 +24,7 @@ Serves a single-page dashboard plus a small JSON API:
     POST /api/kill/purge       {"id"} – destroy a killed file + entry
     GET  /api/webshield        ?url=… – score URL(s), or the intel DB
     GET  /api/firewall         live connection snapshot + alerts
+    GET  /api/engine           ?path=… – VirusTotal-style per-layer report
 
 Scans run in background threads (jobs) so the UI can poll live progress.
 This is a *local* tool: there is no authentication – bind it to an
@@ -592,6 +593,9 @@ a{color:#2f81f7}
     (repeatable) — web shield verdicts; without a URL: the threat-intel DB</td></tr>
 <tr><td><code>/api/firewall</code></td><td>GET</td><td>live network-connection
     snapshot + security alerts (501 when the platform has no table)</td></tr>
+<tr><td><code>/api/engine</code></td><td>GET</td><td><code>?path=…</code> —
+    VirusTotal-style per-layer engine report (7 engines + consensus) for one
+    file</td></tr>
 <tr><td><code>/api/docs</code></td><td>GET</td><td>this page</td></tr>
 </table>
 <h2>Example (curl)</h2>
@@ -1003,6 +1007,8 @@ class _Handler(BaseHTTPRequestHandler):
                 self._webshield()
             elif path == "/api/firewall":
                 self._firewall()
+            elif path == "/api/engine":
+                self._engine()
             elif path == "/api/docs":
                 self._send(200, DOCS_PAGE.encode("utf-8"),
                            "text/html; charset=utf-8")
@@ -1128,6 +1134,28 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(200, firewall.scan())
         except RuntimeError as exc:
             self._json(501, {"error": str(exc)})
+
+    def _engine(self) -> None:
+        from urllib.parse import parse_qs
+
+        from . import engine
+
+        query = parse_qs(urlsplit(self.path).query)
+        path = (query.get("path") or [""])[0].strip()
+        if not path:
+            self._json(400, {"error": "path query parameter is required"})
+            return
+        target = Path(path).expanduser()
+        if not target.is_file():
+            self._json(404, {"error": f"no such file: {path}"})
+            return
+        try:
+            report = engine.engine_report(target, self.app.scanner,
+                                          self.app.config)
+        except Exception as exc:
+            self._json(500, {"error": str(exc)})
+            return
+        self._json(200, report)
 
     def _verify(self) -> None:
         from urllib.parse import parse_qs
