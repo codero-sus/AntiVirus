@@ -138,8 +138,9 @@ class EfficiencyTests(unittest.TestCase):
         self.app.scanner.threads = 8
         parallel = self.app.scanner.scan_path(base)
         for res in (serial, one, parallel):
-            # 30 ordinary + infected.bin + signatures.json copied in by App()
-            self.assertEqual(res.files_scanned, 32)
+            # 30 ordinary + infected.bin (the signatures.json copied in by
+            # App() is the engine's own DB and is always skipped)
+            self.assertEqual(res.files_scanned, 31)
             # infected.bin is EICAR with padding -> hash differs, pattern hits
             self.assertEqual(
                 sorted((f.path, f.kind) for f in res.findings),
@@ -1948,7 +1949,9 @@ class StatsTests(unittest.TestCase):
         try:
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
-                rc = main(["scan", str(base), "--json"])
+                rc = main(["scan", str(base),
+                           "--signatures", str(app.config.signatures_file),
+                           "--json"])
             self.assertEqual(rc, 1)
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
@@ -3720,6 +3723,111 @@ class GuardCliTests(unittest.TestCase):
         self.assertIsNone(state.get("pid"))
 
 
+class RealworldTests(unittest.TestCase):
+    """v2.6: real-world detection pack (sourced IOC signatures + scoreboard)."""
+
+    BUNDLED = Path(__file__).resolve().parent.parent / "data" / \
+        "signatures.json"
+
+    def _db(self):
+        from antivirus.signatures import SignatureDB
+
+        return SignatureDB(self.BUNDLED)
+
+    def test_pack_loaded_and_sourced(self):
+        from antivirus.realworld import realworld_signatures
+
+        db = self._db()
+        sigs = realworld_signatures(db)
+        self.assertGreaterEqual(len(sigs), 20)
+        families = {s.family for s in sigs}
+        self.assertGreaterEqual(len(families), 15)
+        for expected in ("WannaCry", "Ryuk", "LockBit", "Stuxnet",
+                         "Cobalt Strike", "Emotet", "TrickBot", "Dridex",
+                         "Mirai", "XMRig"):
+            self.assertIn(expected, families)
+        for s in sigs:
+            self.assertTrue(s.source, f"{s.id} has no source")
+            self.assertTrue(s.indicator in ("sha256", "md5", "pattern"))
+        for s in sigs:
+            if s.indicator == "pattern":
+                self.assertIsNotNone(s.compiled, f"{s.id} pattern broken")
+
+    def test_run_detects_all_pattern_families(self):
+        import tempfile
+
+        from antivirus.config import Config
+        from antivirus.realworld import run
+
+        base = Path(tempfile.mkdtemp(prefix="av-rw-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        cfg = Config()
+        cfg.quarantine_dir = base / "q"
+        cfg.report_dir = base / "r"
+        cfg.signatures_file = self.BUNDLED
+        r = run(config=cfg, corpus_dir=base / "corpus")
+        self.assertGreaterEqual(r["families_total"], 15)
+        self.assertEqual(r["families_detected"], r["families_pattern"])
+        self.assertEqual(r["clean_false_positives"], 0)
+        detected = {row["family"] for row in r["rows"]
+                    if row["status"] == "detected"}
+        self.assertIn("WannaCry", detected)
+        self.assertIn("Stuxnet", detected)
+        self.assertIn("Cobalt Strike", detected)
+        hash_only = {row["family"] for row in r["rows"]
+                     if row["status"] == "hash-only"}
+        self.assertIn("Emotet", hash_only)
+        self.assertIn("TrickBot", hash_only)
+
+    def test_own_signature_db_is_never_scanned(self):
+        import tempfile
+
+        from antivirus.config import Config
+        from antivirus.scanner import Scanner
+        from antivirus.signatures import SignatureDB
+
+        base = Path(tempfile.mkdtemp(prefix="av-selfskip-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        cfg = Config()
+        cfg.quarantine_dir = base / "quarantine"
+        cfg.report_dir = base / "reports"
+        cfg.signatures_file = base / "signatures.json"
+        shutil.copyfile(self.BUNDLED, cfg.signatures_file)
+        (base / "e.txt").write_bytes(EICAR)
+        (base / "c.txt").write_text("fine\n")
+        db = SignatureDB(cfg.signatures_file)
+        sc = Scanner(cfg, db)
+        result = sc.scan_path(base)
+        # exactly one finding (the EICAR file); the engine's own DB - which
+        # contains the IOC text as data - must not be flagged
+        self.assertEqual(len(result.findings), 1)
+        self.assertTrue(result.findings[0].path.endswith("e.txt"))
+
+    def test_corpus_is_inert(self):
+        import tempfile
+
+        from antivirus.realworld import build_corpus
+
+        base = Path(tempfile.mkdtemp(prefix="av-rwcorpus-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        files = build_corpus(base)
+        self.assertEqual(len(files), 17)
+        # every non-EICAR sample carries the inert header (or is a clean
+        # file); the XMRig config is valid JSON and instead carries the
+        # documented pool IOC only
+        for p in files:
+            data = p.read_bytes()
+            if p.name in ("eicar-test.txt", "xmrig-config.json"):
+                continue
+            self.assertTrue(
+                data.startswith(b"INERT DEMO") or p.name.startswith("clean-"),
+                f"{p.name} missing inert header")
+        line = __import__("antivirus.realworld", fromlist=["verdict_line"]) \
+            .verdict_line({"families_total": 15, "families_pattern": 13,
+                           "families_detected": 13, "clean_false_positives": 0})
+        self.assertIn("13/13", line)
+
+
 class V25ApiTests(unittest.TestCase):
     """v2.5: module API – engine_report / perf / compare on Antivirus."""
 
@@ -3753,6 +3861,16 @@ class V25ApiTests(unittest.TestCase):
         r = av.compare(measure_perf=False)
         self.assertEqual(r["performance"], None)
         self.assertTrue(r["features"])
+
+    def test_realworld_api(self):
+        import tempfile
+
+        av = self._av()
+        base = Path(tempfile.mkdtemp(prefix="av-rwapi-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        r = av.realworld(corpus_dir=base / "corpus")
+        self.assertEqual(r["families_detected"], r["families_pattern"])
+        self.assertEqual(r["clean_false_positives"], 0)
 
 
 class EngineTests(unittest.TestCase):
@@ -3848,7 +3966,7 @@ class CompareTests(unittest.TestCase):
 
         r = compare.run(perf_result=None)
         self.assertEqual(r["version"], __import__("antivirus").__version__)
-        self.assertEqual(len(r["features"]), 13)
+        self.assertEqual(len(r["features"]), 14)
         for f in r["features"]:
             self.assertTrue(f["feature"])
             self.assertTrue(f["detail"])
@@ -3924,10 +4042,15 @@ class V25CliTests(unittest.TestCase):
         self.assertTrue(args.no_perf)
         self.assertEqual(args.perf_files, 7)
 
+        args = p.parse_args(["realworld", "--rebuild", "--json"])
+        self.assertEqual(args.command, "realworld")
+        self.assertTrue(args.rebuild)
+        self.assertTrue(args.json)
+
     def test_commands_registered(self):
         from antivirus.cli import _COMMANDS
 
-        for name in ("perf", "engine", "compare"):
+        for name in ("perf", "engine", "compare", "realworld"):
             self.assertIn(name, _COMMANDS)
 
 

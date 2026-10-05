@@ -25,3 +25,6 @@ rescue.iso
 # Performance benchmark artefacts (perf / compare)
 .av-perf-corpus/
 .av-cache-perf/
+
+# Real-world pack corpus (auto-built by `antivirus realworld`)
+samples/realworld/

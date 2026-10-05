@@ -1,14 +1,16 @@
 {
   "version": 1,
-  "updated": "2026-10-01",
-  "note": "Bundled educational threat-intel set. Domains use the reserved .invalid / example TLDs (RFC 2606 - they can never resolve); IPs use the reserved documentation ranges (TEST-NET-1/2). Extend with real indicators via `antivirus webshield add DOMAIN|IP` or plain-text IOC import.",
+  "updated": "2026-10-05",
+  "note": "Bundled threat-intel set. Educational entries use reserved .invalid / example TLDs (RFC 2606) and TEST-NET ranges; the pack also carries a few REAL documented indicators (dead WannaCry killswitch domain, default XMRig pool, documented Emotet C2 port) - provenance in data/signatures.json. Extend with `antivirus webshield add DOMAIN|IP|PORT` or plain-text IOC import.",
   "domains": [
     "malware-sample.example.com",
     "c2node.evilcorp.invalid",
     "update.evilcorp.invalid",
     "payload.dropzone.invalid",
     "tracker.evilcorp.invalid",
-    "stealer.evilcorp.invalid"
+    "stealer.evilcorp.invalid",
+    "iuqerfsodp9ifjaposdfjhgosurijfaewrwergwea.com",
+    "pool.minexmr.com"
   ],
   "ips": [
     "192.0.2.10",
@@ -21,7 +23,8 @@
     "4431": "common backdoor port",
     "31337": "Back Orifice",
     "1337": "common backdoor port",
-    "6667": "IRC (classic malware channel)"
+    "6667": "IRC (classic malware channel)",
+    "7080": "Emotet C2 port (documented)"
   },
   "listen_ports": {
     "21": "FTP (cleartext credentials)",

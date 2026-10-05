@@ -635,6 +635,28 @@ def run_selftest(signatures_file: Optional[str] = None) -> int:
               and len(comp["positioning"]) >= 5
               and "coverage" in comp["honesty_note"])
 
+        # -- real-world detection pack (v2.6) ------------------------------
+        from . import realworld as realworld_mod
+
+        rw_sigs = realworld_mod.realworld_signatures(db)
+        rw_families = {s.family for s in rw_sigs}
+        rw_patterns_ok = all(
+            s.compiled is not None for s in rw_sigs if s.indicator == "pattern")
+        check("realworld: sourced IOC pack loaded (>=15 families, "
+              "patterns compile)",
+              len(rw_sigs) >= 15 and len(rw_families) >= 15
+              and rw_patterns_ok
+              and all(s.source for s in rw_sigs),
+              f"{len(rw_sigs)} signatures, {len(rw_families)} families")
+
+        rw = realworld_mod.run(config=config,
+                               corpus_dir=workdir / "realworld",
+                               rebuild=True)
+        check("realworld: every pattern family detected, 0 false positives",
+              rw["families_detected"] == rw["families_pattern"]
+              and rw["clean_false_positives"] == 0,
+              realworld_mod.verdict_line(rw))
+
         # -- rescue disk (v2.0) ------------------------------------------------
         from .rescue import (
             KIT_FILES,

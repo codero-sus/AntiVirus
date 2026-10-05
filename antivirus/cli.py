@@ -798,6 +798,47 @@ def cmd_compare(args) -> int:
     return 0
 
 
+# ---------------------------------------------------------------- realworld
+def cmd_realworld(args) -> int:
+    """Score the engine against the sourced real-world IOC pack."""
+    from . import realworld as realworld_mod
+
+    config, db, scanner, quarantine = _build(args)
+    result = realworld_mod.run(config=config,
+                               corpus_dir=args.corpus,
+                               rebuild=args.rebuild)
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
+    print(paint("=" * 72, BOLD))
+    print(paint(f" Real-world detection pack – AntiVirus {__version__}", BOLD))
+    print(paint("=" * 72, BOLD))
+    n_sig = len(realworld_mod.realworld_signatures(db))
+    print(f"{result['families_total']} real malware families, {n_sig} sourced "
+          f"signatures (each carries its public research source)")
+    print(f"corpus: {result['corpus']} ({result['files']} inert files)")
+    print()
+    print(f" {'family':<26} {'kind':<14} {'status':<10} matched file")
+    print(" " + "-" * 70)
+    for row in result["rows"]:
+        mark = paint("DETECTED", GREEN) if row["status"] == "detected" \
+            else paint("hash-only", DIM)
+        matched = Path(row["matched_file"]).name if row["matched_file"] else "-"
+        print(f" {row['family']:<26} {row['kind']:<14} {mark:<10} {matched}")
+    print(paint("-" * 72, BOLD))
+    line = realworld_mod.verdict_line(result)
+    good = (result["families_detected"] == result["families_pattern"]
+            and result["clean_false_positives"] == 0)
+    print(paint(f" {line}", GREEN if good else RED))
+    print()
+    print(" Inert samples contain only publicly documented IOCs - no live")
+    print(" malware. 'hash-only' families match real samples by documented")
+    print(" SHA-256. Commercial engines additionally catch unseen variants")
+    print(" via continuously updated databases, cloud and ML - extend this")
+    print(" pack with your own IOCs: antivirus sig import FILE")
+    return 0 if good else 1
+
+
 # ---------------------------------------------------------------------- sig
 def cmd_sig(args) -> int:
     config, db, scanner, quarantine = _build(args)
@@ -1775,6 +1816,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true")
     _common_options(p)
 
+    p = sub.add_parser(
+        "realworld",
+        help="score the engine against the sourced real-world IOC pack "
+             "(15 named families, inert samples)")
+    p.add_argument("--corpus", default=None, metavar="DIR",
+                   help="corpus directory (default ./samples/realworld)")
+    p.add_argument("--rebuild", action="store_true",
+                   help="force-rebuild the inert corpus")
+    p.add_argument("--json", action="store_true")
+    _common_options(p)
+
     p = sub.add_parser("sig", help="inspect or extend the signature database")
     _common_options(p)
     ssub = p.add_subparsers(dest="saction", required=True)
@@ -1995,6 +2047,7 @@ _COMMANDS = {
     "perf": cmd_perf,
     "engine": cmd_engine,
     "compare": cmd_compare,
+    "realworld": cmd_realworld,
     "sig": cmd_sig,
     "behavior": cmd_behavior,
     "pe": cmd_pe,

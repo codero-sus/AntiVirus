@@ -234,6 +234,25 @@ class Scanner:
         self._cached_version: Optional[int] = None
         #: Threat-intel DB for the web shield (lazy-loaded).
         self._intel: Optional[ThreatIntel] = None
+        #: The engine's own config files (signature DB, threat intel).
+        #: They contain the very IOC text the patterns look for, so scanning
+        #: them would be a self-match false positive – they are skipped.
+        self._self_files: set = self._self_file_set(config)
+
+    @staticmethod
+    def _self_file_set(config: Config) -> set:
+        out = set()
+        for p in (config.signatures_file, config.threat_intel_file,
+                  config.intel_user_file):
+            pp = Path(p).expanduser()
+            out.add(os.path.normpath(str(pp)))
+            if not os.path.isabs(str(pp)):
+                out.add(os.path.normpath(os.path.join(os.getcwd(), str(pp))))
+            try:
+                out.add(os.path.normpath(str(pp.resolve())))
+            except (OSError, RuntimeError):
+                pass
+        return out
 
     def threat_intel(self) -> ThreatIntel:
         """The web shield's threat-intel DB (lazy, cached).
@@ -495,6 +514,11 @@ class Scanner:
             except OSError as exc:
                 result.errors.append(f"{path}: {exc}")
                 return
+        # The engine's own signature / threat-intel DBs contain the very IOC
+        # text the patterns look for; scanning them is a self-match false
+        # positive, so they are always skipped.
+        if self._is_self_file(path):
+            return
         size = st.st_size
 
         if size > self.config.max_file_size:
@@ -634,6 +658,15 @@ class Scanner:
 
         result.findings.extend(local)
         result.scanned_paths[str(path)] = local
+
+    def _is_self_file(self, path: Path) -> bool:
+        s = str(path)
+        if os.path.normpath(s) in self._self_files:
+            return True
+        if not os.path.isabs(s):
+            return os.path.normpath(
+                os.path.join(os.getcwd(), s)) in self._self_files
+        return False
 
     # ----------------------------------------------------------- in-memory
     @staticmethod

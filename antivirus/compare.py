@@ -44,6 +44,11 @@ FEATURES: List[Dict] = [
                "stays on the live side"},
     {"feature": "Multi-layer engine report (VT-style consensus)",
      "detail": "engine FILE – each layer's verdict + 'detected by N of M'"},
+    {"feature": "Real-world detection pack (sourced, auditable)",
+     "detail": "21 IOC signatures for 15 named real malware families "
+               "(WannaCry, Ryuk, LockBit, Stuxnet, Cobalt Strike, Emotet, "
+               "TrickBot, Dridex, Mirai, XMRig, ...) - each with its public "
+               "research source; realworld scores 13/13 + 0 FP"},
     {"feature": "Scriptable Python module API",
      "detail": "import antivirus; Antivirus() engine, scan/risk/url/firewall"},
     {"feature": "SIEM-ready export",
@@ -72,8 +77,11 @@ POSITIONING: List[Dict] = [
      "this": "yes – signatures + heuristics, no cloud needed",
      "commercial": "hybrid local+cloud; VirusTotal is cloud-only"},
     {"axis": "Real-world malware coverage",
-     "this": "signature + behaviour + heuristic; extend with your own",
-     "commercial": "far larger, continuously updated DBs + cloud + ML"},
+     "this": "sourced IOC pack for 15 real named families (WannaCry, Ryuk, "
+             "LockBit, Stuxnet, Cobalt Strike, Emotet, ...) + your own via "
+             "sig import - a real, auditable start",
+     "commercial": "far larger: millions of continuously updated signatures "
+                   "+ cloud lookups + ML on billions of samples"},
     {"axis": "Guard / kill+revive / FIM / rescue / SIEM export",
      "this": "built in, in the free core",
      "commercial": "split across paid / enterprise tiers"},
@@ -97,12 +105,15 @@ def run(perf_result: Optional[Dict] = None) -> Dict:
             "Detection coverage is the one axis the commercial engines "
             "genuinely lead: they maintain huge, continuously updated "
             "signature databases, cloud lookups and ML trained on billions "
-            "of samples. This engine is lightweight, open and educational "
-            "by design; it leads on transparency, no telemetry, "
-            "scriptability and a broad set of operational features – not on "
-            "raw real-world malware coverage. Performance numbers below are "
-            "measured on this machine and are for tuning/regression, not a "
-            "like-for-like claim against optimized C++/kernel engines."),
+            "of samples, and they catch unseen variants. This engine now "
+            "ships a sourced IOC pack for 15 real named families (real "
+            "detection with auditable provenance) and leads on "
+            "transparency, no telemetry, scriptability and a broad set of "
+            "operational features – but it does not out-detect them on raw "
+            "real-world coverage, and it says so. Performance numbers below "
+            "are measured on this machine and are for tuning/regression, "
+            "not a like-for-like claim against optimized C++/kernel "
+            "engines."),
     }
 
 

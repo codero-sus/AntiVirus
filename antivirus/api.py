@@ -425,6 +425,13 @@ class Antivirus:
             if measure_perf else None)
         return compare_mod.run(perf_result=perf_result)
 
+    def realworld(self, corpus_dir=None, rebuild: bool = False) -> Dict:
+        """Score the engine against the sourced real-world IOC pack (v2.6)."""
+        from . import realworld as realworld_mod
+
+        return realworld_mod.run(config=self.config, corpus_dir=corpus_dir,
+                                 rebuild=rebuild)
+
     # ----------------------------------------------------------- kill engine
     def kill_list(self):
         """Everything currently neutralized (key/IV held in the registry)."""

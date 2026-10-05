@@ -99,6 +99,10 @@ class Signature:
     At least one of ``sha256``, ``md5`` or ``pattern`` should be set:
     hashes identify a file exactly, a pattern is a regular expression that
     is matched against the raw file bytes.
+
+    ``family`` / ``source`` / ``indicator`` are provenance metadata used by
+    the real-world detection pack and the ``realworld`` scoreboard.  They are
+    optional – plain EICAR / user-added signatures leave them blank.
     """
 
     id: str
@@ -109,6 +113,9 @@ class Signature:
     sha256: str = ""
     md5: str = ""
     pattern: str = ""
+    family: str = ""
+    source: str = ""
+    indicator: str = ""     # "sha256" | "md5" | "pattern" | ""
 
     @property
     def compiled(self) -> Optional["re.Pattern[bytes]"]:

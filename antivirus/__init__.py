@@ -39,6 +39,11 @@ Features
   MB/s), cache speedup and per-file latency (p50/p99) on a synthetic corpus
 * Comparison: `antivirus compare` - honest feature + positioning comparison
   vs AVG / Avast / Malwarebytes / VirusTotal with live perf numbers
+* Real-world detection pack: sourced IOC signatures for 15 real named
+  malware families (WannaCry, Ryuk, LockBit, Stuxnet, Cobalt Strike,
+  Emotet, TrickBot, Dridex, Mirai, XMRig, ...) - each signature carries its
+  public research source; `antivirus realworld` scores the pack against an
+  inert sample corpus (13/13 detected, 0 false positives)
 * Multiple front-ends: CLI, Tkinter GUI, curses TUI, web console —
   and a plain-module API for embedding in your own code
 * Runs on Windows, Linux and macOS (the curses TUI is Unix-only; the
@@ -67,7 +72,7 @@ Everything is standard library only (Tkinter/curses are optional and used
 only by their respective front-ends).
 """
 
-__version__ = "2.5.0"
+__version__ = "2.6.0"
 
 from .api import (  # noqa: E402
     Antivirus,
