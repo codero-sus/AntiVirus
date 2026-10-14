@@ -32,8 +32,8 @@ from .signatures import SignatureDB
 from .utils import md5_new
 
 #: The "engines", in report order.
-_ENGINES = ("hash", "pattern", "behaviour", "url", "risk", "entropy",
-            "archive")
+_ENGINES = ("hash", "pattern", "behaviour", "polyglot", "obfuscation",
+            "url", "risk", "entropy", "archive")
 
 _SEV_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
 
@@ -71,6 +71,8 @@ def _worst(findings: List[Finding]) -> str:
 def engine_report(path, scanner, config: Optional[Config] = None) -> Dict:
     """Run every layer over one file and return a consensus-style report."""
     from . import behavior as behavior_mod
+    from . import obfuscation as obfuscation_mod
+    from . import polyglot as polyglot_mod
     from . import risk as risk_mod
     from . import webshield as webshield_mod
 
@@ -143,6 +145,32 @@ def engine_report(path, scanner, config: Optional[Config] = None) -> Dict:
             "behaviour", "Behavioural analysis", "clean", "info",
             ["skipped – not executable-looking"]
             if not config.behavior_enabled else [])
+
+    # -- polyglot (v2.7) --------------------------------------------------
+    if config.polyglot_enabled:
+        pg = polyglot_mod.analyze(str(p), content)
+        layers["polyglot"] = (
+            LayerVerdict("polyglot", "Polyglot detection", "flagged",
+                         _worst(pg), _findings_to_details(pg))
+            if pg else
+            LayerVerdict("polyglot", "Polyglot detection", "clean", "info"))
+    else:
+        layers["polyglot"] = LayerVerdict(
+            "polyglot", "Polyglot detection", "clean", "info", ["disabled"])
+
+    # -- obfuscation (v2.7) -----------------------------------------------
+    if config.obfuscation_enabled:
+        ob = obfuscation_mod.analyze(str(p), content)
+        layers["obfuscation"] = (
+            LayerVerdict("obfuscation", "Obfuscation techniques", "flagged",
+                         _worst(ob), _findings_to_details(ob))
+            if ob else
+            LayerVerdict("obfuscation", "Obfuscation techniques", "clean",
+                         "info"))
+    else:
+        layers["obfuscation"] = LayerVerdict(
+            "obfuscation", "Obfuscation techniques", "clean", "info",
+            ["disabled"])
 
     # -- url (web shield) -------------------------------------------------
     if config.webshield_enabled:

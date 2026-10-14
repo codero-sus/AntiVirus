@@ -17,6 +17,8 @@ quarantine/
 reports/
 .av-cache
 registry/
+# standing trust baseline (per-machine state, not a shared signature)
+data/trust_baseline.json
 
 # Rescue disk build output (rescue build)
 rescue-kit/

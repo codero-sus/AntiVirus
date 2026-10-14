@@ -15,6 +15,10 @@ from . import __version__
 from .behavior import analyze_file as behavior_analyze_file
 from .behavior import looks_executable as behavior_looks_executable
 from .config import Config
+from .integrity import (MUTATED, MISSING, load_trust_baseline,
+                        mass_mutation_finding, mutations_report, trust_add,
+                        trust_clear, trust_list, trust_remove,
+                        trust_snapshot)
 from .gui import run_gui
 from .monitor import DirectoryWatcher
 from .pe import (
@@ -1031,6 +1035,121 @@ def cmd_verify(args) -> int:
     return 0 if not findings else 1
 
 
+# ------------------------------------------------------------------- trust
+def cmd_trust(args) -> int:
+    """Standing trust baseline: mutation detection across scans (v2.7)."""
+    config, db, scanner, quarantine = _build(args)
+    bpath = Path(config.trust_baseline_file)
+    action = args.trust_cmd
+    try:
+        if action == "snapshot":
+            for t in args.targets:
+                if not Path(t).exists():
+                    print(paint(f"error: no such file or directory: {t}", RED),
+                          file=sys.stderr)
+                    return 2
+            baseline = trust_snapshot(args.targets, config, bpath)
+            print(paint(f"Trust baseline updated: {len(baseline['files'])} "
+                        f"file(s) registered -> {bpath}", GREEN))
+            print("Every scan now reports trusted files whose content "
+                  "changed (mutation detection).")
+            return 0
+        if action == "add":
+            for t in args.targets:
+                if not Path(t).is_file():
+                    print(paint(f"error: not a file: {t}", RED),
+                          file=sys.stderr)
+                    return 2
+            baseline = trust_add(args.targets, bpath)
+            print(paint(f"Trust baseline updated: {len(baseline['files'])} "
+                        f"file(s) registered", GREEN))
+            return 0
+        if action == "remove":
+            if not bpath.exists():
+                print("No trust baseline to remove entries from.",
+                      file=sys.stderr)
+                return 2
+            trust_remove(args.targets, bpath)
+            remaining = trust_list(bpath)
+            print(f"Removed matching entries; {len(remaining)} file(s) "
+                  f"still registered.")
+            return 0
+        if action == "list":
+            entries = trust_list(bpath)
+            if not entries:
+                print("No trust baseline yet. Create one with: "
+                      "antivirus trust snapshot DIR")
+                return 0
+            if args.json:
+                print(json.dumps(
+                    {"baseline": str(bpath),
+                     "files": {k: v for k, v in entries}}, indent=2))
+            else:
+                for key, meta in entries:
+                    print(f"  {(meta.get('sha256') or '')[:16]}...  "
+                          f"{meta.get('size', '?'):>10} B  {key}")
+                print(f"{len(entries)} file(s) registered")
+            return 0
+        if action == "clear":
+            trust_clear(bpath)
+            print("Trust baseline cleared.")
+            return 0
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(paint(f"error: {exc}", RED), file=sys.stderr)
+        return 2
+    return 0
+
+
+def cmd_mutations(args) -> int:
+    """One-shot mutation check of the standing trust baseline (v2.7)."""
+    config, db, scanner, quarantine = _build(args)
+    bpath = Path(config.trust_baseline_file)
+    if not bpath.exists():
+        print("No trust baseline. Create one with: "
+              "antivirus trust snapshot DIR", file=sys.stderr)
+        return 2
+    try:
+        baseline = load_trust_baseline(bpath)
+        findings = mutations_report(baseline)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(paint(f"error: {exc}", RED), file=sys.stderr)
+        return 2
+    mass = mass_mutation_finding(
+        findings, str(bpath), config.mutation_ransomware_threshold)
+    if mass is not None:
+        findings.append(mass)
+    mutated = sum(1 for f in findings if f.name == MUTATED)
+    missing = sum(1 for f in findings if f.name == MISSING)
+
+    if args.json:
+        print(json.dumps({
+            "baseline": str(bpath),
+            "mutated": mutated, "missing": missing,
+            "ransomware_alert": mass is not None,
+            "clean": not findings,
+            "findings": [f.to_dict() for f in findings],
+        }, indent=2))
+    else:
+        bar = "=" * 62
+        print()
+        print(paint(f" Mutation check ({bpath.name})", BOLD))
+        print(bar)
+        if not findings:
+            print(paint(" No mutations since the baseline.", GREEN))
+        else:
+            for f in findings:
+                color = SEVERITY_COLOR.get(f.severity, YELLOW)
+                print(f"  {paint(f'[{f.severity.upper()}]', color)} "
+                      f"{paint(f.name, BOLD)}")
+                print(f"    {f.path}")
+                print(f"    {f.message}")
+            if mass is not None:
+                print(paint(f"  !!! {mass.message} !!!", RED, BOLD))
+        print(f" {mutated} mutated, {missing} missing")
+        print(bar)
+    return 0 if not findings else 1
+
+
 # ------------------------------------------------------------------- export
 def cmd_export(args) -> int:
     """Export findings from saved reports to CSV (default) or JSONL."""
@@ -1927,6 +2046,27 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--out", default=None, metavar="FILE",
                    help="manifest file (default: print JSON to stdout)")
 
+    p = sub.add_parser("trust",
+                       help="standing trust baseline (mutation detection)")
+    _common_options(p)
+    tsub = p.add_subparsers(dest="trust_cmd", required=True)
+    ts = tsub.add_parser("snapshot",
+                         help="baseline files/dirs into the standing trust baseline")
+    ts.add_argument("targets", nargs="+", help="files or directories to trust")
+    ta = tsub.add_parser("add", help="add/refresh individual files")
+    ta.add_argument("targets", nargs="+", help="files to trust")
+    trm = tsub.add_parser("remove", help="remove entries (file or dir subtree)")
+    trm.add_argument("targets", nargs="+", help="paths to untrust")
+    tl = tsub.add_parser("list", help="list registered files")
+    tl.add_argument("--json", action="store_true")
+    tsub.add_parser("clear", help="empty the trust baseline")
+
+    p = sub.add_parser("mutations",
+                       help="check the trust baseline for mutated/missing files")
+    _common_options(p)
+    p.add_argument("--json", action="store_true",
+                   help="machine readable output")
+
     p = sub.add_parser("samples",
                        help="write the inert demo sample tree (safe test material)")
     p.add_argument("dir", nargs="?", default="samples",
@@ -2056,6 +2196,8 @@ _COMMANDS = {
     "report": cmd_report,
     "hash": cmd_hash,
     "manifest": cmd_manifest,
+    "trust": cmd_trust,
+    "mutations": cmd_mutations,
     "samples": cmd_samples,
     "web": cmd_web,
     "tui": cmd_tui,

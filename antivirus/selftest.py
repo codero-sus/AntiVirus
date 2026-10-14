@@ -149,6 +149,63 @@ def run_selftest(signatures_file: Optional[str] = None) -> int:
               any(f.kind == "heuristic" for f in findings),
               str(sorted({f.kind for f in findings})))
 
+        # -- v2.7: polyglot + obfuscation + mutation --------------------------------
+        import base64 as _b64
+        import struct as _st
+
+        def _mini_pe(section: bytes) -> bytes:
+            dos = bytearray(0x40)
+            dos[0:2] = b"MZ"
+            _st.pack_into("<I", dos, 0x3C, 0x40)
+            pe = b"PE\0\0" + _st.pack("<HHIIIHH", 0x14C, 1, 0, 0, 0,
+                                      224, 0x0102)
+            opt = bytearray(224)
+            _st.pack_into("<H", opt, 0, 0x10B)
+            _st.pack_into("<I", opt, 32, 0x1000)
+            _st.pack_into("<I", opt, 36, 0x200)
+            sec = bytearray(40)
+            sec[0:5] = b".text"
+            _st.pack_into("<IIII", sec, 8, len(section), 0x1000,
+                          len(section), 0x200)
+            _st.pack_into("<I", sec, 36, 0x60000020)
+            pe += opt + sec
+            img = bytes(dos) + bytes(pe)
+            return img + b"\x00" * (0x200 - len(img)) + section
+
+        pdfpe = workdir / "poly.pdf"
+        pdfpe.write_bytes(b"%PDF-1.4\n%%EOF\n" + _mini_pe(b"junk" * 2048))
+        findings = scanner.scan_file(pdfpe)
+        check("polyglot: file valid as PDF *and* PE is flagged",
+              any(f.kind == "polyglot" and f.severity == "critical"
+                  for f in findings),
+              str(sorted({f.name for f in findings})))
+
+        obf = workdir / "obf-payload.txt"
+        obf.write_bytes(b"p = " + _b64.b64encode(
+            random.Random(7).randbytes(600)) + b"\n")
+        findings = scanner.scan_file(obf)
+        check("obfuscation: high-entropy base64 payload blob flagged",
+              any(f.kind == "obfuscation" for f in findings),
+              str(sorted({f.name for f in findings})))
+
+        config.trust_baseline_file = workdir / "trust.json"
+        from .integrity import trust_snapshot
+
+        mdir = workdir / "trusted"
+        mdir.mkdir()
+        m1 = mdir / "a.txt"
+        m1.write_text("original content\n")
+        trust_snapshot([str(mdir)], config, config.trust_baseline_file)
+        findings = scanner.scan_path(mdir).findings
+        check("mutation: unchanged trusted file is not flagged",
+              not any(f.kind == "integrity" for f in findings))
+        m1.write_text("MUTATED BY ATTACKER\n")
+        findings = scanner.scan_path(mdir).findings
+        check("mutation: content change of a trusted file is detected",
+              any(f.kind == "integrity" and "mutated" in f.name.lower()
+                  for f in findings),
+              str(sorted({f.name for f in findings})))
+
         # -- quarantine + restore ---------------------------------------------------
         victim = workdir / "victim-eicar.txt"
         victim.write_bytes(EICAR)
@@ -608,17 +665,17 @@ def run_selftest(signatures_file: Optional[str] = None) -> int:
         eng_file = workdir / "eicar-engine.txt"
         eng_file.write_bytes(EICAR)
         eng_report = engine_mod.engine_report(eng_file, scanner, config)
-        check("engine: EICAR flagged by >=2 of 7 layers, consensus present",
+        check("engine: EICAR flagged by >=2 of 9 layers, consensus present",
               eng_report["engines_detected"] >= 2
               and eng_report["overall_severity"] == "critical"
-              and len(eng_report["layers"]) == 7
-              and "of 7" in eng_report["consensus"],
+              and len(eng_report["layers"]) == 9
+              and "of 9" in eng_report["consensus"],
               str(eng_report.get("consensus")))
 
         clean_file = workdir / "clean-engine.txt"
         clean_file.write_text("totally ordinary text\n")
         clean_report = engine_mod.engine_report(clean_file, scanner, config)
-        check("engine: clean file reported by 0 of 7 engines",
+        check("engine: clean file reported by 0 of 9 engines",
               clean_report["engines_detected"] == 0
               and clean_report["overall_severity"] == "clean")
 

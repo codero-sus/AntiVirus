@@ -67,6 +67,19 @@ class Config:
     # no per-entry behaviour) – meant for quick rescans.
     fast_mode: bool = False
 
+    # Mutation detection (v2.7): a standing "trust baseline" of file
+    # hashes. Every scan checks files against it; a trusted file whose
+    # content changed is reported as mutated (kind=integrity).
+    trust_baseline_file: Path = Path("data/trust_baseline.json")
+    integrity_enabled: bool = True
+    #: >= this many mutated files in one scan raises the aggregate
+    #: "possible ransomware activity" alert.
+    mutation_ransomware_threshold: int = 5
+
+    # Polyglot + obfuscation layers (v2.7).
+    polyglot_enabled: bool = True
+    obfuscation_enabled: bool = True
+
     # Scan cache: unchanged files (same size + mtime + same engine profile)
     # reuse their previous verdict without being read from disk.
     cache_enabled: bool = True
@@ -89,7 +102,8 @@ class Config:
         """Make relative paths absolute, relative to *base* (usually the CWD)."""
         base = base.resolve()
         for name in ("quarantine_dir", "report_dir", "signatures_file",
-                     "cache_dir", "baseline_dir", "registry_dir"):
+                     "cache_dir", "baseline_dir", "registry_dir",
+                     "trust_baseline_file"):
             p = Path(getattr(self, name))
             if not p.is_absolute():
                 setattr(self, name, base / p)

@@ -110,18 +110,35 @@ watches folders for new/changed files, and writes JSON + text reports.
   warm scan (files/s, MB/s), the **cache speedup**, and per-file latency
   (p50/p99) on a synthetic corpus
 - **Engine report** — `engine FILE` gives a VirusTotal-style per-layer
-  verdict table (hash / pattern / behaviour / url / risk / entropy /
-  archive) with a "detected by N of M engines" consensus, in one read pass
+  verdict table (hash / pattern / behaviour / polyglot / obfuscation /
+  url / risk / entropy / archive) with a "detected by N of M engines"
+  consensus, in one read pass
+- **Mutation detection** — a standing *trust baseline* (`trust
+  snapshot|add|remove|list|clear`): every scan compares trusted files
+  against their baseline hashes; a trusted file whose **content changed**
+  is reported as mutated, and **bulk mutation** (≥ 5 files in one pass)
+  raises a critical *possible ransomware activity* alert; `mutations`
+  checks the baseline on demand
+- **Polyglot detection** — flags one file that is valid in **more than
+  one format**: PDF/PE (MalPDF exploit pattern, critical), image/PE,
+  OLE/PE, ELF/PE implants, text files with an embedded PE or a
+  high-entropy binary blob (steganography) — while a PDF with a photo or
+  a ZIP bundling a document stays clean
+- **Obfuscation detection** — static *technique* analysis: high-entropy
+  base64 / hex payload blobs, double-encoded payloads, UTF-16 encoded
+  blobs, NOP-sled / int3 junk code, and packed PEs with no import table
+  (hidden API surface)
 - **Comparison** — `compare` prints the honest feature + positioning
   picture vs AVG / Avast / Malwarebytes / VirusTotal, with live `perf`
   numbers (no inflated "beats commercial AV" claims)
-- **Real-world detection pack** — 21 sourced IOC signatures for **15 real
+- **Real-world detection pack** — 29 sourced IOC signatures for **20 real
   named malware families** (WannaCry, Petya/NotPetya, Ryuk, LockBit,
   DoppelPaymer, BitPaymer, Stuxnet, Mirai, Cobalt Strike, Metasploit/
-  Meterpreter, Emotet, TrickBot, Dridex, XMRig, RedLine). Every signature
-  carries its public research source; `realworld` scores the pack on an
-  inert corpus (13/13 detected, 0 false positives) and says plainly where
-  the commercial engines still lead (unseen variants)
+  Meterpreter, Emotet, TrickBot, Dridex, XMRig, RedLine, Locky,
+  CryptoWall, Cerber, Jigsaw, Alphabet). Every signature carries its
+  public research source; `realworld` scores the pack on an inert corpus
+  (13/13 pattern families detected, 0 false positives) and says plainly
+  where the commercial engines still lead (unseen variants)
 - **Reports** — every scan writes a JSON report and a human-readable text
   report
 - **Signature editor** — add your own signatures from the CLI (hash or
@@ -775,21 +792,25 @@ plus a consensus line —
 
 ```console
 $ antivirus engine eicar-test.txt
- engine     verdict    severity  details
- hash       FLAG       critical  matches 'EICAR-STD-2014' (EICAR-Test-File)
- pattern    FLAG       critical  pattern of 'EICAR-STD-2014' found
- behaviour  clean      info      ...
- url        clean      info      ...
- risk       FLAG       high      score 71/100
- entropy    clean      info      ...
- archive    clean      info      ...
- consensus: detected by 2 of 7 engines
+ engine      verdict    severity  details
+ hash        FLAG       critical  matches 'EICAR-STD-2014' (EICAR-Test-File)
+ pattern     FLAG       critical  pattern of 'EICAR-STD-2014' found
+ behaviour   clean      info      ...
+ polyglot    clean      info      ...
+ obfuscation clean      info      ...
+ url         clean      info      ...
+ risk        FLAG       high      score 71/100
+ entropy     clean      info      ...
+ archive     clean      info      ...
+ consensus: detected by 3 of 9 engines
 ```
 
-The seven "engines" are this tool's layers — `hash`, `pattern`,
-`behaviour`, `url` (web shield), `risk` (suspicion engine), `entropy`,
-`archive` — shown in the VT style so you can see *which* layers agree. The
-file is read once. (They are not 70+ independent third-party AV vendors.)
+The nine "engines" are this tool's layers — `hash`, `pattern`,
+`behaviour`, `polyglot` (multi-format files), `obfuscation` (encoding /
+packing / junk-code techniques), `url` (web shield), `risk` (suspicion
+engine), `entropy`, `archive` — shown in the VT style so you can see
+*which* layers agree. The file is read once. (They are not 70+ independent
+third-party AV vendors.)
 
 ### Real-world detection pack (`realworld`)
 
@@ -840,8 +861,8 @@ Linux scanner; only their bytes are read):
 
 | real sample | sha256 (prefix) | result |
 | --- | --- | --- |
-| WannaCrypt 2017 dropper (3.5 MB) | `ed01ebfbc9eb…` | **4 of 7 layers** — hash (critical) + `.wnry` note-path pattern + packed PE + entropy 7.76 |
-| LockBit Black 3.0 locker (166 KB) | `80e8defa5377…` | **3 of 7 layers** — hash (critical) + packed PE + risk 45/100 |
+| WannaCrypt 2017 dropper (3.5 MB) | `ed01ebfbc9eb…` | **4 of 9 engines** — hash (critical) + `.wnry` note-path pattern + packed PE + entropy 7.76 |
+| LockBit Black 3.0 locker (166 KB) | `80e8defa5377…` | **3 of 9 engines** — hash (critical) + packed PE + risk 45/100 |
 | Petya 2016/17 (`petya2.exe`) | `4c1dc737915d…` | hash (high) — plus 8 heuristics incl. "PE downloads and executes code" |
 | Locky 2016 | `bc98c8b22461…` | hash (high) + packed-PE heuristics |
 | CryptoWall | `45317968759d…` | hash (high) + heuristics |
@@ -870,6 +891,73 @@ Locky, CryptoWall, Cerber, Jigsaw, Alphabet — 2017 public research
 collection) and `whichbuffer/Lockbit-Black-3.0` (LockBit locker shipped
 with its threat-spotlight PDF). The WannaCrypt sample's hash is cross
 referenced by the public analysis `alby0304/WannaCry_Analysis`.
+
+### Mutation detection (trust baseline)
+
+`manifest`/`verify` give you a one-shot FIM diff; the **trust baseline**
+makes mutation detection *continuous*: register files you trust, and every
+scan from then on reports any of them whose content changed.
+
+```console
+$ antivirus trust snapshot /opt/myapp          # baseline a tree (or files)
+$ antivirus trust add /etc/ssh/sshd_config     # or register single files
+$ antivirus scan /opt/myapp                    # normal scan — mutations included
+  [HIGH] File mutated since trusted baseline  /opt/myapp/bin/worker
+         trusted sha256 9f1c… changed to 4ab2…
+$ antivirus mutations                          # one-shot check, no full scan
+ 1 mutated, 0 missing
+```
+
+* **Content-based**: only the SHA-256 matters — touching a file (mtime
+  change, no content change) is *not* a mutation.
+* **Bulk-mutation alert**: 5+ trusted files mutated in one scan add a
+  `critical` aggregate finding — *Mass file mutation – possible
+  ransomware activity*. That is the shape ransomware leaves: a wave of
+  content changes, not a single odd file.
+* The baseline lives in `data/trust_baseline.json` (git-ignored,
+  per-machine state). A missing trusted file is reported by `mutations`
+  as `File missing since baseline`.
+
+### Polyglot files
+
+A polyglot is one file that is simultaneously a valid member of two or
+more formats. Every format is validated with its **real header rules**
+(structural checks, not magic-byte coincidence), and only genuinely
+suspicious combinations are reported:
+
+| combination | severity | why |
+| --- | --- | --- |
+| PDF + PE | **critical** | the MalPDF exploit pattern — a document that is also a Windows executable |
+| PDF + ELF, image (PNG/JPEG) + PE/ELF, OLE + PE, PE + ELF | high | implant / document-that-runs patterns |
+| text file + embedded PE | high | "readme.txt" hiding a payload |
+| text file + 16 KiB+ high-entropy region | medium | steganography / hidden binary blob |
+| PDF/PE + ZIP, PE + ZIP/PDF, image + ZIP | low | self-extracting / attachment patterns (also legitimate — informational) |
+
+Deliberately **not** flagged: a PDF embedding a JPEG photo, a ZIP that
+bundles a PDF document, a fake JPEG with an inert body — the legitimate
+use of multi-format containers.
+
+### Code obfuscation
+
+Where the behaviour layer asks *what the file does*, the obfuscation
+layer asks *whether the file is hiding what it does*:
+
+* **Encoded payload blobs** — a base64 run of 512+ chars with entropy
+  ≥ 4.6 (or a 1 KiB+ hex run) in any file: the standard wrapper for
+  stagers, obfuscated PowerShell, malware-in-document payloads.
+* **Double-encoded payloads** (high) — a base64 blob that decodes to
+  *another* base64 layer: a deliberate extra step.
+* **UTF-16 encoded blobs** — the same wrapper stored as UTF-16LE
+  (PowerShell `-enc` style) inside binary files.
+* **Junk code** — runs of 256+ NOP (`0x90`) or int3 (`0xCC`) bytes in a
+  PE: mutator / packer padding.
+* **Packed PE with no import table** (high) — the image is
+  packed/encrypted *and* declares no imports: the API surface is hidden
+  entirely (a normal PE needs imports).
+
+Thresholds are set to stay clean on ordinary code, minified JS, long
+hashes in config files and random binaries (a 512-char base64 run is
+astronomically unlikely to appear by chance in non-structured bytes).
 
 ### How does it stack up? (`compare`)
 
@@ -925,6 +1013,8 @@ scale. `antivirus compare` says all of this plainly.
 | `report diff [OLD NEW] [--json]` | Compare two reports (default: the two newest): new / cleared / unchanged |
 | `report summary` | Aggregate all saved reports (counts, severities, top indicators) |
 | `manifest TARGET [--out FILE]` | Build a file-integrity baseline (SHA-256 of every file) |
+| `trust snapshot\|add\|remove\|list\|clear [PATH…]` | Standing trust baseline — continuous mutation detection |
+| `mutations [--json]` | One-shot check of the trust baseline (mutated / missing files) |
 | `samples [DIR]` | Write the inert demo sample tree (safe test material) |
 | `web [--host 0.0.0.0] [--port 8420]` | Open the web console (dashboard + JSON API) |
 | `tui [TARGET]` | Terminal UI (curses): live scan, findings, options |
@@ -1089,7 +1179,11 @@ antivirus/
 │                    #   PE/ELF import tables, binary IOCs, SUID)
 ├── pe.py            # PE32/PE32+ dissection ("debug report") + indicators
 ├── fileinfo.py      # file identification (magic + digests)
-├── integrity.py     # file-integrity baselines (manifest + diff + fast verify)
+├── integrity.py     # file-integrity baselines (manifest + diff + trust
+│                    #   baseline mutation detection + bulk-mutation alert)
+├── polyglot.py      # polyglot files: one file valid in 2+ formats
+├── obfuscation.py   # obfuscation techniques (encoded blobs, junk code,
+│                    #   packed PEs without imports)
 ├── kill.py          # kill engine: in-place obfuscation cipher + registry
 ├── rescue.py        # rescue kit + ISO 9660 writer + rescue scan runner
 ├── samples.py       # builder for the inert demo samples (fake PE/ELF,

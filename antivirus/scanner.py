@@ -27,6 +27,7 @@ import fnmatch
 import gzip
 import hashlib
 import io
+import json
 import os
 import re
 import stat
@@ -44,8 +45,13 @@ from .behavior import analyze_file as behavior_analyze_file
 from .behavior import looks_executable as behavior_looks_executable
 from .cache import ScanCache
 from .config import Config
+from . import obfuscation as obfuscation_mod
+from . import polyglot as polyglot_mod
 from . import risk as risk_mod
 from . import webshield as webshield_mod
+# NOTE: .integrity is imported *inside* the methods that need it – it
+# imports walk_files from this module, so a top-level import would be a
+# cycle.
 from .webshield import ThreatIntel
 from .models import (  # noqa: F401  (re-exported for backwards compatibility)
     Finding,
@@ -238,12 +244,47 @@ class Scanner:
         #: They contain the very IOC text the patterns look for, so scanning
         #: them would be a self-match false positive – they are skipped.
         self._self_files: set = self._self_file_set(config)
+        #: Standing trust baseline (mutation detection), lazy-loaded.
+        self._trust_cache: Optional[Dict[str, Dict]] = None
+        self._trust_version: int = 0
+
+    def _trust_baseline(self) -> Dict[str, Dict]:
+        """The standing trust baseline ({} when none is configured).
+
+        Reloaded when the baseline file's mtime changes, so a baseline
+        created or updated between scans is picked up (one cheap stat).
+        """
+        from .integrity import _canon as _canon_key, load_manifest
+        path = Path(self.config.trust_baseline_file)
+        try:
+            mtime = path.stat().st_mtime_ns if path.exists() else 0
+        except OSError:
+            mtime = 0
+        if self._trust_cache is None or mtime != self._trust_version:
+            files: Dict[str, Dict] = {}
+            if mtime:
+                try:
+                    manifest = load_manifest(path)
+                    files = {_canon_key(k): v
+                             for k, v in manifest.get("files", {}).items()}
+                except (ValueError, OSError, json.JSONDecodeError):
+                    files = {}
+            self._trust_cache = files
+            self._trust_version = mtime
+        return self._trust_cache
+
+    def _integrity_finding(self, path_str: str, sha256: str) -> Optional[Finding]:
+        """Mutation check of one file against the trust baseline."""
+        from .integrity import check_trusted
+        if not self.config.integrity_enabled:
+            return None
+        return check_trusted(self._trust_baseline(), path_str, sha256)
 
     @staticmethod
     def _self_file_set(config: Config) -> set:
         out = set()
         for p in (config.signatures_file, config.threat_intel_file,
-                  config.intel_user_file):
+                  config.intel_user_file, config.trust_baseline_file):
             pp = Path(p).expanduser()
             out.add(os.path.normpath(str(pp)))
             if not os.path.isabs(str(pp)):
@@ -380,6 +421,16 @@ class Scanner:
         if cache is not None and result.scanned_paths:
             self._record_cache(cache, result)
 
+        # Aggregate mutation alert (v2.7): many trusted files mutated in
+        # one pass is the signature of ransomware-style bulk encryption.
+        if self.config.integrity_enabled and self._trust_baseline():
+            from .integrity import mass_mutation_finding
+            mass = mass_mutation_finding(
+                result.findings, str(path),
+                self.config.mutation_ransomware_threshold)
+            if mass is not None:
+                result.findings.append(mass)
+
         if len(result.findings) > 1:
             result.findings.sort(key=lambda f: (f.path, f.kind))
         result.finished_at = time.time()
@@ -388,6 +439,7 @@ class Scanner:
     def _cache_profile(self) -> dict:
         """Everything that influences a verdict – the cache's validity key."""
         cfg = self.config
+        self._trust_baseline()  # load + refresh _trust_version
         return {
             "db_version": self.db.version,
             "behavior": cfg.behavior_enabled,
@@ -397,6 +449,10 @@ class Scanner:
             "risk": [cfg.risk_enabled, cfg.risk_threshold],
             "webshield": cfg.webshield_enabled,
             "max_file_size": cfg.max_file_size,
+            "integrity": [cfg.integrity_enabled,
+                          self._trust_version],
+            "polyglot": cfg.polyglot_enabled,
+            "obfuscation": cfg.obfuscation_enabled,
         }
 
     def _record_cache(self, cache: ScanCache, result: ScanResult) -> None:
@@ -551,7 +607,16 @@ class Scanner:
         # silently suppress heuristics for every later file.
         local: List[Finding] = []
 
-        # Layer 1 – exact hash match (definite).
+        # Layer 1 – mutation detection (v2.7): the content of a *trusted*
+        # file changed since the trust baseline was taken.  Runs before the
+        # hash short-circuit so a trusted file that turned into a known-bad
+        # binary is reported as mutated *and* matched.
+        if not partial:
+            mutation = self._integrity_finding(str(path), sha256)
+            if mutation is not None:
+                local.append(mutation)
+
+        # Layer 2 – exact hash match (definite).
         if not partial:
             signature = self.db.by_sha256(sha256)
             if signature is None:
@@ -596,6 +661,23 @@ class Scanner:
             and behavior_looks_executable(path, content)
         ):
             local.extend(behavior_analyze_file(path, st, content))
+
+        # Layer 2.55 – polyglot detection (v2.7): one file that is valid in
+        # more than one format (PDF/PE, image/PE, text + binary blob, ...).
+        # Any file type can be a polyglot, so no executable-looking gate.
+        if self.config.polyglot_enabled and not self.config.fast_mode:
+            head = content if content is not None else \
+                self._peek_bytes(path, 4 * 1024 * 1024)
+            if head:
+                local.extend(polyglot_mod.analyze(str(path), head))
+
+        # Layer 2.56 – obfuscation techniques (v2.7): encoded payload
+        # blobs, double encoding, junk code, packed PEs without imports.
+        if self.config.obfuscation_enabled and not self.config.fast_mode:
+            head = content if content is not None else \
+                self._peek_bytes(path, 4 * 1024 * 1024)
+            if head:
+                local.extend(obfuscation_mod.analyze(str(path), head))
 
         # Layer 2.6 – web shield: URLs inside the file vs threat-intel (v2.4).
         if self.config.webshield_enabled and not self.config.fast_mode:
@@ -720,6 +802,12 @@ class Scanner:
             and behavior_looks_executable(p, data)
         ):
             local.extend(behavior_analyze_file(p, None, data))
+
+        # Polyglot + obfuscation layers (v2.7) – same as on disk.
+        if cfg.polyglot_enabled and not cfg.fast_mode:
+            local.extend(polyglot_mod.analyze(name, data))
+        if cfg.obfuscation_enabled and not cfg.fast_mode:
+            local.extend(obfuscation_mod.analyze(name, data))
 
         # Web shield + suspicion engine (v2.4) – same layers as on disk.
         if cfg.webshield_enabled and not cfg.fast_mode:

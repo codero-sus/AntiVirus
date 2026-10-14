@@ -17,7 +17,10 @@ import time
 import unittest
 from pathlib import Path
 
+import base64
+
 from antivirus.config import Config
+from antivirus.integrity import MASS_MUTATION, MISSING, MUTATED
 from antivirus.models import Finding
 from antivirus.quarantine import Quarantine
 from antivirus.report import ReportWriter, render_report
@@ -42,6 +45,7 @@ class App:
         self.config.cache_dir = base / ".av-cache"
         self.config.baseline_dir = base / "baselines"
         self.config.registry_dir = base / "registry"
+        self.config.trust_baseline_file = base / "trust.json"
         if BUNDLED_DB.exists():
             self.config.signatures_file.parent.mkdir(parents=True,
                                                       exist_ok=True)
@@ -3890,11 +3894,11 @@ class EngineTests(unittest.TestCase):
         r = engine.engine_report(f, self.app.scanner, self.app.config)
         self.assertGreaterEqual(r["engines_detected"], 2)
         self.assertEqual(r["overall_severity"], "critical")
-        self.assertIn("of 7", r["consensus"])
+        self.assertIn("of 9", r["consensus"])
         by = {l["engine"]: l for l in r["layers"]}
         self.assertEqual(by["hash"]["verdict"], "flagged")
         self.assertEqual(by["pattern"]["verdict"], "flagged")
-        self.assertEqual(len(r["layers"]), 7)
+        self.assertEqual(len(r["layers"]), 9)
 
     def test_clean_file_not_detected(self):
         from antivirus import engine
@@ -4004,7 +4008,7 @@ class EngineApiTests(WebConsoleTests):
         self.assertEqual(code, 200)
         self.assertGreaterEqual(data["engines_detected"], 2)
         self.assertEqual(data["overall_severity"], "critical")
-        self.assertEqual(len(data["layers"]), 7)
+        self.assertEqual(len(data["layers"]), 9)
 
     def test_engine_missing_param(self):
         code, data = self._req("GET", "/api/engine")
@@ -4052,6 +4056,426 @@ class V25CliTests(unittest.TestCase):
 
         for name in ("perf", "engine", "compare", "realworld"):
             self.assertIn(name, _COMMANDS)
+
+
+# ===================================================================== v2.7
+class _PeBuilder:
+    """Crafts minimal but structurally valid PE32 images for tests."""
+
+    @staticmethod
+    def build(section: bytes, with_imports: bool = False) -> bytes:
+        import struct
+
+        dos = bytearray(0x40)
+        dos[0:2] = b"MZ"
+        struct.pack_into("<I", dos, 0x3C, 0x40)
+        pe = b"PE\0\0" + struct.pack("<HHIIIHH", 0x14C, 1, 0, 0, 0,
+                                     224, 0x0102)
+        opt = bytearray(224)
+        struct.pack_into("<H", opt, 0, 0x10B)          # PE32
+        struct.pack_into("<I", opt, 16, 0x1000)        # entry point RVA
+        struct.pack_into("<I", opt, 28, 0x400000)      # image base
+        struct.pack_into("<I", opt, 32, 0x1000)        # section align
+        struct.pack_into("<I", opt, 36, 0x200)         # file align
+        struct.pack_into("<H", opt, 68, 3)             # console
+        struct.pack_into("<H", opt, 70, 0x8100)        # ASLR + DEP
+        struct.pack_into("<I", opt, 56, 0x3000)        # size of image
+        struct.pack_into("<I", opt, 60, 0x200)         # size of headers
+        if with_imports:
+            struct.pack_into("<II", opt, 104, 0x1000, 20)  # Import dir
+        pe += opt
+        sec = bytearray(40)
+        sec[0:5] = b".text"
+        struct.pack_into("<IIII", sec, 8, len(section), 0x1000,
+                         len(section), 0x200)
+        struct.pack_into("<I", sec, 36, 0x60000020)    # CODE|EXEC|READ
+        pe += sec
+        img = bytes(dos) + bytes(pe)
+        img += b"\x00" * (0x200 - len(img))
+        return img + section
+
+    @staticmethod
+    def clean() -> bytes:
+        """Low-entropy .text with a real import table (KERNEL32!ExitProcess)."""
+        import struct
+
+        sec = bytearray(b"abcdef" * 1366)  # 8196 B, low entropy, no 0x90/0xCC
+        struct.pack_into("<IIIII", sec, 0x00, 0x1024, 0, 0, 0x1014, 0x1024)
+        sec[0x14:0x14 + 13] = b"KERNEL32.dll\x00"
+        struct.pack_into("<II", sec, 0x24, 0x1030, 0)
+        struct.pack_into("<H", sec, 0x30, 0)
+        sec[0x32:0x32 + 12] = b"ExitProcess\x00"
+        return _PeBuilder.build(bytes(sec), with_imports=True)
+
+
+class PolyglotTests(unittest.TestCase):
+    """v2.7: one file valid in more than one format."""
+
+    def setUp(self):
+        base = Path(tempfile.mkdtemp(prefix="av-poly-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        self.base = base
+        self.app = App(base)
+
+    def _scan(self, name: str, data: bytes):
+        p = self.base / name
+        p.write_bytes(data)
+        return self.app.scanner.scan_path(p)
+
+    def _kinds(self, result):
+        return {(f.kind, f.name, f.severity) for f in result.findings}
+
+    def test_pdf_pe_polyglot_critical(self):
+        pe = _PeBuilder.build(b"junk" * 2048)
+        data = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n" + pe
+        result = self._scan("mal.pdf", data)
+        self.assertIn(("polyglot",
+                       "PDF/PE polyglot - valid PDF document that is also a "
+                       "Windows PE executable (MalPDF exploit pattern)",
+                       "critical"), self._kinds(result))
+
+    def test_png_pe_polyglot_high(self):
+        import struct
+
+        png = (b"\x89PNG\r\n\x1a\n" + struct.pack(">I", 13) + b"IHDR"
+               + struct.pack(">IIBBBBB", 10, 10, 8, 2, 0, 0, 0))
+        data = png + b"\x00" * 64 + _PeBuilder.build(b"junk" * 1024)
+        result = self._scan("implant.png", data)
+        self.assertTrue(any(k == "polyglot" and "PNG/PE" in n
+                            and sev == "high"
+                            for k, n, sev in self._kinds(result)))
+
+    def test_jpeg_elf_polyglot_high(self):
+        elf = b"\x7fELF" + bytes([2, 1, 1, 0]) + b"\x00" * 64
+        data = b"\xff\xd8\xff\xe0" + b"JFIF filler" * 40 + elf
+        result = self._scan("photo.jpg", data)
+        self.assertTrue(any(k == "polyglot" and "JPEG/ELF" in n
+                            for k, n, _ in self._kinds(result)))
+
+    def test_text_with_embedded_pe(self):
+        data = b"notes about the meeting\n" * 40 + _PeBuilder.build(b"z" * 4096)
+        result = self._scan("readme.txt", data)
+        self.assertTrue(any(k == "polyglot" and "embedded PE" in n
+                            and sev == "high"
+                            for k, n, sev in self._kinds(result)))
+
+    def test_text_with_binary_blob(self):
+        data = b"line of text\n" * 2000 + os.urandom(40960)
+        result = self._scan("notes.txt", data)
+        self.assertTrue(any(k == "polyglot" and "binary blob" in n
+                            and sev == "medium"
+                            for k, n, sev in self._kinds(result)))
+
+    def test_pdf_with_embedded_jpeg_is_clean(self):
+        jpeg = b"\xff\xd8\xff\xe0\x00\x10JFIF" + b"\x00" * 500
+        data = b"%PDF-1.4\nbody with a photo stream " + jpeg + b"\n%%EOF"
+        result = self._scan("doc.pdf", data)
+        self.assertFalse(any(f.kind == "polyglot" for f in result.findings))
+
+    def test_zip_bundling_a_pdf_is_clean(self):
+        import io
+        import zipfile
+
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("doc.pdf", b"%PDF-1.4\nx\n%%EOF")
+        result = self._scan("docs.zip", buf.getvalue())
+        self.assertFalse(any(f.kind == "polyglot" for f in result.findings))
+
+    def test_plain_text_is_clean(self):
+        result = self._scan("ok.txt", b"just some notes\n" * 500)
+        self.assertFalse(any(f.kind == "polyglot"
+                             for f in result.findings))
+
+    def test_polyglot_in_archive_member(self):
+        import io
+        import zipfile
+
+        member = (b"%PDF-1.4\n%%EOF\n"
+                  + _PeBuilder.build(b"junk" * 1024))
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("inner.pdf", member)
+        p = self.base / "outer.zip"
+        p.write_bytes(buf.getvalue())
+        result = self.app.scanner.scan_path(p)
+        self.assertTrue(any(f.kind == "polyglot" and "inner.pdf" in f.path
+                            for f in result.findings))
+
+
+class ObfuscationTests(unittest.TestCase):
+    """v2.7: encoded payloads, junk code, packed PEs without imports."""
+
+    def setUp(self):
+        base = Path(tempfile.mkdtemp(prefix="av-obf-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        self.base = base
+        self.app = App(base)
+
+    def _scan(self, name: str, data: bytes):
+        p = self.base / name
+        p.write_bytes(data)
+        return self.app.scanner.scan_path(p)
+
+    def test_base64_blob_detected(self):
+        blob = base64.b64encode(os.urandom(600))
+        result = self._scan("stager.txt", b"run:\n" + blob + b"\ndone\n")
+        self.assertTrue(any(f.kind == "obfuscation"
+                            and "encoded blob" in f.name
+                            for f in result.findings))
+
+    def test_short_base64_not_flagged(self):
+        blob = base64.b64encode(os.urandom(40))
+        result = self._scan("ok.txt", b"x = " + blob + b"\n")
+        self.assertFalse(any(f.kind == "obfuscation"
+                             for f in result.findings))
+
+    def test_double_encoded_payload_high(self):
+        inner = base64.b64encode(os.urandom(300))
+        outer = base64.b64encode(inner)
+        result = self._scan("stage2.txt", b"p = " + outer + b"\n")
+        self.assertTrue(any(f.kind == "obfuscation"
+                            and f.name == "Double-encoded payload"
+                            and f.severity == "high"
+                            for f in result.findings))
+
+    def test_hex_blob_detected(self):
+        blob = os.urandom(600).hex().encode()
+        result = self._scan("hex.txt", b"key: " + blob + b"\n")
+        self.assertTrue(any(f.kind == "obfuscation" and "hex" in f.name
+                            for f in result.findings))
+
+    def test_nop_sled_junk_code(self):
+        sec = bytearray(b"abcdef" * 512)   # 3072 B low entropy
+        sec += b"\x90" * 512               # NOP sled
+        sec += bytearray(b"abcdef" * 512)
+        result = self._scan("sledd.exe",
+                            _PeBuilder.build(bytes(sec), with_imports=False))
+        self.assertTrue(any(f.kind == "obfuscation"
+                            and "NOP sled" in f.name
+                            for f in result.findings))
+
+    def test_packed_pe_without_imports_high(self):
+        result = self._scan("packed.exe",
+                            _PeBuilder.build(os.urandom(8192)))
+        self.assertTrue(any(f.kind == "obfuscation"
+                            and f.name == "Packed PE with no import table"
+                            and f.severity == "high"
+                            for f in result.findings))
+
+    def test_clean_pe_not_flagged(self):
+        result = self._scan("clean.exe", _PeBuilder.clean())
+        self.assertFalse(any(f.kind == "obfuscation"
+                             for f in result.findings))
+
+
+class MutationTests(unittest.TestCase):
+    """v2.7: standing trust baseline + mutation (ransomware) detection."""
+
+    def setUp(self):
+        base = Path(tempfile.mkdtemp(prefix="av-mut-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        self.base = base
+        self.app = App(base)
+        # the App fixture points the baseline into the temp dir; it must
+        # not exist yet
+        self.assertFalse(self.app.config.trust_baseline_file.exists())
+
+    def _trust(self, *targets, out=None):
+        from antivirus.integrity import trust_snapshot
+        trust_snapshot(list(targets), self.app.config,
+                       out or self.app.config.trust_baseline_file)
+
+    def test_trusted_tree_clean_then_mutated(self):
+        d = self.base / "app"
+        d.mkdir()
+        f1 = d / "main.py"
+        f1.write_text("print('ok')\n")
+        (d / "lib.py").write_text("x = 1\n")
+        self._trust(d)
+        result = self.app.scanner.scan_path(d)
+        self.assertFalse(any(f.kind == "integrity" for f in result.findings))
+
+        f1.write_text("print('pwned')\n")
+        result = self.app.scanner.scan_path(d)
+        mutated = [f for f in result.findings if f.kind == "integrity"]
+        self.assertEqual(len(mutated), 1)
+        self.assertEqual(mutated[0].name, MUTATED)
+        self.assertEqual(mutated[0].severity, "high")
+        self.assertIn("main.py", mutated[0].path)
+
+    def test_mass_mutation_raises_ransomware_alert(self):
+        d = self.base / "docs"
+        d.mkdir()
+        files = []
+        for i in range(self.app.config.mutation_ransomware_threshold + 1):
+            f = d / f"doc{i}.txt"
+            f.write_text(f"content {i}\n")
+            files.append(f)
+        self._trust(d)
+        for f in files:
+            f.write_bytes(os.urandom(128))
+        result = self.app.scanner.scan_path(d)
+        mutated = [f for f in result.findings if f.name == MUTATED]
+        self.assertEqual(len(mutated), len(files))
+        mass = [f for f in result.findings if f.name == MASS_MUTATION]
+        self.assertEqual(len(mass), 1)
+        self.assertEqual(mass[0].severity, "critical")
+
+    def test_below_threshold_no_aggregate(self):
+        d = self.base / "part"
+        d.mkdir()
+        files = []
+        for i in range(self.app.config.mutation_ransomware_threshold - 1):
+            f = d / f"f{i}.txt"
+            f.write_text(f"c{i}\n")
+            files.append(f)
+        self._trust(d)
+        for f in files:
+            f.write_bytes(os.urandom(64))
+        result = self.app.scanner.scan_path(d)
+        self.assertEqual(
+            sum(1 for f in result.findings if f.name == MUTATED),
+            len(files))
+        self.assertFalse(any(f.name == MASS_MUTATION
+                             for f in result.findings))
+
+    def test_missing_trusted_file_reported(self):
+        from antivirus.integrity import (MISSING, load_trust_baseline,
+                                         mutations_report)
+        d = self.base / "app"
+        d.mkdir()
+        keep = d / "keep.txt"
+        keep.write_text("keep\n")
+        gone = d / "gone.txt"
+        gone.write_text("gone\n")
+        self._trust(d)
+        gone.unlink()
+        findings = mutations_report(load_trust_baseline(
+            self.app.config.trust_baseline_file))
+        self.assertIn(MISSING, {f.name for f in findings})
+        self.assertIn("gone.txt", next(f.path for f in findings
+                                       if f.name == MISSING))
+        self.assertFalse(any(f.name == MUTATED for f in findings))
+
+    def test_mtime_only_touch_is_not_a_mutation(self):
+        d = self.base / "app"
+        d.mkdir()
+        f = d / "same.txt"
+        f.write_text("same content\n")
+        self._trust(d)
+        os.utime(f, (time.time() + 100, time.time() + 100))
+        result = self.app.scanner.scan_path(d)
+        self.assertFalse(any(f.kind == "integrity"
+                             for f in result.findings))
+
+    def test_trust_add_list_remove_cli(self):
+        from antivirus.cli import main
+
+        d = self.base / "app"
+        d.mkdir()
+        f = d / "a.txt"
+        f.write_text("alpha\n")
+        (d / "b.txt").write_text("beta\n")
+
+        def run(*argv):
+            old = os.getcwd()
+            os.chdir(self.base)
+            try:
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = main(["trust", *argv])
+            finally:
+                os.chdir(old)
+            return rc, buf.getvalue()
+
+        rc, out = run("add", str(f), str(d / "b.txt"))
+        self.assertEqual(rc, 0)
+        rc, out = run("list")
+        self.assertEqual(rc, 0)
+        self.assertIn("a.txt", out)
+        self.assertIn("b.txt", out)
+        rc, out = run("remove", str(f))
+        self.assertEqual(rc, 0)
+        rc, out = run("list")
+        self.assertNotIn("a.txt", out)
+        self.assertIn("b.txt", out)
+
+    def test_mutations_cli_exit_codes(self):
+        from antivirus.cli import main
+
+        d = self.base / "app"
+        d.mkdir()
+        f = d / "a.txt"
+        f.write_text("alpha\n")
+        # the CLI resolves the baseline relative to the CWD it runs in
+        self._trust(d, out=self.base / "data" / "trust_baseline.json")
+
+        def run():
+            old = os.getcwd()
+            os.chdir(self.base)
+            try:
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = main(["mutations", "--json"])
+            finally:
+                os.chdir(old)
+            return rc, json.loads(buf.getvalue())
+
+        rc, data = run()
+        self.assertEqual(rc, 0)
+        self.assertTrue(data["clean"])
+
+        f.write_bytes(os.urandom(96))
+        rc, data = run()
+        self.assertEqual(rc, 1)
+        self.assertEqual(data["mutated"], 1)
+        self.assertFalse(data["ransomware_alert"])
+
+
+class V27EngineTests(unittest.TestCase):
+    """v2.7: the engine report grows to nine engines."""
+
+    def setUp(self):
+        base = Path(tempfile.mkdtemp(prefix="av-eng9-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        self.base = base
+        self.app = App(base)
+
+    def test_nine_engines_reported(self):
+        from antivirus import engine
+
+        f = self.base / "eicar.txt"
+        f.write_bytes(EICAR)
+        r = engine.engine_report(f, self.app.scanner, self.app.config)
+        self.assertEqual(r["engines_total"], 9)
+        self.assertEqual(len(r["layers"]), 9)
+        names = [l["engine"] for l in r["layers"]]
+        self.assertIn("polyglot", names)
+        self.assertIn("obfuscation", names)
+
+    def test_polyglot_and_obfuscation_verdicts(self):
+        from antivirus import engine
+
+        f = self.base / "evil.pdf"
+        f.write_bytes(b"%PDF-1.4\n%%EOF\n" + _PeBuilder.build(b"z" * 4096))
+        r = engine.engine_report(f, self.app.scanner, self.app.config)
+        by = {l["engine"]: l for l in r["layers"]}
+        self.assertEqual(by["polyglot"]["verdict"], "flagged")
+
+        g = self.base / "stager.txt"
+        g.write_bytes(b"p = " + base64.b64encode(os.urandom(600)) + b"\n")
+        r = engine.engine_report(g, self.app.scanner, self.app.config)
+        by = {l["engine"]: l for l in r["layers"]}
+        self.assertEqual(by["obfuscation"]["verdict"], "flagged")
+
+    def test_clean_file_all_clean_or_low(self):
+        from antivirus import engine
+
+        f = self.base / "note.txt"
+        f.write_text("hello world\n" * 200)
+        r = engine.engine_report(f, self.app.scanner, self.app.config)
+        self.assertEqual(r["consensus"], "not detected by any engine")
 
 
 if __name__ == "__main__":

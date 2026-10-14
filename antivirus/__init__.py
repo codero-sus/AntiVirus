@@ -33,8 +33,18 @@ Features
 * Benchmark: `antivirus benchmark` runs the labelled sample corpus and
   reports recall / false positives (100% / 0 on the bundled set)
 * Engine report: `antivirus engine FILE` - a VirusTotal-style table of each
-  detection layer's verdict (hash / pattern / behaviour / url / risk /
-  entropy / archive) with a "detected by N of M engines" consensus
+  detection layer's verdict (hash / pattern / behaviour / polyglot /
+  obfuscation / url / risk / entropy / archive) with a "detected by N of M
+  engines" consensus
+* Mutation detection: a standing trust baseline (`trust snapshot/add/...`)
+  flags trusted files whose content changed; bulk mutation (>= 5 files in
+  one pass) raises a critical "possible ransomware activity" alert
+* Polyglot detection: one file valid in 2+ formats (PDF/PE, image/PE,
+  text+embedded PE or high-entropy blob) - legitimate containers (a PDF
+  with a photo, a ZIP of docs) stay clean
+* Obfuscation detection: high-entropy base64/hex payload blobs, double
+  encoding, UTF-16 encoded blobs, NOP/int3 junk code, packed PEs with no
+  import table (hidden API surface)
 * Performance: `antivirus perf` - measured cold/warm throughput (files/s,
   MB/s), cache speedup and per-file latency (p50/p99) on a synthetic corpus
 * Comparison: `antivirus compare` - honest feature + positioning comparison
@@ -72,7 +82,7 @@ Everything is standard library only (Tkinter/curses are optional and used
 only by their respective front-ends).
 """
 
-__version__ = "2.6.1"
+__version__ = "2.7.0"
 
 from .api import (  # noqa: E402
     Antivirus,
