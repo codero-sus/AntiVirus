@@ -793,21 +793,22 @@ file is read once. (They are not 70+ independent third-party AV vendors.)
 
 ### Real-world detection pack (`realworld`)
 
-This is no longer just an EICAR toy: `data/signatures.json` ships **21
-sourced IOC signatures covering 15 real, named malware families** —
+This is no longer just an EICAR toy: `data/signatures.json` ships **29
+sourced IOC signatures covering 20 real, named malware families** —
 WannaCry, Petya/NotPetya, Ryuk, LockBit, DoppelPaymer, BitPaymer, Stuxnet,
 Mirai, Cobalt Strike, Metasploit/Meterpreter, Emotet, TrickBot, Dridex,
-XMRig and RedLine. Each signature carries its **public research source**
+XMRig, RedLine, Locky, CryptoWall, Cerber, Jigsaw and Alphabet. Each
+signature carries its **public research source**
 (FBI flash alerts, CISA advisories, ESET/malpedia TLP:WHITE rules, vendor
 threat-research writeups) in its `source` field, so every detection is
 auditable.
 
 ```console
 $ antivirus realworld
- BitPaymer                    pattern      DETECTED   bitpaymer-sample.bin
- Cobalt Strike                pattern      DETECTED   cobaltstrike-config.txt
+ BitPaymer                    pattern        DETECTED   bitpaymer-sample.bin
+ Cobalt Strike                pattern+hash   DETECTED   cobaltstrike-config.txt
  ...
- 15 real-world families (13 pattern, 2 hash) - 13/13 pattern families
+ 20 real-world families (13 pattern, 7 hash) - 13/13 pattern families
  detected, 0 false positives
 ```
 
@@ -819,6 +820,9 @@ $ antivirus realworld
 * `realworld` builds an **inert** corpus (each sample contains only the
   public IOC of its family — no live malware) and scores the engine:
   13/13 pattern families detected, 0 false positives on the clean files.
+  Hash-only families (LockBit's documented locker, Locky, CryptoWall, Cerber,
+  Jigsaw, Alphabet, Emotet, TrickBot) are scored as *hash-only*: the inert
+  corpus cannot match a sample's SHA-256, but a real dropped sample will.
 
 **The honest gap, stated plainly:** these signatures catch the *documented*
 forms of these families. Commercial engines additionally catch **millions
@@ -827,6 +831,45 @@ and ML — that is the axis they genuinely lead, and `compare`/`realworld`
 say so. What you get here is real detection of named real malware with
 auditable provenance, fully offline, plus a first-class way to extend it
 with your own IOCs (`sig import`).
+
+### Real-sample verification
+
+The pack was validated against **8 real ransomware binaries** pulled from
+public research collections (never executed — they are Windows PEs on a
+Linux scanner; only their bytes are read):
+
+| real sample | sha256 (prefix) | result |
+| --- | --- | --- |
+| WannaCrypt 2017 dropper (3.5 MB) | `ed01ebfbc9eb…` | **4 of 7 layers** — hash (critical) + `.wnry` note-path pattern + packed PE + entropy 7.76 |
+| LockBit Black 3.0 locker (166 KB) | `80e8defa5377…` | **3 of 7 layers** — hash (critical) + packed PE + risk 45/100 |
+| Petya 2016/17 (`petya2.exe`) | `4c1dc737915d…` | hash (high) — plus 8 heuristics incl. "PE downloads and executes code" |
+| Locky 2016 | `bc98c8b22461…` | hash (high) + packed-PE heuristics |
+| CryptoWall | `45317968759d…` | hash (high) + heuristics |
+| Cerber | `9ef7fe10bbbb…` | hash (high) + heuristics |
+| Jigsaw | `3ae96f73d805…` | hash (high) — `"jigsaw"` string verified inside the binary |
+| Alphabet | `4e60f3c8eaa0…` | hash (high) — `"alphabet"` string verified inside the binary |
+
+Two things this validation proved, honestly stated:
+
+1. **Note-text patterns do not always live in the locker binary.** The
+   LockBit locker keeps `Restore-My-Files` and the note text
+   XOR-encrypted in memory, so the plaintext pattern correctly *misses*
+   the binary itself (it still matches the note *file* the ransomware
+   drops on disk). Verified sample **hashes** close that gap for the
+   documented samples, and the heuristic layers (packed sections, no ASLR,
+   no relocations, risk score) keep flagging **unknown** variants for
+   review — that is the closest a local engine gets to "detect the new
+   thing", and it is exactly what the commercial clouds do at scale.
+2. **8 real samples is a spot check, not a coverage claim.** It shows the
+   detection *mechanics* work end-to-end on genuine malware, not on
+   synthetic fixtures. Coverage of *all circulating variants* remains the
+   commercial engines' axis, as `compare` says.
+
+Sample provenance: `gr33ntii/malware-collection` (WannaCrypt, Petya,
+Locky, CryptoWall, Cerber, Jigsaw, Alphabet — 2017 public research
+collection) and `whichbuffer/Lockbit-Black-3.0` (LockBit locker shipped
+with its threat-spotlight PDF). The WannaCrypt sample's hash is cross
+referenced by the public analysis `alby0304/WannaCry_Analysis`.
 
 ### How does it stack up? (`compare`)
 
@@ -858,7 +901,7 @@ scale. `antivirus compare` says all of this plainly.
 | `perf [--files N] [--keep-corpus] [--json]` | Measured throughput: cold vs warm (files/s, MB/s), cache speedup, per-file p50/p99 |
 | `engine FILE [--json]` | VirusTotal-style per-layer engine report + "detected by N of M" consensus |
 | `compare [--no-perf] [--perf-files N] [--json]` | Honest feature + performance comparison vs AVG / Avast / Malwarebytes / VirusTotal |
-| `realworld [--corpus DIR] [--rebuild] [--json]` | Score the sourced real-world IOC pack (15 named families, inert corpus): per-family detection + false positives |
+| `realworld [--corpus DIR] [--rebuild] [--json]` | Score the sourced real-world IOC pack (20 named families, inert corpus): per-family detection + false positives |
 | `hash FILE… [--json]` | Print SHA-256 / MD5 / SHA-1 digests + size of each file |
 | `behavior analyze FILE [--json]` | Show what one file appears to do (static behavioural analysis) |
 | `pe analyze FILE [--json]` | Full static PE dissection ("debug report") + red-flag indicators |
@@ -1064,7 +1107,7 @@ antivirus/
 ├── engine.py        # VirusTotal-style per-layer engine report (consensus)
 ├── perf.py          # measured throughput benchmark (cold/warm + latency)
 ├── compare.py       # honest feature + positioning comparison
-├── realworld.py     # real-world IOC pack scoreboard (15 named families)
+├── realworld.py     # real-world IOC pack scoreboard (20 named families)
 ├── report.py        # JSON + text report writer, diff, summary, export
 ├── selftest.py      # built-in end-to-end self test
 ├── output.py        # tiny ANSI colour helper

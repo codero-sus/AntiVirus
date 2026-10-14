@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated": "2026-10-05T08:43:55Z",
+  "updated": "2026-10-14T09:45:00Z",
   "signatures": [
     {
       "id": "EICAR-STD-2014",
@@ -284,6 +284,110 @@
       "family": "RedLine Stealer",
       "source": "eSentire Threat Intelligence RedLine analysis (2024)",
       "indicator": "pattern"
+    },
+    {
+      "id": "RW-WANNA-2017-V2-SHA256",
+      "name": "WannaCry (second documented 2017 sample hash)",
+      "category": "realworld",
+      "severity": "critical",
+      "description": "SHA-256 of another widely circulated 2017 WannaCry dropper (different variant than RW-WANNACRY-2017-SHA256; carries the .wnry note templates).",
+      "sha256": "ed01ebfbc9eb5bbea545af4d01bf5f1071661840480439c6e5babe8e080e41aa",
+      "md5": "",
+      "pattern": "",
+      "family": "WannaCry",
+      "source": "alby0304/WannaCry_Analysis (sample named by this hash); verified locally against the public collection copy",
+      "indicator": "sha256"
+    },
+    {
+      "id": "RW-LOCKBIT-BLACK3-SHA256",
+      "name": "LockBit Black 3.0 (documented locker sample hash)",
+      "category": "realworld",
+      "severity": "critical",
+      "description": "SHA-256 of a LockBit Black 3.0 locker shipped with a public threat-spotlight report.",
+      "sha256": "80e8defa5377018b093b5b90de0f2957f7062144c83a09a56bba1fe4eda932ce",
+      "md5": "",
+      "pattern": "",
+      "family": "LockBit",
+      "source": "whichbuffer/Lockbit-Black-3.0 (sample + 'Threat Spotlight Lockbit Black 3.0 Ransomware' PDF)",
+      "indicator": "sha256"
+    },
+    {
+      "id": "RW-LOCKY-SAMPLE-SHA256",
+      "name": "Locky (public collection sample hash)",
+      "category": "realworld",
+      "severity": "high",
+      "description": "SHA-256 of the Locky 2016 dropper sample as labeled in the public collection. Exact-match only; the family's on-disk note files are covered by heuristics.",
+      "sha256": "bc98c8b22461a2c2631b2feec399208fdc4ecd1cd2229066c2f385caa958daa3",
+      "md5": "",
+      "pattern": "",
+      "family": "Locky",
+      "source": "gr33ntii/malware-collection (public 2017 research collection; filename-labeled sample, stored locally for verification)",
+      "indicator": "sha256"
+    },
+    {
+      "id": "RW-PETYA2-SAMPLE-SHA256",
+      "name": "Petya (public collection sample hash)",
+      "category": "realworld",
+      "severity": "high",
+      "description": "SHA-256 of the Petya 2 sample as labeled in the public collection. The MBR ransom-note text is covered by RW-PETYA-NOTE.",
+      "sha256": "4c1dc737915d76b7ce579abddaba74ead6fdb5b519a1ea45308b8c49b950655c",
+      "md5": "",
+      "pattern": "",
+      "family": "Petya / NotPetya",
+      "source": "gr33ntii/malware-collection (public 2017 research collection; filename-labeled sample, stored locally for verification)",
+      "indicator": "sha256"
+    },
+    {
+      "id": "RW-CRYPTOWALL-SAMPLE-SHA256",
+      "name": "CryptoWall (public collection sample hash)",
+      "category": "realworld",
+      "severity": "high",
+      "description": "SHA-256 of the CryptoWall sample as labeled in the public collection.",
+      "sha256": "45317968759d3e37282ceb75149f627d648534c5b4685f6da3966d8f6fca662d",
+      "md5": "",
+      "pattern": "",
+      "family": "CryptoWall",
+      "source": "gr33ntii/malware-collection (public 2017 research collection; filename-labeled sample, stored locally for verification)",
+      "indicator": "sha256"
+    },
+    {
+      "id": "RW-CERBER-SAMPLE-SHA256",
+      "name": "Cerber (public collection sample hash)",
+      "category": "realworld",
+      "severity": "high",
+      "description": "SHA-256 of the Cerber sample as labeled in the public collection.",
+      "sha256": "9ef7fe10bbbb58899859d82ba7a698cbfdd546c6e9e4d3b55193e4180682036c",
+      "md5": "",
+      "pattern": "",
+      "family": "Cerber",
+      "source": "gr33ntii/malware-collection (public 2017 research collection; filename-labeled sample, stored locally for verification)",
+      "indicator": "sha256"
+    },
+    {
+      "id": "RW-JIGSAW-SAMPLE-SHA256",
+      "name": "Jigsaw (public collection sample hash)",
+      "category": "realworld",
+      "severity": "high",
+      "description": "SHA-256 of the Jigsaw sample as labeled in the public collection; 'jigsaw' string verified inside the binary.",
+      "sha256": "3ae96f73d805e1d3995253db4d910300d8442ea603737a1428b613061e7f61e7",
+      "md5": "",
+      "pattern": "",
+      "family": "Jigsaw",
+      "source": "gr33ntii/malware-collection (public 2017 research collection; filename-labeled sample, stored locally for verification)",
+      "indicator": "sha256"
+    },
+    {
+      "id": "RW-ALPHABET-SAMPLE-SHA256",
+      "name": "Alphabet (public collection sample hash)",
+      "category": "realworld",
+      "severity": "high",
+      "description": "SHA-256 of the Alphabet sample as labeled in the public collection; 'alphabet' string verified inside the binary.",
+      "sha256": "4e60f3c8eaa0441d4ffdced18aa04153bb91b5470bc5441ba5878f7760ca9b5b",
+      "md5": "",
+      "pattern": "",
+      "family": "Alphabet",
+      "source": "gr33ntii/malware-collection (public 2017 research collection; filename-labeled sample, stored locally for verification)",
+      "indicator": "sha256"
     }
   ]
 }
