@@ -87,6 +87,10 @@ def _build(args):
         config.feeds_enabled = False
     if getattr(args, "feeds_dir", None):
         config.feeds_dir = Path(args.feeds_dir)
+    if getattr(args, "no_allowlist", False):
+        config.allowlist_enabled = False
+    if getattr(args, "allowlist_file", None):
+        config.allowlist_file = Path(args.allowlist_file)
     if getattr(args, "max_depth", 0):
         config.scan_max_depth = int(args.max_depth)
     if getattr(args, "file_timeout", 0.0):
@@ -175,6 +179,7 @@ def cmd_scan(args) -> int:
         scanner.on_progress = _ProgressBar()
     try:
         result = scanner.scan_path(target)
+        result.allowlist_suppressed = scanner.allowlist_suppressed
     except OSError as exc:
         print(paint(f"error: {exc}", RED), file=sys.stderr)
         return 2
@@ -274,6 +279,10 @@ def _print_scan_summary(result: ScanResult, action: str, notes: dict,
     if getattr(result, "files_neutralized", 0):
         print(f" Neutralized:    {result.files_neutralized}  "
               f"(already killed – inert, not re-flagged)")
+    suppressed = getattr(result, "allowlist_suppressed", 0)
+    if suppressed:
+        print(f" Suppressed:     {suppressed}  "
+              f"(allowlisted – see `antivirus allowlist list`)")
     print(f" Errors:         {len(result.errors)}")
     print(f" Threads:        {workers} ({'parallel' if workers > 1 else 'sequential'})")
     print(f" Duration:       {result.elapsed:.2f} s")
@@ -1925,6 +1934,14 @@ def build_parser() -> argparse.ArgumentParser:
                    help="feed database directory (default data/feeds)")
     p.add_argument("--rules", default=None, metavar="FILE",
                    help="user rule file (default data/user_rules.json)")
+    p.add_argument("--no-allowlist", action="store_true",
+                   help="ignore the allowlist (show findings it would suppress)")
+    p.add_argument("--allowlist", dest="allowlist_file", default=None,
+                   metavar="FILE",
+                   help="allowlist file (default data/allowlist.json)")
+    p.add_argument("--save-report", dest="save_report", default=None,
+                   metavar="FILE",
+                   help="write the JSON report (for allowlist from-findings)")
     p.add_argument("--json", action="store_true", help="machine readable output")
 
     p = sub.add_parser("monitor", help="watch a directory and scan new/changed files")
@@ -2481,6 +2498,69 @@ def build_parser() -> argparse.ArgumentParser:
                    help="import-clamav: .hdb/.hsb/.ndb/.cvd/.cld file")
     p.add_argument("--json", action="store_true", help="machine readable")
 
+    p = sub.add_parser("yara", help="export the detection content as a "
+                                    "portable YARA ruleset")
+    p.add_argument("--out", default="av-rules.yar", metavar="FILE",
+                   help="output ruleset (default av-rules.yar)")
+    p.add_argument("--min-severity", default="medium", metavar="SEV",
+                   help="lowest indicator severity to convert (default medium)")
+    p.add_argument("--no-feeds", action="store_true",
+                   help="exclude feed-derived literals from the ruleset")
+    p.add_argument("--max-feed", type=int, default=5000, metavar="N",
+                   help="cap feed-derived rules (default 5000)")
+    p.add_argument("--signatures", default=None, metavar="FILE",
+                   help="signature database to convert (default "
+                        "data/signatures.json)")
+    p.add_argument("--feeds-dir", default=None, metavar="DIR",
+                   help="feed database directory (default data/feeds)")
+    p.add_argument("--verify", action="store_true",
+                   help="compile the ruleset with yara-python when available")
+    p.add_argument("--verbose", action="store_true",
+                   help="list every pattern that YARA cannot express")
+    p.add_argument("--json", action="store_true", help="machine readable")
+
+    p = sub.add_parser("matrix", aliases=["coverage"],
+                       help="coverage of the indicator library by ATT&CK tactic")
+    p.add_argument("--tag", action="append", metavar="TAG",
+                   help="only count checks carrying this tag (repeatable)")
+    p.add_argument("--json", action="store_true", help="machine readable")
+
+    p = sub.add_parser("fpcheck", aliases=["fpaudit"],
+                       help="false-positive audit against random and clean data")
+    p.add_argument("--blobs", type=int, default=50, metavar="N",
+                   help="random blobs per seed (default 50; use 150 for the "
+                        "full ~90 s release audit)")
+    p.add_argument("--size", type=int, default=300, metavar="KiB",
+                   help="size of each random blob, KiB (default 300)")
+    p.add_argument("--min-severity", default="info", metavar="SEV",
+                   help="ignore findings below this severity")
+    p.add_argument("--blobs-only", action="store_true",
+                   help="skip the text/script corpora")
+    p.add_argument("--text-only", action="store_true",
+                   help="skip the random-binary corpus")
+    p.add_argument("--json", action="store_true", help="machine readable")
+
+    p = sub.add_parser("allowlist", aliases=["allow"],
+                       help="false-positive allowlist: list/add/remove/check/"
+                            "export/import/audit")
+    p.add_argument("allowlist_action", nargs="?", default="list",
+                   choices=("list", "add", "remove", "clear", "check", "export",
+                            "import", "from-findings", "audit"),
+                   help="what to do (default: list)")
+    p.add_argument("targets", nargs="*", default=None,
+                   help="add: KIND VALUE  ·  remove/check: VALUE")
+    p.add_argument("--kind", choices=("hash", "name", "path", "domain"),
+                   default=None, help="entry kind for add/from-findings")
+    p.add_argument("--value", default=None, help="entry value (alternative to "
+                                                 "positional)")
+    p.add_argument("--note", default="", help="why this entry exists")
+    p.add_argument("--file", default=None, metavar="FILE",
+                   help="file to allowlist by hash · export/import/from-findings "
+                        "JSON path")
+    p.add_argument("--allowlist-file", default=None, metavar="FILE",
+                   help="allowlist file (default data/allowlist.json)")
+    p.add_argument("--json", action="store_true", help="machine readable")
+
     return parser
 
 
@@ -2534,6 +2614,13 @@ _COMMANDS = {
     "explain": _extra.cmd_explain,
     # ---------------------------------------------------------- v2.9
     "feeds": _extra.cmd_feeds,
+    "yara": _extra.cmd_yara,
+    "matrix": _extra.cmd_matrix,
+    "coverage": _extra.cmd_matrix,
+    "fpcheck": _extra.cmd_fpcheck,
+    "fpaudit": _extra.cmd_fpcheck,
+    "allowlist": _extra.cmd_allowlist,
+    "allow": _extra.cmd_allowlist,
 }
 
 

@@ -13,6 +13,7 @@ import sys
 import textwrap
 import time
 from collections import Counter
+from typing import Dict
 from pathlib import Path
 
 from . import __version__
@@ -829,3 +830,373 @@ def cmd_explain(args) -> int:
     print(paint(topic, BOLD))
     print(textwrap.fill(text, 78, initial_indent="  ", subsequent_indent="  "))
     return 0
+
+
+# --------------------------------------------------------------------------
+# allowlist (v3.0) – false-positive suppression that is auditable
+# --------------------------------------------------------------------------
+def _allow_file(args) -> Path:
+    return Path(getattr(args, "allowlist_file", None) or "data/allowlist.json")
+
+
+def cmd_allowlist(args) -> int:
+    """Manage the false-positive allowlist (hashes, names, paths, domains)."""
+    from . import allowlist as al_mod
+
+    action = getattr(args, "allowlist_action", None) or "list"
+    if action == "audit":
+        return cmd_allowlist_audit(args)
+    path = _allow_file(args)
+    allow = al_mod.AllowList.load(path)
+
+    if action == "list":
+        stats = allow.stats()
+        if args.json:
+            print(json.dumps({"path": str(path), "stats": stats,
+                              "entries": [e.to_dict() for e in allow.entries]},
+                             indent=2, ensure_ascii=False))
+            return 0
+        print(paint(f"allowlist {path} – {stats['total']} entry(s)", BOLD))
+        if not allow.entries:
+            print("  empty: nothing is suppressed")
+            print("  add with:  antivirus allowlist add hash <sha256> --note why")
+            return 0
+        print("  " + "  ".join(f"{k}={v}" for k, v in stats.items()
+                               if k != "total" and v))
+        for entry in allow.entries:
+            print(f"  {entry.id:16} {entry.kind:6} {entry.value[:64]}")
+            meta = " – ".join(x for x in (entry.note, entry.added_at,
+                                          entry.source) if x)
+            if meta:
+                print(f"      {meta}")
+        return 0
+
+    if action in ("add", "allow"):
+        kind = getattr(args, "kind", None)
+        value = getattr(args, "value", None)
+        targets = list(getattr(args, "targets", None) or [])
+        if not kind and len(targets) >= 2:
+            kind, value = targets[0], targets[1]
+        elif not kind and len(targets) == 1:
+            value = targets[0]
+        if not value and getattr(args, "file", None):
+            entry = al_mod.add_hash_from_file(
+                allow, Path(args.file), note=args.note or "")
+            allow.save()
+            print(f"allowlisted {entry.kind} {entry.value}")
+            return 0
+        if not kind:
+            print("usage: antivirus allowlist add hash|name|path|domain VALUE "
+                  "[--note why]", file=sys.stderr)
+            return 2
+        try:
+            entry, created = allow.add(kind, value, note=getattr(args, "note", "")
+                                       or "")
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        if created:
+            allow.save()
+            print(f"allowlisted {entry.kind} {entry.value}")
+        else:
+            print(f"already allowlisted: {entry.kind} {entry.value}")
+        return 0
+
+    if action in ("remove", "delete", "rm"):
+        target = getattr(args, "value", None) or (
+            (getattr(args, "targets", None) or [""])[0])
+        if not target:
+            print("usage: antivirus allowlist remove ID|VALUE", file=sys.stderr)
+            return 2
+        try:
+            entry = allow.remove(target)
+        except KeyError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        allow.save()
+        print(f"removed {entry.kind} {entry.value}")
+        return 0
+
+    if action == "clear":
+        count = allow.clear()
+        allow.save()
+        print(f"cleared {count} allowlist entry(s)")
+        return 0
+
+    if action in ("check", "why"):
+        target = getattr(args, "value", None) or (
+            (getattr(args, "targets", None) or [""])[0])
+        if not target:
+            print("usage: antivirus allowlist check PATH|DOMAIN", file=sys.stderr)
+            return 2
+        p = Path(target)
+        hit = allow.check(str(p), name=p.name)
+        if hit is None and p.exists():
+            digest = __import__("hashlib").sha256(p.read_bytes()).hexdigest()
+            hit = allow.check(str(p), sha256=digest, name=p.name)
+        if hit is None:
+            hit = allow.check_domain(target)
+        if hit is None:
+            print(f"{target}: NOT allowlisted – findings would be reported")
+            return 1
+        if args.json:
+            print(json.dumps(hit.to_dict(), indent=2, ensure_ascii=False))
+        else:
+            print(f"{target}: suppressed – {hit.reason}")
+            print(f"  entry {hit.entry.id} ({hit.entry.kind} "
+                  f"{hit.entry.value}) {hit.entry.note}".rstrip())
+        return 0
+
+    if action in ("export", "import"):
+        file_arg = getattr(args, "file", None) or (
+            (getattr(args, "targets", None) or [None])[0])
+        if not file_arg:
+            print(f"usage: antivirus allowlist {action} FILE", file=sys.stderr)
+            return 2
+        target = Path(file_arg)
+        if action == "export":
+            payload = {"version": 1, "entries": [e.to_dict()
+                                                 for e in allow.entries]}
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(json.dumps(payload, indent=2, ensure_ascii=False),
+                              encoding="utf-8")
+            print(f"exported {len(allow.entries)} entry(s) to {target}")
+            return 0
+        try:
+            data = json.loads(target.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            print(f"error: cannot read {target}: {exc}", file=sys.stderr)
+            return 2
+        added = skipped = 0
+        for raw in (data.get("entries") if isinstance(data, dict) else data) or []:
+            try:
+                _, created = allow.add(str(raw.get("kind", "")),
+                                       str(raw.get("value", "")),
+                                       note=str(raw.get("note", "")),
+                                       source="import")
+            except ValueError:
+                skipped += 1
+                continue
+            added += int(created)
+            skipped += int(not created)
+        allow.save()
+        print(f"imported {added} new entry(s), {skipped} skipped/duplicate")
+        return 0
+
+    if action in ("from-findings", "auto", "autoadd"):
+        """Allowlist everything a previous report flagged (JSON report input)."""
+        source = getattr(args, "file", None) or (
+            (getattr(args, "targets", None) or [None])[0])
+        if not source:
+            print("usage: antivirus allowlist from-findings report.json",
+                  file=sys.stderr)
+            return 2
+        try:
+            data = json.loads(Path(source).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            print(f"error: cannot read {source}: {exc}", file=sys.stderr)
+            return 2
+        findings = data.get("findings") if isinstance(data, dict) else data
+        only = getattr(args, "kind", None)
+        added = 0
+        seen = set()
+        for finding in findings or []:
+            digest = str(finding.get("sha256") or "")
+            if only in (None, "hash") and digest and digest not in seen:
+                seen.add(digest)
+                if allow.add_hash(digest, note=f"suppressed by {source}",
+                                  source="report")[1]:
+                    added += 1
+            domain = str(finding.get("domain") or "")
+            if only in (None, "domain") and domain:
+                if allow.add_domain(domain, note=f"seen in {source}",
+                                    source="report")[1]:
+                    added += 1
+        allow.save()
+        print(f"allowlisted {added} item(s) from {len(findings or [])} finding(s)"
+              f" -> {path}")
+        print("  review before trusting: an allowlisted hash is never reported "
+              "again")
+        return 0
+
+    print(f"unknown allowlist action: {action}", file=sys.stderr)
+    return 2
+
+
+def cmd_allowlist_audit(args) -> int:
+    """Show how many findings the allowlist is currently hiding, and where."""
+    from . import allowlist as al_mod
+
+    path = _allow_file(args)
+    allow = al_mod.AllowList.load(path)
+    suspects = [e for e in allow.entries if e.kind == "hash" and not e.note]
+    stats = allow.stats()
+    if args.json:
+        print(json.dumps({"path": str(path), "stats": stats,
+                          "unexplained": [e.to_dict() for e in suspects]},
+                         indent=2, ensure_ascii=False))
+        return 0
+    print(paint(f"allowlist audit – {stats['total']} entry(s)", BOLD))
+    print(f"  hashes {stats.get('hash', 0)}  names {stats.get('name', 0)}  "
+          f"paths {stats.get('path', 0)}  domains {stats.get('domain', 0)}")
+    if stats.get("name") or stats.get("path"):
+        print(paint("  note: name/path entries are broad – prefer hashes where "
+                    "possible", YELLOW))
+    if suspects:
+        print(paint(f"  {len(suspects)} hash entry(s) without an explanation:",
+                    YELLOW))
+        for entry in suspects[:20]:
+            print(f"    {entry.id} {entry.value}")
+    else:
+        print("  every entry carries an explanation")
+    return 0
+
+
+def cmd_fpcheck(args) -> int:
+    """False-positive audit of the indicator library against clean data."""
+    from . import fpcheck as fp_mod
+
+    severity = getattr(args, "min_severity", None) or "info"
+    seeds = (1, 7, 20261015)
+    blobs = int(getattr(args, "blobs", None) or 150)
+    size_kib = int(getattr(args, "size", None) or 300)
+    report = fp_mod.run(blobs=blobs, size=size_kib * 1024, seeds=seeds,
+                        min_severity=severity,
+                        blobs_only=getattr(args, "blobs_only", False),
+                        text_only=getattr(args, "text_only", False))
+
+    if getattr(args, "json", False):
+        print(json.dumps(report.to_dict(), indent=2, ensure_ascii=False))
+        return 0 if report.clean else 1
+
+    print(paint(f"false-positive audit – {__version__}", BOLD))
+    print(f"  random binary : {report.blobs} × {human_size(report.blob_size)}"
+          f"  (seeds {', '.join(str(s) for s in seeds)})")
+    if not getattr(args, "blobs_only", False):
+        samples = fp_mod.corpus_summary()
+        print(f"  clean text    : {len(samples)} file(s) – "
+              + ", ".join(name for _, name, _ in samples))
+    print(f"  threshold     : findings below '{severity}' are ignored")
+    print()
+    for corpus, count in sorted(report.per_corpus.items()):
+        flagged = sum(1 for h in report.hits if h.corpus == corpus)
+        mark = paint("ok", GREEN) if not flagged else paint(
+            f"{flagged} flagged", RED)
+        print(f"  {corpus:14} {count:4} file(s)   {mark}")
+    print()
+    if report.clean:
+        print(paint(f"  no false positive above '{severity}' in "
+                    f"{report.total_files} clean file(s)  "
+                    f"({report.elapsed:.1f} s)", GREEN))
+        return 0
+    print(paint(f"  {report.flagged_files}/{report.total_files} clean file(s) "
+                f"flagged ({report.rate:.2%})", RED))
+    for check, count in Counter(report.counts).most_common(15):
+        example = next(h for h in report.hits if h.check == check)
+        print(f"    {count:4}  {check}")
+        print(f"          e.g. {example.file} [{example.severity}] "
+              f"{example.message[:90]}")
+    print()
+    print("  fix by tightening the pattern (see indicators.py) – never by "
+          "deleting the check without a replacement.")
+    return 1
+
+
+def cmd_yara(args) -> int:
+    """Export the detection content as a portable YARA ruleset."""
+    from . import yararules as yr
+
+    min_sev = getattr(args, "min_severity", None) or "medium"
+    order = ["info", "low", "medium", "high", "critical"]
+    severities = tuple(order[order.index(min_sev):]) if min_sev in order else \
+        ("critical", "high", "medium")
+    patterns = [] if getattr(args, "no_feeds", False) else None
+    text, stats = yr.generate(
+        severities=severities, patterns=patterns,
+        signatures_file=(Path(args.signatures) if getattr(args, "signatures",
+                                                          None) else None),
+        feeds_dir=(Path(args.feeds_dir) if getattr(args, "feeds_dir", None)
+                   else None),
+        max_feed=int(getattr(args, "max_feed", 5000) or 5000))
+    out = Path(getattr(args, "out", None) or "av-rules.yar")
+    yr.write(text, out)
+
+    if args.json:
+        print(json.dumps({"path": str(out), "bytes": len(text),
+                          "stats": stats.to_dict()}, indent=2))
+        return 0
+
+    print(paint(f"YARA ruleset written to {out}", BOLD))
+    print(f"  {stats.rules} rule(s): {stats.signatures} signature / "
+          f"{stats.indicators} indicator / {stats.feed} feed")
+    print(f"  skipped: {stats.skipped_hash_only} hash-only signature(s) "
+          f"(YARA cannot match by hash), "
+          f"{len(stats.skipped_regex)} pattern(s) outside YARA's regex subset")
+    if stats.skipped_regex and getattr(args, "verbose", False):
+        for id_ in stats.skipped_regex[:40]:
+            print(f"    skipped pattern: {id_}")
+    if getattr(args, "verify", False):
+        result = yr.verify(out)
+        if not result.get("available"):
+            print(paint(f"  --verify: {result['detail']}", YELLOW))
+        elif result.get("compiled"):
+            print(paint("  --verify: yara-python compiled the ruleset "
+                        "successfully", GREEN))
+        else:
+            print(paint(f"  --verify: COMPILE FAILED – {result.get('error')}",
+                        RED))
+            return 1
+    else:
+        print("  verify with:  yara -r av-rules.yar <path>   (or --verify)")
+    return 0
+
+
+def cmd_matrix(args) -> int:
+    """ATT&CK-style coverage view of the indicator library."""
+    from . import indicators as ind_mod
+
+    checks = list(ind_mod.CHECKS)
+    want_tags = {t.lower() for t in (getattr(args, "tag", None) or [])}
+    if want_tags:
+        checks = [c for c in checks
+                  if want_tags & {t.lower() for t in c.tags}]
+    summary = ind_mod.matrix_summary(checks)
+
+    if args.json:
+        print(json.dumps(summary, indent=2, ensure_ascii=False))
+        return 0
+
+    print(paint(f"indicator coverage by ATT&CK tactic – {__version__}", BOLD))
+    print(f"  {summary['total']} checks"
+          + (f" matching {', '.join(sorted(want_tags))}" if want_tags else ""))
+    print()
+    width = max(len(t["tactic"]) for t in summary["tactics"])
+    for tactic in summary["tactics"]:
+        entries = tactic["checks"]
+        if not entries:
+            print(f"  {tactic['tactic']:<{width}}  " + paint("no coverage",
+                                                           YELLOW))
+            continue
+        sev = tactic["by_severity"]
+        bar = "".join(_SEV_GLYPH.get(sev_name, "?") * min(count, 12)
+                      for sev_name, count in sorted(
+                          sev.items(), key=lambda kv: -_SEV_RANK.get(kv[0], 0)))
+        print(f"  {tactic['tactic']:<{width}}  {entries:3}  {bar}")
+        print(f"  {'':<{width}}  {tactic['description']}")
+        if tactic["tags"]:
+            print(f"  {'':<{width}}  top tags: "
+                  + ", ".join(tag for tag, _ in tactic["tags"][:5]))
+        if tactic.get("example"):
+            print(f"  {'':<{width}}  e.g. {tactic['example']}")
+    print()
+    if summary["extra_categories"]:
+        for category in summary["extra_categories"]:
+            print(f"  (no tactic assigned: {category})")
+    print("  glyphs: " + "  ".join(f"{_SEV_GLYPH[s]}{s}"
+                                  for s in ("critical", "high", "medium",
+                                            "low")))
+    print("  list one:  antivirus explain IND-EXEC-PS-ENCODED")
+    return 0
+
+
+_SEV_GLYPH = {"critical": "#", "high": "+", "medium": "-", "low": "."}

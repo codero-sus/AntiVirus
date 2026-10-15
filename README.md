@@ -18,13 +18,22 @@ watches folders for new/changed files, and writes JSON + text reports.
      (catches renamed/wrapped variants)
 - **Public threat-intel database** (`feeds`) — millions of indicators from
   vetted public sources (blocklists, hash sets, rule strings), converted into
-  compact local indexes: 22 MB on disk for 2.8 M indicators, matched by
-  binary search. Licence-aware, provenance-tracked, and built by you rather
-  than shipped — see [Public threat-intel feeds](#public-threat-intel-feeds).
-- **Technique indicators** (`indicators`) — 89 static checks for how a file
+  compact, tiered local indexes: ~39 MB on disk for 4.8 M indicators, matched
+  by binary search. Licence-aware, provenance-tracked, guarded against the
+  false positives aggregated feeds are full of, and built by you rather than
+  shipped — see [Public threat-intel feeds](#public-threat-intel-feeds).
+- **Technique indicators** (`indicators`) — 301 static checks for how a file
   behaves, independent of any specific malware: LOLBins, persistence,
   defence evasion, credential access, C2, ransomware impact, Office macros
-  and file-name tricks. `antivirus indicators --category evasion` lists them.
+  and file-name tricks. `antivirus indicators --category evasion` lists them,
+  `antivirus matrix` shows coverage per ATT&CK tactic.
+- **False-positive control** — an auditable `allowlist` (hashes, names, paths,
+  domains) for the things you know are safe, and `antivirus fpcheck`, which
+  measures the whole indicator library against random data and realistic
+  clean files so a bad check cannot ship unnoticed.
+- **Portable rules** — `antivirus yara --out rules.yar` exports the same
+  detection content as a YARA ruleset (532 rules, verified with
+  `yara-python`), for the tooling that speaks nothing else.
 - **Behavioural detection** (static — nothing is ever executed):
   * *Python* — AST analysis: `eval`/`exec` on non-constant input,
     `subprocess(..., shell=True)`, `os.system`, sockets to hardcoded
@@ -989,8 +998,9 @@ that security teams publish and maintain — so this tool **builds a database
 from them on your machine** instead of pretending to ship one.
 
 ```bash
-python3 -m antivirus feeds list          # 12 vetted sources + licences
-python3 -m antivirus feeds build         # ~25 s → 2.8 M indicators, 22 MB
+python3 -m antivirus feeds list          # 23 vetted sources + licences
+python3 -m antivirus feeds build         # ~49 s → 4.8 M indicators, 39 MB
+python3 -m antivirus feeds build --all   # include runtime-only licences
 python3 -m antivirus feeds stats         # what is in the database
 python3 -m antivirus feeds audit         # provenance + licence report
 python3 -m antivirus feeds verify        # indexes consistent + sorted
@@ -998,10 +1008,17 @@ python3 -m antivirus scan .              # the feeds layer now contributes
 python3 -m antivirus feeds clear         # remove the database
 ```
 
-Measured on the default build (2026-10-15): **2,817,300 indicators** from
-9 sources in **25 seconds**, stored as **22.6 MB** of sorted index files in
-`data/feeds/` (git-ignored — generated data is never committed). A scan that
-uses it costs about **+0.25 s (≈3 %)** on a full repository scan.
+Measured on a full build (2026-10-15): **4,826,602 indicators** from
+**23 sources** in **49 seconds**, stored as **~39 MB** of sorted index files
+in `data/feeds/` (git-ignored — generated data is never committed). A scan
+that uses it costs about **+0.5 s** on a full repository scan.
+
+The indexes are tiered, so a feed hit carries the *confidence* of the source
+list rather than a flat severity: `domain.critical` (ransomware C2),
+`domain.high` (4.4 M malware/phishing domains), `domain.medium`,
+`domain.low` (adware/telemetry), and `ip.critical` / `ip.high` / `ip.medium`
+where the tier comes from how many independent blocklists report the address
+(IPsum). Most-listed-first lookups mean the worst classification wins.
 
 ### Where the data comes from
 
@@ -1017,6 +1034,11 @@ uses it costs about **+0.25 s (≈3 %)** on a full repository scan.
 | `mandiant-yara` | red-team tool YARA **string literals** | BSD-2-Clause | shipped-as-code |
 | `signature-base-hashes` | evil hash IOCs | DRL 1.1 | runtime-only (`--all`) |
 | `signature-base-c2` / `-filenames` | C2 IOCs, malware file names | DRL 1.1 | runtime-only (`--all`) |
+| `phishing-database-domains` / `-links` / `-ips` / `-adblock` | active phishing domains, links and IPs | MIT | shipped-as-code |
+| `stevenblack-unified` | adware / telemetry hosts (low severity) | MIT | shipped-as-code |
+| `ipsum-ips` | aggregated malicious IPs **with sighting counts** | Unlicense | shipped-as-code |
+| `tweetfeed-year` / `-month` / `-exclusive` | community-reported IOCs (CC0) | CC0-1.0 | shipped-as-code |
+| `hagezi-threat-intel` / `-fake` | threat-intel + fake-domain lists | GPL-3.0 | runtime-only (`--all`) |
 
 *Redistribution* is the important column: every source is usable, but sources
 whose licence does not allow shipping their data inside an MIT project are
@@ -1048,6 +1070,16 @@ Two guard rails keep the database honest:
 2. **Benign-corpus gate** — every converted pattern is matched against the
    bundled known-clean samples; anything that fires on a file known to be
    innocent is discarded (`pattern-benign-match` in the build report).
+3. **Trusted-host guard** — 114 well-known hosts (`github.com`, `bit.ly`,
+   `googleapis.com`, `blogspot.com`, package registries, CDNs, …) are never
+   indexed, however many feeds list a malicious *URL* on them. Aggregated
+   feeds are full of such entries: the first full-database scan of this
+   repository flagged `github.com` in its own README. The guard applies at
+   build time *and* at lookup time, so a database built before the rule
+   cannot produce that finding either (`trusted-host=N` in the build report).
+4. **Private-address guard** — RFC1918 / loopback / link-local addresses are
+   dropped from IP feeds and URL hosts: a LAN address in a blocklist only
+   creates false positives on ordinary internal traffic.
 
 Feed hits appear as their own engine layer (`feeds`) with the source and
 licence in the finding, e.g.:
@@ -1066,10 +1098,97 @@ Public blocklists contain machine-generated junk such as `subprocess.run` and
 `s.id` — `.run` and `.id` are real TLDs — and matching those in source code
 would be a false positive, so context is required.
 
+## False positives, and what to do about them
+
+Every detector is wrong sometimes: a penetration-test script, an in-house
+admin tool, a domain your company legitimately talks to. A tool that cannot
+be corrected gets ignored, so v3.0 adds three things that keep the signal
+trustworthy.
+
+### Allowlist (`antivirus allowlist`)
+
+```bash
+python3 -m antivirus allowlist add hash   <sha256> --note "our patch tool"
+python3 -m antivirus allowlist add name   "*.ps1"  --note "internal scripts"
+python3 -m antivirus allowlist add path   "/srv/legacy/*"
+python3 -m antivirus allowlist add domain vpn.corp.example
+python3 -m antivirus allowlist check /srv/legacy/old.exe   # why would it be hidden?
+python3 -m antivirus allowlist from-findings report.json   # import a whole report
+python3 -m antivirus allowlist audit    # entries without an explanation
+```
+
+Entries live in `data/allowlist.json`, record when and why they were added,
+and are honoured by every scan — a suppressed finding shows up as
+`Suppressed: N` in the summary and as `allowlist_suppressed` in the JSON
+report, so nothing is hidden silently. `--no-allowlist` shows what the
+allowlist is currently hiding; the allowlist file is part of the scan-cache
+key, so adding an entry immediately re-scans affected files.
+
+### False-positive audit (`antivirus fpcheck`)
+
+```bash
+python3 -m antivirus fpcheck              # random blobs + clean corpus (~30 s)
+python3 -m antivirus fpcheck --blobs 150  # the full release audit (~90 s)
+```
+
+Runs the entire indicator library against 450 random 300 KiB blobs and a
+corpus of realistic clean files (Python, shell, batch, PowerShell, docs,
+JSON) and exits non-zero when anything reaches the chosen severity. Current
+result: **0 false positives in 457 clean files**. This is the gate every new
+check has to pass; it is how the loopback-URL and packaging-marker false
+positives in this release were found and fixed.
+
+### ATT&CK coverage (`antivirus matrix`)
+
+```bash
+python3 -m antivirus matrix          # checks per tactic, severity mix, top tags
+python3 -m antivirus matrix --tag lolbin
+```
+
+301 checks across 8 tactics; the table is generated from the library, and the
+self test asserts that **no check is unmapped** to a tactic.
+
+### YARA export (`antivirus yara`)
+
+```bash
+python3 -m antivirus yara --out av-rules.yar          # 532 rules
+python3 -m antivirus yara --min-severity high --no-feeds
+python3 -m antivirus yara --out r.yar --verify         # needs yara-python
+```
+
+Turns the signature database, the technique indicators and the feed literals
+into a portable ruleset for the huge amount of tooling that speaks YARA
+(sandboxes, SOC pipelines, Velociraptor). The generator is deliberately
+conservative: constructs YARA cannot express are **skipped and counted**
+(11 hash-only signatures and 100 patterns in the current build), because a
+rule that silently means something else is worse than no rule. Verified
+against real `yara-python` 4.5.4: the 532-rule output compiles, matches the
+EICAR string, and does not match random data.
+
+## What's new in v3.0
+
+* **Allowlist** — `allowlist add hash|name|path|domain`, audited, counted in
+  every report, `--no-allowlist` to bypass.
+* **False-positive audit** — `antivirus fpcheck`, the release gate for
+  detection content (457 clean files, 0 false positives).
+* **ATT&CK matrix** — `antivirus matrix` groups all 301 checks by tactic.
+* **YARA export** — `antivirus yara` converts this detection content into a
+  portable ruleset (532 rules, compiled with yara-python 4.5.4).
+* **Indicator library: 89 → 301 checks** (execution 68, evasion 66,
+  persistence 46, credential 32, exfil 27, lateral 25, impact 25, Office 12),
+  each with a description and tags.
+* **Feed database: 9 → 23 sources, 2.8 M → 4.8 M indicators**, five new
+  parsers (adblock, URL-hosts, IP-with-count, TweetFeed CSV, wildcard
+  domains), tiered severities, and the trusted-host + private-address guards
+  described above.
+* **Tests**: 339 unit tests (was 293) plus 82 self-test checks, covering the
+  new parsers, the allowlist, YARA conversion and the FP harness.
+
 ## What's new in v2.8
 
-* **89 technique indicators** (`antivirus indicators`, `IND-…` ids, 8
-  categories) — a new detection layer that reports *how* a file behaves.
+* **Technique indicators** (`antivirus indicators`, `IND-…` ids, 8
+  categories) — a detection layer that reports *how* a file behaves
+  (89 at the time; extended to 301 in v3.0).
 * **User rules** (`antivirus rules add/remove/list/test/import`) — YARA-lite
   patterns and file-name globs, kept separate from the bundled database.
 * **Machine-readable output** — `scan --sarif report.sarif` (SARIF 2.1.0) and
@@ -1084,7 +1203,7 @@ would be a false positive, so context is required.
 
 | Command | Description |
 | --- | --- |
-| `scan TARGET [--action detect\|quarantine\|kill\|delete] [--threads N] [--no-behavior] [--fast] [--no-cache] [--no-archives] [--exclude GLOB] [--since DURATION] [--baseline FILE] [--fail-on LEVEL] [--sarif FILE] [--html FILE] [--quiet] [--no-feeds] [--json]` | Scan a file or directory tree (`--threads`: auto, N, or 1; `--fast`: hash+pattern only; `--exclude` repeatable; `--since 30m/2h/1d`: only recently modified files; `--baseline`: integrity check vs a manifest; `kill`: obfuscate in place, key/IV to the registry) |
+| `scan TARGET [--action detect\|quarantine\|kill\|delete] [--threads N] [--no-behavior] [--fast] [--no-cache] [--no-archives] [--exclude GLOB] [--since DURATION] [--baseline FILE] [--fail-on LEVEL] [--sarif FILE] [--html FILE] [--quiet] [--no-feeds] [--json]` | Scan a file or directory tree (`--threads`: auto, N, or 1; `--fast`: hash+pattern only; `--exclude` repeatable; `--since 30m/2h/1d`: only recently modified files; `--baseline`: integrity check vs a manifest; `--no-allowlist`: show findings the allowlist hides; `kill`: obfuscate in place, key/IV to the registry) |
 | `monitor TARGET [--action ...] [--interval 2] [--no-behavior] [--no-archives] [--exclude GLOB] [--since DURATION] [--json]` | Watch a directory, scan new/changed files (`--json`: one JSON object per event; actions include `kill`) |
 | `guard start [TARGET] [--action …] [--interval 5] [--initial] [--state-dir DIR]` | Start the background guard: auto-scan new/changed files, detached, lightweight |
 | `guard stop` / `guard status` / `guard log [--lines N]` | Stop / inspect / tail the background guard |
@@ -1100,7 +1219,11 @@ would be a false positive, so context is required.
 | `feeds build [--source ID]… [--all] [--limit N] [--max-patterns N] [--json]` | Fetch, convert and index public feeds into `data/feeds/` (default: licence-safe sources only) |
 | `feeds import-clamav FILE` | Import a local ClamAV database (`.hdb`/`.hsb`/`.ndb`/`.cvd`/`.cld`) |
 | `feeds stats` / `feeds audit` / `feeds verify` / `feeds clear` | Inspect / provenance + licence report / consistency check / delete the feed database |
-| `indicators [--category C] [--show ID] [--json]` | List the 89 technique-indicator checks |
+| `indicators [--category C] [--show ID] [--json]` | List the 301 technique-indicator checks |
+| `matrix [--tag TAG] [--json]` | ATT&CK coverage view: checks per tactic, severity mix, top tags |
+| `allowlist list\|add\|remove\|clear\|check\|export\|import\|from-findings\|audit` | False-positive allowlist (hashes, names, paths, domains), audited and counted |
+| `fpcheck [--blobs N] [--size KiB] [--min-severity S] [--json]` | False-positive audit: random blobs + realistic clean corpus; exits non-zero on a hit |
+| `yara [--out FILE] [--min-severity S] [--no-feeds] [--verify] [--json]` | Export the detection content as a portable YARA ruleset |
 | `rules list\|add\|remove\|test\|import` | Manage user detection rules (patterns + file-name globs) |
 | `sarif -o FILE` / `html -o FILE` | Scan and write a SARIF 2.1.0 / self-contained HTML report |
 | `strings FILE [--min N] [--utf16] [--grep S]` / `entropy FILE` | Extract strings / measure entropy |
@@ -1315,13 +1438,16 @@ antivirus/
 ├── risk.py          # suspicion engine: 0-100 risk score per file
 ├── webshield.py     # web shield: URL extraction + reputation scoring
 ├── firewall.py      # live connection-table audit (no root needed)
-├── indicators.py    # 89 technique-indicator checks (LOLBins, persistence, …)
+├── indicators.py    # 301 technique-indicator checks + ATT&CK coverage summary
 ├── prefilter.py     # literal-token gate that makes pattern matching ~100x faster
 ├── feeds.py         # public threat-intel feeds → compact local indexes (v2.9)
+├── allowlist.py     # false-positive allowlist: hashes/names/paths/domains (v3.0)
+├── fpcheck.py       # false-positive audit harness: random + clean corpora (v3.0)
+├── yararules.py     # YARA ruleset export (conservative, skip-and-count) (v3.0)
 ├── rules.py         # user-defined rules (patterns + file-name globs)
 ├── metrics.py       # cumulative counters + Prometheus rendering
 ├── exporters.py     # SARIF 2.1.0 + self-contained HTML report writers
-├── extra_cli.py     # v2.8/v2.9 commands (indicators, rules, feeds, doctor, …)
+├── extra_cli.py     # v2.8–v3.0 commands (indicators, rules, feeds, allowlist, …)
 ├── benchmark.py     # labelled-corpus detection benchmark
 ├── engine.py        # VirusTotal-style per-layer engine report (consensus)
 ├── perf.py          # measured throughput benchmark (cold/warm + latency)
@@ -1335,6 +1461,7 @@ data/
 ├── signatures.json    # bundled signature database (EICAR test string)
 ├── threat_intel.json  # bundled threat intel (blocklist domains/IPs/ports)
 ├── user_rules.json    # your own rules (created by `antivirus rules`)
+├── allowlist.json     # false positives you have excluded (created by `antivirus allowlist`)
 └── feeds/             # built public-feed database (git-ignored, generated)
 samples/
 ├── eicar-test.txt     # the standard 68-byte harmless AV test string

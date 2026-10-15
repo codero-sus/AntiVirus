@@ -121,6 +121,10 @@ class FeedSource:
     homepage: str
     ref: Optional[str] = None      # branch/tag; None = repository default
     note: str = ""
+    #: When true the parser computes a per-record severity (e.g. the
+    #: sighting-count tiers of ``ip-count``) and that value chooses the
+    #: index bucket; otherwise every record gets the source severity.
+    tiered: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -131,6 +135,7 @@ class FeedSource:
             "license_url": self.license_url,
             "redistribution": self.redistribution,
             "homepage": self.homepage, "ref": self.ref, "note": self.note,
+            "tiered": self.tiered,
         }
 
 
@@ -271,6 +276,135 @@ SOURCES: Tuple[FeedSource, ...] = (
                     "LICENSE",
         redistribution="runtime-only",
         homepage="https://github.com/Neo23x0/signature-base", ref="master"),
+
+    # ------------------------------------------------------------ v3.0 pack
+    FeedSource(
+        id="stevenblack-unified",
+        name="Unified hosts blocklist (ads, trackers, malware)",
+        provider="StevenBlack",
+        repo="StevenBlack/hosts", path="hosts", parser="hosts",
+        kind="domain", category="adware", severity="low",
+        license="MIT", license_url="https://opensource.org/license/mit",
+        redistribution="redistributable",
+        homepage="https://github.com/StevenBlack/hosts", ref="master",
+        note="the de-facto community hosts list; mostly advertising and "
+             "telemetry with a malware component, so it is filed under the "
+             "lowest severity tier"),
+    FeedSource(
+        id="phishing-database-domains",
+        name="Active phishing domains",
+        provider="mitchellkrogza Phishing.Database",
+        repo="mitchellkrogza/Phishing.Database",
+        path="phishing-domains-ACTIVE.txt", parser="domains",
+        kind="domain", category="phishing", severity="high",
+        license="MIT", license_url="https://opensource.org/license/mit",
+        redistribution="redistributable",
+        homepage="https://github.com/mitchellkrogza/Phishing.Database",
+        ref="master"),
+    FeedSource(
+        id="phishing-database-ips",
+        name="Active phishing hosts (IPs)",
+        provider="mitchellkrogza Phishing.Database",
+        repo="mitchellkrogza/Phishing.Database",
+        path="phishing-IPs-ACTIVE.txt", parser="ip-list",
+        kind="ip", category="phishing", severity="high",
+        license="MIT", license_url="https://opensource.org/license/mit",
+        redistribution="redistributable",
+        homepage="https://github.com/mitchellkrogza/Phishing.Database",
+        ref="master"),
+    FeedSource(
+        id="phishing-database-adblock",
+        name="Active phishing domains (adblock syntax)",
+        provider="mitchellkrogza Phishing.Database",
+        repo="mitchellkrogza/Phishing.Database",
+        path="phishing-domains-ACTIVE.adblock", parser="adblock",
+        kind="domain", category="phishing", severity="high",
+        license="MIT", license_url="https://opensource.org/license/mit",
+        redistribution="redistributable",
+        homepage="https://github.com/mitchellkrogza/Phishing.Database",
+        ref="master"),
+    FeedSource(
+        id="phishing-database-links",
+        name="Active phishing URLs (hosts extracted)",
+        provider="mitchellkrogza Phishing.Database",
+        repo="mitchellkrogza/Phishing.Database",
+        path="phishing-links-ACTIVE.txt", parser="url-hosts",
+        kind="domain", category="phishing", severity="high",
+        license="MIT", license_url="https://opensource.org/license/mit",
+        redistribution="redistributable",
+        homepage="https://github.com/mitchellkrogza/Phishing.Database",
+        ref="master",
+        note="large file (~65 MB); only the host part of each URL is indexed"),
+    FeedSource(
+        id="ipsum-ips",
+        tiered=True,
+        name="Aggregated malicious IPs (with sighting counts)",
+        provider="IPsum",
+        repo="stamparm/ipsum", path="ipsum.txt", parser="ip-count",
+        kind="ip", category="malware", severity="high",
+        license="Unlicense", license_url="https://unlicense.org/",
+        redistribution="redistributable",
+        homepage="https://github.com/stamparm/ipsum", ref="master",
+        note="daily merge of ~30 blocklists; the sighting count becomes the "
+             "severity tier (>=6 lists = critical, >=3 = high)"),
+    FeedSource(
+        id="tweetfeed-year",
+        name="Community-reported IOCs (12 months)",
+        provider="TweetFeed",
+        repo="0xDanielLopez/TweetFeed", path="year.csv", parser="tweetfeed-csv",
+        kind="ioc", category="community-ioc", severity="high",
+        license="CC0-1.0",
+        license_url="https://creativecommons.org/publicdomain/zero/1.0/",
+        redistribution="redistributable",
+        homepage="https://github.com/0xDanielLopez/TweetFeed", ref="master",
+        note="IOCs posted publicly by the infosec community; domains, IPs "
+             "and file hashes are indexed"),
+    FeedSource(
+        id="tweetfeed-month",
+        name="Community-reported IOCs (current month)",
+        provider="TweetFeed",
+        repo="0xDanielLopez/TweetFeed", path="month.csv",
+        parser="tweetfeed-csv", kind="ioc", category="community-ioc",
+        severity="high",
+        license="CC0-1.0",
+        license_url="https://creativecommons.org/publicdomain/zero/1.0/",
+        redistribution="redistributable",
+        homepage="https://github.com/0xDanielLopez/TweetFeed", ref="master"),
+    FeedSource(
+        id="tweetfeed-exclusive",
+        name="Community-reported IOCs (exclusive set)",
+        provider="TweetFeed",
+        repo="0xDanielLopez/TweetFeed", path="exclusive.csv",
+        parser="tweetfeed-csv", kind="ioc", category="community-ioc",
+        severity="high",
+        license="CC0-1.0",
+        license_url="https://creativecommons.org/publicdomain/zero/1.0/",
+        redistribution="redistributable",
+        homepage="https://github.com/0xDanielLopez/TweetFeed", ref="master"),
+    FeedSource(
+        id="hagezi-threat-intel",
+        name="Threat-intelligence domains (malware, C2, phishing)",
+        provider="HaGeZi DNS blocklists",
+        repo="hagezi/dns-blocklists", path="wildcard/tif.txt",
+        parser="wildcard-domains", kind="domain", category="malware",
+        severity="high",
+        license="GPL-3.0",
+        license_url="https://www.gnu.org/licenses/gpl-3.0.html",
+        redistribution="runtime-only",
+        homepage="https://github.com/hagezi/dns-blocklists", ref="main",
+        note="~1.4 M domains from many threat feeds; downloaded only on "
+             "request (--all) and never redistributed by this project"),
+    FeedSource(
+        id="hagezi-fake",
+        name="Fake/typosquatted shops and portals (HaGeZi)",
+        provider="HaGeZi DNS blocklists",
+        repo="hagezi/dns-blocklists", path="wildcard/fake.txt",
+        parser="wildcard-domains", kind="domain", category="scam",
+        severity="medium",
+        license="GPL-3.0",
+        license_url="https://www.gnu.org/licenses/gpl-3.0.html",
+        redistribution="runtime-only",
+        homepage="https://github.com/hagezi/dns-blocklists", ref="main"),
 )
 
 SOURCES_BY_ID: Dict[str, FeedSource] = {s.id: s for s in SOURCES}
@@ -438,6 +572,23 @@ def normalize_ip(value: str) -> str:
     return token
 
 
+#: IPv4 ranges that can never be a real internet-facing indicator.
+_PRIVATE_IP = re.compile(
+    r"^(?:0\.|10\.|127\.|169\.254\.|192\.168\."
+    r"|172\.(?:1[6-9]|2[0-9]|3[01])\.|22[4-9]\.|23[0-9]\.|24[0-9]\.|25[0-5]\.)")
+
+
+def is_private_ip(value: str) -> bool:
+    """True for loopback, link-local, RFC1918 and multicast/reserved space.
+
+    A blocklist entry or a URL pointing at ``192.168.1.1`` describes someone's
+    LAN, not a threat: indexing it only creates false positives on ordinary
+    internal traffic.  (The same reasoning excludes those ranges from the
+    ``Download from a bare IP`` indicator.)
+    """
+    return bool(_PRIVATE_IP.match(value or ""))
+
+
 def _is_bogus_domain(domain: str) -> bool:
     """Drop list-maintenance noise (localhost, placeholders, wildcards)."""
     if domain in ("localhost", "localhost.localdomain", "local", "broadcasthost",
@@ -449,6 +600,56 @@ def _is_bogus_domain(domain: str) -> bool:
     if ".." in domain or domain.startswith("-"):
         return True
     return False
+
+
+#: Hosts that must never be indexed as indicators, however often a feed
+#: lists them.
+#:
+#: Aggregated feeds are full of them: a phishing page hosted on
+#: ``github.io`` appears in a URL list as ``github.com``, a shortened
+#: malicious link appears as ``bit.ly``, and a malware sample downloaded
+#: from a public file host appears as that host.  Indexing those turns the
+#: feed layer into a false-positive machine - the first repository scan with
+#: the v3.0 feed database (4.8 M indicators) flagged ``github.com`` inside
+#: this project's own README.  A domain in this set is dropped at build
+#: *and* ignored at lookup, so an older database behaves too.
+TRUSTED_HOSTS = frozenset("""
+bit.ly buff.ly cutt.ly git.io goo.gl is.gd ow.ly rb.gy rebrand.ly reurl.cc
+shorturl.at soo.gd t.co tiny.cc tinyurl.com
+github.com github.io githubusercontent.com raw.githubusercontent.com gist.github.com
+gitlab.com bitbucket.org sourceforge.net
+google.com googleapis.com gstatic.com googleusercontent.com googlesyndication.com
+google-analytics.com googletagmanager.com drive.google.com docs.google.com
+gmail.com youtube.com ytimg.com googlevideo.com
+microsoft.com microsoftonline.com live.com office.com office365.com
+windowsupdate.com microsoft365.com sharepoint.com onedrive.com msn.com bing.com
+apple.com icloud.com itunes.com
+amazon.com amazonaws.com aws.amazon.com cloudfront.net
+cloudflare.com cdnjs.cloudflare.com fastly.net akamai.net akamaized.net
+edgekey.net azure.com azureedge.net
+facebook.com fbcdn.net instagram.com whatsapp.com messenger.com
+twitter.com x.com linkedin.com licdn.com tiktok.com tiktokcdn.com
+wikipedia.org wikimedia.org wiktionary.org
+mozilla.org firefox.com debian.org ubuntu.com fedoraproject.org
+python.org pypi.org npmjs.com npmjs.org nodejs.org rubygems.org
+docker.com docker.io hub.docker.com
+adobe.com oracle.com java.com vmware.com cisco.com nvidia.com
+dropbox.com dropboxusercontent.com box.com
+slack.com zoom.us webex.com discord.com discordapp.com telegram.org
+w3.org ietf.org rfc-editor.org archive.org
+blogspot.com wordpress.com weebly.com wixsite.com godaddysites.com
+""".split())
+
+
+def is_trusted_host(token: str) -> bool:
+    """True when *token* is a well-known host that must not be an indicator.
+
+    Matching is exact, deliberately: ``evil.blogspot.com`` (a specific
+    tenant page) is a precise indicator and is still indexed, while the
+    bare platform domain is not.
+    """
+    host = (token or "").strip().lower().rstrip(".")
+    return bool(host) and host in TRUSTED_HOSTS
 
 
 def parse_hosts(text: str) -> Iterator[IOC]:  # noqa: ARG001 (uniform iface)
@@ -486,7 +687,7 @@ def parse_ip_list(text: str) -> Iterator[IOC]:
             else:
                 candidate = parts[-1] if normalize_ip(parts[-1]) else parts[0]
         ip = normalize_ip(candidate)
-        if ip:
+        if ip and not is_private_ip(ip):
             yield IOC("ip", ip, "high", "", "")
 
 
@@ -540,7 +741,8 @@ def parse_ioc_domains(text: str) -> Iterator[IOC]:
             continue
         ip = normalize_ip(token)
         if ip:
-            yield IOC("ip", ip, "high", "", "")
+            if not is_private_ip(ip):
+                yield IOC("ip", ip, "high", "", "")
             continue
         domain = normalize_domain(token)
         if domain and not _is_bogus_domain(domain):
@@ -597,7 +799,142 @@ PARSERS = {
     "ioc-domains": parse_ioc_domains,
     "filename-iocs": parse_filename_iocs,
     "yara-literals": parse_yara_literals,
+    "adblock": None,          # filled in below (kept readable with the others)
+    "url-hosts": None,
+    "ip-count": None,
+    "tweetfeed-csv": None,
+    "wildcard-domains": None,
 }
+
+
+def parse_adblock(text: str) -> Iterator[IOC]:
+    """Adblock/uBlock syntax: ``||domain^`` (phishing blocklists use it too)."""
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith(("#", "!")):
+            continue
+        if not line.startswith("||"):
+            continue
+        # ``||domain.com^$third-party`` and ``||domain.com/path^`` both name
+        # the domain; the path/options are how the *rule* is scoped, not part
+        # of the indicator.
+        token = line[2:].split("^")[0].split("$")[0].split("/")[0].strip()
+        domain = normalize_domain(token)
+        if domain and not _is_bogus_domain(domain):
+            yield IOC("domain", domain, "high", "", "")
+
+
+def parse_url_hosts(text: str) -> Iterator[IOC]:
+    """One URL per line - keep only the host (path/query dropped)."""
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith(("#", "!")):
+            continue
+        token = line.split()[0]
+        if "://" in token:
+            token = token.split("://", 1)[1]
+        token = token.split("/")[0].split("?")[0].split("@")[-1]
+        if token.count(":") == 1 and token.rsplit(":", 1)[1].isdigit():
+            token = token.rsplit(":", 1)[0]
+        ip = normalize_ip(token)
+        if ip:
+            if not is_private_ip(ip):
+                yield IOC("ip", ip, "high", "", "")
+            continue
+        domain = normalize_domain(token)
+        if domain and not _is_bogus_domain(domain):
+            yield IOC("domain", domain, "high", "", "")
+
+
+def parse_ip_count(text: str) -> Iterator[IOC]:
+    """``<ip>\\t<count>`` - how many blocklists report the address.
+
+    The sighting count is a free confidence signal: an address in many
+    lists is a stronger indicator than one in a single list, so the
+    severity tier follows it.
+    """
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        ip = normalize_ip(parts[0])
+        if not ip:
+            continue
+        count = 0
+        if len(parts) > 1:
+            try:
+                count = int(parts[1])
+            except ValueError:
+                count = 0
+        severity = "critical" if count >= 6 else \
+            "high" if count >= 3 else "medium"
+        yield IOC("ip", ip, severity, "", "")
+
+
+_TWEET_KINDS = {
+    "domain": "domain", "url": "url", "ip": "ip", "ipv4": "ip",
+    "md5": "md5", "sha1": "sha1", "sha256": "sha256",
+}
+
+
+def parse_tweetfeed_csv(text: str) -> Iterator[IOC]:
+    """TweetFeed: ``timestamp,reporter,type,value,tags,source``.
+
+    Only typed IOC rows are kept (domain/url/ip/hash); CVEs and free text are
+    ignored.  ``url`` rows contribute their host as well as their full form.
+    """
+    for line in text.splitlines():
+        line = line.rstrip("\r")
+        if not line or line.startswith("#"):
+            continue
+        fields = line.split(",")
+        if len(fields) < 4:
+            continue
+        kind = fields[2].strip().lower()
+        value = fields[3].strip().strip('"')
+        mapped = _TWEET_KINDS.get(kind)
+        if mapped is None or not value:
+            continue
+        if mapped == "domain":
+            domain = normalize_domain(value)
+            if domain and not _is_bogus_domain(domain):
+                yield IOC("domain", domain, "high", "", "")
+        elif mapped == "url":
+            host = value.split("://", 1)[-1].split("/")[0]
+            domain = normalize_domain(host.split("@")[-1])
+            if domain and not _is_bogus_domain(domain):
+                yield IOC("domain", domain, "high", "", "")
+        elif mapped == "ip":
+            ip = normalize_ip(value)
+            if ip:
+                yield IOC("ip", ip, "high", "", "")
+        else:
+            digest = value.strip().lower()
+            if _HEX_RE.match(digest) and len(digest) == {"md5": 32, "sha1": 40,
+                                                        "sha256": 64}[mapped]:
+                yield IOC(mapped, digest, "high", "", "")
+
+
+def parse_wildcard_domains(text: str) -> Iterator[IOC]:
+    """``*.domain.tld`` wildcard blocklists (HaGeZi-style)."""
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith(("#", "!")):
+            continue
+        token = line.lstrip("*.").split()[0]
+        domain = normalize_domain(token)
+        if domain and not _is_bogus_domain(domain):
+            yield IOC("domain", domain, "high", "", "")
+
+
+PARSERS.update({
+    "adblock": parse_adblock,
+    "url-hosts": parse_url_hosts,
+    "ip-count": parse_ip_count,
+    "tweetfeed-csv": parse_tweetfeed_csv,
+    "wildcard-domains": parse_wildcard_domains,
+})
 
 
 # ------------------------------------------------------------------ ClamAV
@@ -969,8 +1306,23 @@ class FeedDB:
         return f"{stat.st_mtime_ns}:{stat.st_size}"
 
     def counts(self) -> Dict[str, int]:
-        return {key: int(value.get("count", 0))
-                for key, value in self.manifest().get("indexes", {}).items()}
+        """Indicator count per bucket.
+
+        Tolerates a hand-edited manifest where a bucket is a bare number
+        instead of the ``{"count": …}`` record the builder writes – a
+        corrupt manifest must never crash a scan.
+        """
+        out: Dict[str, int] = {}
+        for key, value in (self.manifest().get("indexes") or {}).items():
+            if isinstance(value, dict):
+                out[key] = int(value.get("count", 0) or 0)
+            elif isinstance(value, (int, float)):
+                out[key] = int(value)
+            elif isinstance(value, (list, tuple)):
+                out[key] = len(value)
+            else:
+                out[key] = 0
+        return out
 
     @property
     def built(self) -> bool:
@@ -1016,7 +1368,12 @@ class FeedDB:
         return None
 
     def lookup_domain(self, value: str) -> Optional[dict]:
-        return self._lookup("domain", normalize_domain(value))
+        domain = normalize_domain(value)
+        # Lookup-time guard: a database built before the trusted-host rule
+        # (or one assembled by hand) must not flag github.com either.
+        if is_trusted_host(domain):
+            return None
+        return self._lookup("domain", domain)
 
     def lookup_ip(self, value: str) -> Optional[dict]:
         return self._lookup("ip", normalize_ip(value))
@@ -1304,12 +1661,20 @@ def build(sources: Sequence[FeedSource], root: Path, *,
                 produced += 1
                 continue
             kind = ioc.kind
-            # The *source's* declared severity decides the index bucket: a
+            # Tiered sources (a parser that assigns per-record severity,
+            # e.g. ipsum's sighting-count tiers) choose their own bucket; a
             # ransomware C2 list is critical even though its lines look like
             # any other domain, and the same domain may sit in both a
             # malware list (high) and a ransomware list (critical) - lookups
             # check critical first, so the worst classification wins.
-            key = _bucket_key(kind, source.severity)
+            if kind == "domain" and is_trusted_host(value):
+                entry["skipped"]["trusted-host"] = \
+                    entry["skipped"].get("trusted-host", 0) + 1
+                skipped["trusted-host"] = skipped.get("trusted-host", 0) + 1
+                continue
+            tier = ioc.severity if (source.tiered and ioc.severity) \
+                else source.severity
+            key = _bucket_key(kind, tier)
             digest = token_digest(value)
             bucket = buckets.setdefault(key, {})
             if digest in bucket:

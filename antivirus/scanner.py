@@ -43,6 +43,7 @@ from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
 from .behavior import analyze_file as behavior_analyze_file
 from .behavior import looks_executable as behavior_looks_executable
+from . import allowlist as allowlist_mod
 from . import feeds as feeds_mod
 from . import indicators as indicators_mod
 from . import metrics as metrics_mod
@@ -85,6 +86,8 @@ class ScanResult:
     files_neutralized: int = 0
     #: files whose deep analysis hit the `scan_file_timeout` budget (v2.8)
     files_budget_skipped: int = 0
+    #: findings dropped because the file/domain is allowlisted (v3.0)
+    allowlist_suppressed: int = 0
     bytes_scanned: int = 0
     errors: List[str] = field(default_factory=list)
     findings: List[Finding] = field(default_factory=list)
@@ -125,6 +128,7 @@ class ScanResult:
             "files_cached": self.files_cached,
             "files_neutralized": self.files_neutralized,
             "files_budget_skipped": self.files_budget_skipped,
+            "allowlist_suppressed": self.allowlist_suppressed,
             "bytes_scanned": self.bytes_scanned,
             "errors": list(self.errors),
             "findings": [f.to_dict() for f in self.findings],
@@ -280,6 +284,11 @@ class Scanner:
         self._feeds: Optional[feeds_mod.FeedDB] = None
         self._feed_patterns: Optional[List[Signature]] = None
         self._feed_patterns_version: str = ""
+        #: False-positive allowlist (v3.0) – lazy, mtime-aware.
+        self._allow: Optional[allowlist_mod.AllowList] = None
+        self._allow_version: int = -1
+        #: Findings suppressed by the allowlist during this engine's life.
+        self._allow_suppressed: int = 0
 
     # ----------------------------------------------------------------- feeds
     def feeds(self) -> feeds_mod.FeedDB:
@@ -289,6 +298,45 @@ class Scanner:
                 Path(self.config.feeds_dir),
                 enabled=bool(getattr(self.config, "feeds_enabled", True)))
         return self._feeds
+
+    # ------------------------------------------------------------- allowlist
+    def allowlist(self) -> allowlist_mod.AllowList:
+        """The false-positive allowlist (lazy, reloaded when the file changes)."""
+        if not getattr(self.config, "allowlist_enabled", True):
+            if self._allow is None:
+                self._allow = allowlist_mod.AllowList(None, entries=[])
+            return self._allow
+        path = Path(getattr(self.config, "allowlist_file",
+                            allowlist_mod.DEFAULT_ALLOWLIST))
+        try:
+            mtime = path.stat().st_mtime_ns if path.exists() else 0
+        except OSError:
+            mtime = 0
+        if self._allow is None or mtime != self._allow_version:
+            self._allow = allowlist_mod.AllowList.load(path)
+            self._allow_version = mtime
+        return self._allow
+
+    @property
+    def allowlist_suppressed(self) -> int:
+        """How many findings the allowlist has hidden for this engine."""
+        return self._allow_suppressed
+
+    def _apply_allowlist(self, path: Path, findings: List[Finding],
+                         *, sha256: str = "", md5: str = "",
+                         name: str = "") -> List[Finding]:
+        """Drop findings for an allowlisted file/domain, counting them."""
+        allow = self.allowlist()
+        if not allow.entries:
+            return findings
+        hit = allow.check(str(path), sha256=sha256, md5=md5, name=name)
+        if hit is not None:
+            self._allow_suppressed += len(findings)
+            return []
+        kept, suppressed = allow.filter_findings(findings)
+        if suppressed:
+            self._allow_suppressed += len(suppressed)
+        return kept
 
     def _load_feed_patterns(self) -> List[Signature]:
         """Feed-derived literal signatures (YARA strings, ClamAV .ndb)."""
@@ -543,6 +591,15 @@ class Scanner:
             pass
         return result
 
+    def _allowlist_identity(self) -> int:
+        """mtime of the allowlist file – part of the cache validity key."""
+        try:
+            path = Path(getattr(self.config, "allowlist_file",
+                                allowlist_mod.DEFAULT_ALLOWLIST))
+            return path.stat().st_mtime_ns if path.exists() else 0
+        except OSError:
+            return 0
+
     def _cache_profile(self) -> dict:
         """Everything that influences a verdict – the cache's validity key."""
         cfg = self.config
@@ -551,6 +608,7 @@ class Scanner:
             "db_version": self.db.version,
             "feeds": [self.feeds().identity(), cfg.feeds_enabled,
                       cfg.feeds_domains_enabled],
+            "allowlist": [cfg.allowlist_enabled, self._allowlist_identity()],
             "indicators_enabled": self.config.indicators_enabled,
             "indicators_max_size": self.config.indicators_max_size,
             "wide_patterns_enabled": self.config.wide_patterns_enabled,
@@ -696,6 +754,12 @@ class Scanner:
         # positive, so they are always skipped.
         if self._is_self_file(path):
             return
+        # False-positive allowlist (v3.0): a name/path match skips the file
+        # entirely, so an excluded file costs nothing to scan.
+        allow = self.allowlist()
+        if allow.entries and allow.check(str(path), name=path.name) is not None:
+            self._allow_suppressed += 1
+            return
         size = st.st_size
 
         if size > self.config.max_file_size:
@@ -708,6 +772,11 @@ class Scanner:
                 self._stream_file(path, size)
         except OSError as exc:
             result.errors.append(f"{path}: {exc}")
+            return
+
+        if not partial and allow.entries and allow.check(
+                str(path), sha256=sha256, md5=md5, name=path.name) is not None:
+            self._allow_suppressed += 1
             return
 
         result.files_scanned += 1
@@ -944,12 +1013,13 @@ class Scanner:
         # Backfill digests on findings produced by layers that don't set
         # them (behaviour / archives), so reports & exports carry the
         # file's hash and size for every finding.
+        local = self._apply_allowlist(path, local, sha256=sha256,
+                                      md5=md5, name=path.name)
         for f in local:
             if not f.sha256:
                 f.sha256 = sha256
             if not f.size:
                 f.size = size
-
         result.findings.extend(local)
         result.scanned_paths[str(path)] = local
 
@@ -995,6 +1065,11 @@ class Scanner:
         p = Path(name)
         sha256 = hashlib.sha256(data).hexdigest()
         md5 = hashlib.md5(data).hexdigest()
+        allow = self.allowlist()
+        if allow.entries and allow.check(str(name), sha256=sha256, md5=md5,
+                                         name=p.name) is not None:
+            self._allow_suppressed += 1
+            return []
         local: List[Finding] = []
 
         signature = self.db.by_sha256(sha256) or self.db.by_md5(md5)
@@ -1079,6 +1154,8 @@ class Scanner:
                     ),
                     sha256=sha256, size=len(data),
                 ))
+        local = self._apply_allowlist(name, local, sha256=sha256,
+                                      name=p.name)
         for f in local:
             if not f.sha256:
                 f.sha256 = sha256

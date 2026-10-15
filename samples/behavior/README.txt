@@ -23,7 +23,7 @@ malware.
                        no entry point, no relocations, no debug info,
                        VBScript hidden in the resources -> many PE findings
   packed-upx.exe       code-less PE: RELOCS_STRIPPED, no import table,
-                       high-entropy UPX0 section    -> packer PE findings
+                       high-entropy packed section  -> packer PE findings
   clean.exe            well-formed code-less PE: benign imports, ASLR +
                        DEP on, entry point, relocations, debug info
                        -> no findings

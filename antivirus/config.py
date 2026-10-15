@@ -112,6 +112,11 @@ class Config:
     #: Disable user rules entirely (`scan --no-rules` / `rules` off).
     user_rules_enabled: bool = True
 
+    # False-positive suppression (v3.0) – exact hashes, file-name globs,
+    # path globs and domains that must never be reported.  See allowlist.py.
+    allowlist_enabled: bool = True
+    allowlist_file: Path = Path("data/allowlist.json")
+
     # Public threat-intel feeds (v2.9) – blocklists, hash sets and rule
     # strings fetched from trusted public sources and converted into compact
     # local indexes by `antivirus feeds build`.  See antivirus/feeds.py.
@@ -151,7 +156,7 @@ class Config:
         for name in ("quarantine_dir", "report_dir", "signatures_file",
                      "cache_dir", "baseline_dir", "registry_dir",
                      "trust_baseline_file", "metrics_file",
-                     "user_rules_file", "feeds_dir"):
+                     "user_rules_file", "feeds_dir", "allowlist_file"):
             p = Path(getattr(self, name))
             if not p.is_absolute():
                 setattr(self, name, base / p)

@@ -116,6 +116,10 @@ def run(corpus_dir: Optional[Path] = None, files_per_tier: int = 400,
     # warm run then serves.
     config.cache_dir = corpus / ".av-cache-perf"
     config.cache_enabled = True
+    # A private, empty allowlist: the throughput numbers must not change
+    # because the operator allowlisted something on their machine.
+    config.allowlist_file = corpus / ".allowlist-perf.json"
+    config.allowlist_enabled = False
     db = SignatureDB(config.signatures_file)
     scanner = Scanner(config, db)
 

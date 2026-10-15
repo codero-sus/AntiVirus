@@ -57,10 +57,25 @@ Features
 * Public threat-intel feeds (v2.9): `antivirus feeds build` fetches vetted
   public blocklists, hash sets and rule strings, converts what can be
   converted faithfully and stores them as compact sorted indexes
-  (2.8 M indicators in ~22 MB); licence-aware, provenance-tracked, and
+  (4.6 M indicators in ~35 MB); licence-aware, provenance-tracked, and
   git-ignored - local ClamAV databases can be imported with
   `feeds import-clamav`.  Feed hits form their own engine layer
-* Technique indicators (v2.8): 89 static checks (LOLBins, persistence,
+* False-positive allowlist (v3.0): exact hashes, file-name globs, path
+  globs and domains that must never be reported - `antivirus allowlist
+  list|add|remove|check|export|import|from-findings|audit`, honoured by
+  every scan, visible as "Suppressed: N" in the summary and as
+  `allowlist_suppressed` in the JSON report (`--no-allowlist` to bypass)
+* False-positive audit (v3.0): `antivirus fpcheck` runs the whole indicator
+  library against random binary blobs, random text and a corpus of
+  realistic clean scripts/docs, and exits non-zero if anything above the
+  chosen severity is flagged - the release gate for detection content
+* YARA export (v3.0): `antivirus yara --out rules.yar` converts the
+  signature database, the technique indicators and (optionally) feed
+  literals into a portable ruleset; constructs YARA cannot express are
+  skipped and counted, never approximated
+* ATT&CK coverage view (v3.0): `antivirus matrix` groups every indicator by
+  tactic with severity mix, top tags and gaps
+* Technique indicators (v2.8): 301 static checks (LOLBins, persistence,
   evasion, credential access, C2, ransomware impact, Office macros,
   file-name tricks) - `antivirus indicators`
 * User rules (v2.8): YARA-lite patterns and file-name globs managed with
@@ -97,7 +112,7 @@ Everything is standard library only (Tkinter/curses are optional and used
 only by their respective front-ends).
 """
 
-__version__ = "2.9.0"
+__version__ = "3.0.0"
 
 from .api import (  # noqa: E402
     Antivirus,
