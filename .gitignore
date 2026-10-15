@@ -28,5 +28,9 @@ rescue.iso
 .av-perf-corpus/
 .av-cache-perf/
 
+# Public feed database (built by `antivirus feeds build`) - generated
+# data, can be hundreds of MB; never committed
+data/feeds/
+
 # Real-world pack corpus (auto-built by `antivirus realworld`)
 samples/realworld/

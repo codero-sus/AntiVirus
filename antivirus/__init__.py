@@ -34,8 +34,8 @@ Features
   reports recall / false positives (100% / 0 on the bundled set)
 * Engine report: `antivirus engine FILE` - a VirusTotal-style table of each
   detection layer's verdict (hash / pattern / behaviour / polyglot /
-  obfuscation / url / risk / entropy / archive) with a "detected by N of M
-  engines" consensus
+  obfuscation / indicators / feeds / url / risk / entropy / archive) with a
+  "detected by N of M engines" consensus
 * Mutation detection: a standing trust baseline (`trust snapshot/add/...`)
   flags trusted files whose content changed; bulk mutation (>= 5 files in
   one pass) raises a critical "possible ransomware activity" alert
@@ -49,11 +49,26 @@ Features
   MB/s), cache speedup and per-file latency (p50/p99) on a synthetic corpus
 * Comparison: `antivirus compare` - honest feature + positioning comparison
   vs AVG / Avast / Malwarebytes / VirusTotal with live perf numbers
-* Real-world detection pack: sourced IOC signatures for 15 real named
+* Real-world detection pack: sourced IOC signatures for 99 real named
   malware families (WannaCry, Ryuk, LockBit, Stuxnet, Cobalt Strike,
   Emotet, TrickBot, Dridex, Mirai, XMRig, ...) - each signature carries its
   public research source; `antivirus realworld` scores the pack against an
-  inert sample corpus (13/13 detected, 0 false positives)
+  inert sample corpus (92/92 pattern families detected, 0 false positives)
+* Public threat-intel feeds (v2.9): `antivirus feeds build` fetches vetted
+  public blocklists, hash sets and rule strings, converts what can be
+  converted faithfully and stores them as compact sorted indexes
+  (2.8 M indicators in ~22 MB); licence-aware, provenance-tracked, and
+  git-ignored - local ClamAV databases can be imported with
+  `feeds import-clamav`.  Feed hits form their own engine layer
+* Technique indicators (v2.8): 89 static checks (LOLBins, persistence,
+  evasion, credential access, C2, ransomware impact, Office macros,
+  file-name tricks) - `antivirus indicators`
+* User rules (v2.8): YARA-lite patterns and file-name globs managed with
+  `antivirus rules`
+* Machine-readable output (v2.8): SARIF 2.1.0 (`scan --sarif`),
+  self-contained HTML (`scan --html`), Prometheus metrics, `--fail-on`
+* Literal prefilter (v2.8): pattern matching is ~100x faster than the
+  merged-alternation approach (6.8 s/MiB -> 69 ms/MiB)
 * Multiple front-ends: CLI, Tkinter GUI, curses TUI, web console —
   and a plain-module API for embedding in your own code
 * Runs on Windows, Linux and macOS (the curses TUI is Unix-only; the
@@ -82,7 +97,7 @@ Everything is standard library only (Tkinter/curses are optional and used
 only by their respective front-ends).
 """
 
-__version__ = "2.7.0"
+__version__ = "2.9.0"
 
 from .api import (  # noqa: E402
     Antivirus,

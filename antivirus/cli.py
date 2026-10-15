@@ -33,7 +33,7 @@ from .report import ReportWriter, diff_reports, render_report
 from .scanner import ScanResult, Scanner
 from .selftest import run_selftest
 from .signatures import Signature, SignatureDB, VALID_SEVERITIES
-from .utils import human_size, parse_since
+from .utils import human_size, parse_since, utf16_view
 
 BUNDLED_SIGNATURES = Path(__file__).resolve().parent.parent / "data" / "signatures.json"
 
@@ -79,13 +79,28 @@ def _build(args):
         config.risk_enabled = False
     if getattr(args, "no_webshield", False):
         config.webshield_enabled = False
+    if getattr(args, "no_indicators", False):
+        config.indicators_enabled = False
+    if getattr(args, "no_rules", False):
+        config.user_rules_enabled = False
+    if getattr(args, "no_feeds", False):
+        config.feeds_enabled = False
+    if getattr(args, "feeds_dir", None):
+        config.feeds_dir = Path(args.feeds_dir)
+    if getattr(args, "max_depth", 0):
+        config.scan_max_depth = int(args.max_depth)
+    if getattr(args, "file_timeout", 0.0):
+        config.scan_file_timeout = float(args.file_timeout)
+    if getattr(args, "rules", None):
+        config.user_rules_file = Path(args.rules)
     if getattr(args, "exclude", None):
         config.exclude_patterns = tuple(args.exclude)
     if getattr(args, "since", 0.0):
         config.since_ts = time.time() - args.since
     config.resolve_paths(Path.cwd())
     db = SignatureDB(config.signatures_file)
-    scanner = Scanner(config, db, threads=getattr(args, "threads", "auto"))
+    threads = getattr(args, "threads", None) or getattr(args, "jobs", None) or "auto"
+    scanner = Scanner(config, db, threads=threads)
     quarantine = Quarantine(config.quarantine_dir)
     return config, db, scanner, quarantine
 
@@ -187,6 +202,22 @@ def cmd_scan(args) -> int:
     report_path = writer.save(result, action=args.action, actions_taken=notes)
     workers = scanner._workers()
 
+    # Optional CI-friendly exports (v2.8): SARIF for code scanning, HTML
+    # for a human-readable artefact attached to a ticket.
+    from . import exporters
+
+    export_base = target if target.is_dir() else target.parent
+    extras = []
+    if getattr(args, "sarif", None):
+        path_out = exporters.write_sarif(result, Path(args.sarif),
+                                        base=export_base)
+        extras.append(f"SARIF: {path_out}")
+    if getattr(args, "html", None):
+        path_out = exporters.write_html(
+            result, Path(args.html), base=export_base,
+            title=f"AntiVirus scan report - {result.target}")
+        extras.append(f"HTML:  {path_out}")
+
     if args.json:
         data = result.to_dict()
         data["action"] = args.action
@@ -194,10 +225,36 @@ def cmd_scan(args) -> int:
         data["threads"] = workers
         data["report"] = str(report_path)
         print(json.dumps(data, indent=2, ensure_ascii=False))
+    elif getattr(args, "quiet", False):
+        for finding in result.findings:
+            print(f"{finding.severity.upper()}\t{finding.kind}\t"
+                  f"{finding.path}\t{finding.name}")
     else:
         _print_scan_summary(result, args.action, notes, report_path, workers)
+        for extra in extras:
+            print(f" {extra}")
 
+    if getattr(args, "fail_on", "any"):
+        return _exit_code_for(result, args.fail_on)
     return 0 if result.clean else 1
+
+
+_SEV_RANK = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
+
+
+def _exit_code_for(result: ScanResult, fail_on: str) -> int:
+    """CI exit code: 0 unless a finding reaches *fail_on*.
+
+    ``any`` keeps the classic behaviour (any finding -> 1), ``none`` always
+    returns 0 (report-only mode).
+    """
+    if fail_on == "none":
+        return 0
+    if fail_on == "any":
+        return 0 if result.clean else 1
+    threshold = _SEV_RANK.get(fail_on, 3)
+    return 1 if any(_SEV_RANK.get(f.severity, 2) >= threshold
+                    for f in result.findings) else 0
 
 
 def _print_scan_summary(result: ScanResult, action: str, notes: dict,
@@ -211,6 +268,9 @@ def _print_scan_summary(result: ScanResult, action: str, notes: dict,
     cached = f"  [{result.files_cached} from scan cache]" if result.files_cached else ""
     print(f" Files scanned:  {result.files_scanned}{cached}  ({human_size(result.bytes_scanned)})")
     print(f" Skipped:        {result.files_skipped}")
+    if getattr(result, "files_budget_skipped", 0):
+        print(f" Budget-skipped: {result.files_budget_skipped}  "
+              f"(deep analysis hit the per-file time budget)")
     if getattr(result, "files_neutralized", 0):
         print(f" Neutralized:    {result.files_neutralized}  "
               f"(already killed – inert, not re-flagged)")
@@ -316,6 +376,44 @@ def cmd_quarantine(args) -> int:
             print(f"   path:    {item.original_path}")
             print(f"   reason:  {item.reason}")
             print()
+        return 0
+    if args.qaction == "info":
+        items = {i.id: i for i in quarantine.items()}
+        item = items.get(args.id)
+        if item is None:
+            print(paint(f"error: no quarantined item {args.id!r}", RED),
+                  file=sys.stderr)
+            return 2
+        blob = quarantine.root / item.id
+        exists = blob.is_file()
+        detail = {
+            "id": item.id,
+            "original_path": item.original_path,
+            "quarantined_at": item.quarantined_at,
+            "reason": item.reason,
+            "sha256": getattr(item, "sha256", "") or "",
+            "size": getattr(item, "size", 0) or 0,
+            "blob": str(blob),
+            "blob_present": exists,
+            "action": getattr(item, "action", "quarantine"),
+        }
+        if getattr(args, "json", False):
+            print(json.dumps(detail, indent=2, ensure_ascii=False))
+            return 0
+        print(paint(f"Quarantined item {item.id}", BOLD))
+        for key in ("original_path", "quarantined_at", "reason", "action"):
+            print(f"  {key:<15} {detail[key]}")
+        if detail["sha256"]:
+            print(f"  {'sha256':<15} {detail['sha256']}")
+        print(f"  {'blob':<15} {detail['blob']} "
+              f"({'present' if exists else 'MISSING'})")
+        if exists and detail["sha256"]:
+            digest = hashlib.sha256(blob.read_bytes()).hexdigest()
+            match = digest == detail["sha256"]
+            print(f"  {'integrity':<15} "
+                  + paint("hash matches" if match else
+                          f"HASH MISMATCH (now {digest[:16]}...)", 
+                          GREEN if match else RED))
         return 0
     try:
         if args.qaction == "restore":
@@ -858,6 +956,39 @@ def cmd_sig(args) -> int:
             if s.description:
                 print(f" {'':<22} {s.description}")
         return 0
+    if args.saction == "lint":
+        problems = []
+        seen = {}
+        for sig in db.list():
+            key = sig.id.lower()
+            if key in seen:
+                problems.append(f"duplicate id {sig.id!r}")
+            seen[key] = True
+            if sig.severity not in VALID_SEVERITIES:
+                problems.append(f"{sig.id}: invalid severity {sig.severity!r}")
+            if not (sig.sha256 or sig.md5 or sig.pattern):
+                problems.append(f"{sig.id}: no sha256/md5/pattern")
+            if sig.pattern and sig.compiled is None:
+                problems.append(f"{sig.id}: pattern does not compile")
+            if sig.sha256 and len(sig.sha256) != 64:
+                problems.append(f"{sig.id}: sha256 must be 64 hex chars")
+            if sig.md5 and len(sig.md5) != 32:
+                problems.append(f"{sig.id}: md5 must be 32 hex chars")
+            if not sig.name.strip():
+                problems.append(f"{sig.id}: empty name")
+        payload = {"file": str(config.signatures_file),
+                   "signatures": len(db.list()), "problems": problems}
+        if getattr(args, "json", False):
+            print(json.dumps(payload, indent=2, ensure_ascii=False))
+        elif problems:
+            print(paint(f"{len(problems)} problem(s) in "
+                        f"{config.signatures_file}:", RED))
+            for line in problems:
+                print(f"  - {line}")
+        else:
+            print(paint(f"{len(db.list())} signature(s) OK "
+                        f"({config.signatures_file})", GREEN))
+        return 1 if problems else 0
     if args.saction == "remove":
         try:
             removed = db.remove(args.id)
@@ -1272,6 +1403,8 @@ def _apply_baseline(result: ScanResult, target: Path,
 
 # --------------------------------------------------------------------- hash
 def cmd_hash(args) -> int:
+    algorithms = ("sha256", "md5", "sha1") if getattr(args, "algorithm", "all") \
+        in ("all", None) else (args.algorithm,)
     rows = []
     ok = True
     for name in args.files:
@@ -1293,19 +1426,20 @@ def cmd_hash(args) -> int:
             print(paint(f"error: {path}: {exc}", RED), file=sys.stderr)
             ok = False
             continue
-        rows.append({"file": name,
-                     "sha256": sha256.hexdigest(),
-                     "md5": md5.hexdigest(),
-                     "sha1": sha1.hexdigest(),
-                     "size": path.lstat().st_size})
+        digests = {"sha256": sha256.hexdigest(),
+                   "md5": md5.hexdigest(),
+                   "sha1": sha1.hexdigest()}
+        row = {"file": name, "size": path.lstat().st_size}
+        row.update({k: v for k, v in digests.items() if k in algorithms})
+        rows.append(row)
     if args.json:
         print(json.dumps(rows, indent=2, ensure_ascii=False))
     else:
         for r in rows:
             print(f"file:   {r['file']}")
-            print(f"sha256: {r['sha256']}")
-            print(f"md5:    {r['md5']}")
-            print(f"sha1:   {r['sha1']}")
+            for algo in algorithms:
+                if algo in r:
+                    print(f"{algo + ':':<7} {r[algo]}")
             print(f"size:   {r['size']} bytes")
             print()
     return 0 if ok else 2
@@ -1763,6 +1897,34 @@ def build_parser() -> argparse.ArgumentParser:
                    help="integrity baseline (manifest) to compare against – "
                         "reports changed / missing / new files "
                         "(see: antivirus manifest)")
+    p.add_argument("--jobs", default=None, metavar="N",
+                   help="alias for --threads (worker threads)")
+    p.add_argument("--max-depth", type=int, default=0, metavar="N",
+                   help="do not descend deeper than N directories (0 = no limit)")
+    p.add_argument("--file-timeout", type=float, default=0.0, metavar="SEC",
+                   help="soft per-file analysis budget in seconds; deep "
+                        "layers are skipped once it is exceeded")
+    p.add_argument("--fail-on",
+                   choices=("any", "critical", "high", "medium", "low", "none"),
+                   default="any",
+                   help="exit 1 only when a finding reaches this severity "
+                        "(default any; 'none' always exits 0)")
+    p.add_argument("--sarif", default=None, metavar="FILE",
+                   help="also write a SARIF 2.1.0 report (CI code scanning)")
+    p.add_argument("--html", default=None, metavar="FILE",
+                   help="also write a standalone HTML report")
+    p.add_argument("--quiet", action="store_true",
+                   help="print findings as TSV lines only (no banner/summary)")
+    p.add_argument("--no-indicators", action="store_true",
+                   help="disable the technique-indicator layer")
+    p.add_argument("--no-rules", action="store_true",
+                   help="ignore user-defined rules for this scan")
+    p.add_argument("--no-feeds", action="store_true",
+                   help="ignore the public feed database (data/feeds)")
+    p.add_argument("--feeds-dir", default=None, metavar="DIR",
+                   help="feed database directory (default data/feeds)")
+    p.add_argument("--rules", default=None, metavar="FILE",
+                   help="user rule file (default data/user_rules.json)")
     p.add_argument("--json", action="store_true", help="machine readable output")
 
     p = sub.add_parser("monitor", help="watch a directory and scan new/changed files")
@@ -1795,6 +1957,9 @@ def build_parser() -> argparse.ArgumentParser:
     _common_options(p)
     qsub = p.add_subparsers(dest="qaction", required=True)
     qsub.add_parser("list", help="list quarantined files")
+    qinfo = qsub.add_parser("info", help="details + integrity of one item")
+    qinfo.add_argument("id", help="quarantine id")
+    qinfo.add_argument("--json", action="store_true", help="machine readable")
     pr = qsub.add_parser("restore", help="restore a quarantined file")
     pr.add_argument("id", help="quarantine id (a prefix is enough)")
     pp = qsub.add_parser("purge", help="permanently delete a quarantined file")
@@ -1950,6 +2115,10 @@ def build_parser() -> argparse.ArgumentParser:
     _common_options(p)
     ssub = p.add_subparsers(dest="saction", required=True)
     ssub.add_parser("show", help="list signatures")
+    plint = ssub.add_parser("lint",
+                            help="validate the database (ids, severities, "
+                                 "patterns, hash lengths)")
+    plint.add_argument("--json", action="store_true")
     pr = ssub.add_parser("remove", help="remove a signature by id")
     pr.add_argument("id", help="signature id to remove")
     pe = ssub.add_parser("export", help="export the database to a JSON file")
@@ -2036,6 +2205,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("hash",
                        help="print SHA-256 / MD5 / SHA-1 digests of files")
     p.add_argument("files", nargs="+", help="file(s) to hash")
+    p.add_argument("--algorithm", choices=("all", "sha256", "md5", "sha1"),
+                   default="all",
+                   help="only compute one digest (default: all)")
     p.add_argument("--json", action="store_true",
                    help="machine readable output")
 
@@ -2170,8 +2342,149 @@ def build_parser() -> argparse.ArgumentParser:
     rv.add_argument("kit", nargs="?", default="rescue-kit",
                     help="kit directory (default ./rescue-kit)")
 
+    # ------------------------------------------------------- v2.8 additions
+    p = sub.add_parser("indicators",
+                       help="list/explain the technique-indicator checks")
+    p.add_argument("--category", default=None,
+                   help="filter by category (execution, persistence, "
+                        "evasion, credential, lateral, exfil, impact, office)")
+    p.add_argument("--show", default=None, metavar="ID",
+                   help="explain one check by id")
+    p.add_argument("--json", action="store_true", help="machine readable")
+
+    p = sub.add_parser("rules", help="user-defined detection rules (YARA-lite)")
+    rsub2 = p.add_subparsers(dest="raction", required=True)
+    rl = rsub2.add_parser("list", help="list user rules")
+    rl.add_argument("--user-rules", default=None, metavar="FILE")
+    rl.add_argument("--json", action="store_true")
+    ra = rsub2.add_parser("add", help="add or replace a rule")
+    ra.add_argument("--user-rules", default=None, metavar="FILE")
+    ra.add_argument("--id", required=True, help="rule id (USER-... recommended)")
+    ra.add_argument("--pattern", required=True, help="regex matched against bytes")
+    ra.add_argument("--severity", default="medium",
+                    choices=("critical", "high", "medium", "low", "info"))
+    ra.add_argument("--name", default="", help="human-readable rule name")
+    ra.add_argument("--description", default="", help="why this rule exists")
+    ra.add_argument("--family", default="", help="optional family/tag")
+    ra.add_argument("--filename", default="", metavar="GLOB",
+                    help="only apply to files whose name matches GLOB")
+    rr = rsub2.add_parser("remove", help="remove a rule by id")
+    rr.add_argument("--user-rules", default=None, metavar="FILE")
+    rr.add_argument("id", help="rule id")
+    rt = rsub2.add_parser("test", help="test a rule (or a candidate pattern) "
+                                      "against a file")
+    rt.add_argument("--user-rules", default=None, metavar="FILE")
+    rt.add_argument("file", help="file to test against")
+    rt.add_argument("--id", default=None, help="test a saved rule by id")
+    rt.add_argument("--pattern", default=None, help="test an unsaved pattern")
+    rt.add_argument("--filename", default="", metavar="GLOB")
+    ri = rsub2.add_parser("import", help="import a plain-text IOC file as rules")
+    ri.add_argument("--user-rules", default=None, metavar="FILE")
+    ri.add_argument("file", help="IOC text file (hashes, 'pattern:' lines, literals)")
+    ri.add_argument("--source", default="ioc-import", help="source label")
+    ri.add_argument("--severity", default="medium",
+                    choices=("critical", "high", "medium", "low", "info"))
+
+    for name, helptext in (
+            ("sarif", "write a SARIF 2.1.0 report of a scan "
+                      "(CI code scanning)"),
+            ("html", "write a standalone HTML report of a scan")):
+        p = sub.add_parser(name, help=helptext)
+        _common_options(p)
+        p.add_argument("target", help="file or directory to scan")
+        p.add_argument("-o", "--out", default=None, metavar="FILE",
+                       help="output file (default: stdout)")
+        p.add_argument("--fail-on",
+                       choices=("any", "critical", "high", "medium", "low", "none"),
+                       default=("any" if name == "sarif" else None),
+                       help="exit 1 when a finding reaches this severity")
+        if name == "html":
+            p.add_argument("--title", default=None, help="report title")
+
+    p = sub.add_parser("strings",
+                       help="extract printable strings from a file")
+    p.add_argument("file", help="file to read")
+    p.add_argument("--min", type=int, default=6, metavar="N",
+                   help="minimum string length (default 6)")
+    p.add_argument("--max-bytes", type=int, default=32 * 1024 * 1024,
+                   metavar="BYTES", help="only read the first BYTES of the file")
+    p.add_argument("--utf16", action="store_true",
+                   help="also extract strings from the UTF-16 view")
+    p.add_argument("--grep", default=None, metavar="REGEX",
+                   help="only show strings matching REGEX")
+    p.add_argument("--max", type=int, default=0, metavar="N",
+                   help="at most N strings")
+    p.add_argument("--json", action="store_true", help="machine readable")
+
+    p = sub.add_parser("entropy",
+                       help="Shannon entropy + byte histogram of files")
+    p.add_argument("files", nargs="+", help="file(s) to measure")
+    p.add_argument("--sample", type=int, default=1024 * 1024, metavar="BYTES",
+                   help="bytes to sample (default 1 MiB)")
+    p.add_argument("--json", action="store_true", help="machine readable")
+
+    p = sub.add_parser("doctor",
+                       help="environment self-check (paths, DBs, permissions)")
+    _common_options(p)
+    p.add_argument("--json", action="store_true", help="machine readable")
+
+    p = sub.add_parser("completion",
+                       help="emit a shell completion script")
+    p.add_argument("shell", choices=("bash", "zsh", "fish"),
+                   help="shell to generate completion for")
+
+    p = sub.add_parser("metrics",
+                       help="cumulative engine counters "
+                            "(JSON or Prometheus)")
+    p.add_argument("--metrics", default=None, metavar="FILE",
+                   help="metrics file (default .av-cache/metrics.json)")
+    p.add_argument("--format", choices=("json", "prometheus"), default="json")
+    p.add_argument("--reset", action="store_true", help="zero all counters")
+
+    p = sub.add_parser("history",
+                       help="recent scans from the saved reports")
+    p.add_argument("--report-dir", default="reports", help="report directory")
+    p.add_argument("--limit", type=int, default=20, metavar="N",
+                   help="how many reports to show (default 20)")
+    p.add_argument("--json", action="store_true", help="machine readable")
+
+    p = sub.add_parser("version",
+                       help="version and engine inventory (--json)")
+    p.add_argument("--signatures", default=None, metavar="FILE",
+                   help="inspect a specific signature database")
+    p.add_argument("--user-rules", default=None, metavar="FILE")
+    p.add_argument("--json", action="store_true", help="machine readable")
+
+    p = sub.add_parser("explain",
+                       help="explain a finding kind, severity or indicator id")
+    p.add_argument("topic", help="e.g. indicator, signature-pattern, critical, "
+                                 "IND-EVADE-SHADOWCOPY")
+
+    p = sub.add_parser("feeds",
+                       help="public threat-intel feeds: build/import/list/stats")
+    p.add_argument("feeds_action", nargs="?", default="stats",
+                   choices=("list", "build", "import-clamav", "stats", "audit",
+                            "verify", "clear"),
+                   help="what to do (default: stats)")
+    p.add_argument("--source", action="append", metavar="ID",
+                   help="build only this source id/provider/category "
+                        "(repeatable)")
+    p.add_argument("--all", dest="all_sources", action="store_true",
+                   help="include runtime-only (non-redistributable) sources")
+    p.add_argument("--limit", type=int, default=None, metavar="N",
+                   help="cap indicators taken per source")
+    p.add_argument("--max-patterns", type=int, default=20000, metavar="N",
+                   help="cap converted literal signatures (default 20000)")
+    p.add_argument("--feeds-dir", default=None, metavar="DIR",
+                   help="feed database directory (default data/feeds)")
+    p.add_argument("file", nargs="?", default=None,
+                   help="import-clamav: .hdb/.hsb/.ndb/.cvd/.cld file")
+    p.add_argument("--json", action="store_true", help="machine readable")
+
     return parser
 
+
+from . import extra_cli as _extra  # noqa: E402  (registered below)
 
 _COMMANDS = {
     "scan": cmd_scan,
@@ -2206,6 +2519,21 @@ _COMMANDS = {
     "export": cmd_export,
     "stats": cmd_stats,
     "rescue": _cmd_rescue,
+    # ---------------------------------------------------------- v2.8
+    "indicators": _extra.cmd_indicators,
+    "rules": _extra.cmd_rules,
+    "sarif": _extra.cmd_sarif,
+    "html": _extra.cmd_html,
+    "strings": _extra.cmd_strings,
+    "entropy": _extra.cmd_entropy,
+    "doctor": _extra.cmd_doctor,
+    "completion": _extra.cmd_completion,
+    "metrics": _extra.cmd_metrics,
+    "history": _extra.cmd_history,
+    "version": _extra.cmd_version,
+    "explain": _extra.cmd_explain,
+    # ---------------------------------------------------------- v2.9
+    "feeds": _extra.cmd_feeds,
 }
 
 

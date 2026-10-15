@@ -173,20 +173,51 @@ _PAIRS: Dict[Tuple[str, str], Tuple[str, str]] = {
 
 
 def _printable_ratio(chunk: bytes) -> float:
+    """Share of *text-like* bytes.
+
+    Only printable ASCII (0x20-0x7E) plus tab/newline/CR count, and any
+    other C0 control byte (including NUL) is disqualifying.  High bytes
+    (>= 0x80) count as text *only* when the region decodes as UTF-8 — that
+    is what separates real non-English text from random binary data, whose
+    byte distribution is uniform and would otherwise look ~87% "printable"
+    (v2.8 fix: that made the text+blob check fire on random blobs).
+    """
     if not chunk:
         return 0.0
-    printable = sum(1 for b in chunk if b >= 0x20 or b in (9, 10, 13))
-    return printable / len(chunk)
+    text = sum(1 for b in chunk
+               if 0x20 <= b <= 0x7E or b in (9, 10, 13))
+    if text / len(chunk) >= 0.95:
+        return text / len(chunk)
+    try:
+        decoded = chunk.decode("utf-8")
+    except UnicodeDecodeError:
+        return text / len(chunk)
+    return sum(1 for ch in decoded
+               if ch.isprintable() or ch in "\t\n\r") / len(decoded)
+
+
+def _has_binary_controls(chunk: bytes) -> bool:
+    """True when the region holds C0 control bytes other than \t \n \r."""
+    return any(b < 0x20 and b not in (9, 10, 13) for b in chunk)
 
 
 def _looks_like_text(data: bytes) -> bool:
-    """The *start* of the file is text (a payload may follow later)."""
+    """The *start* of the file is text (a payload may follow later).
+
+    Strict on purpose: no NUL, no stray control bytes and a >= 0.9
+    text-like ratio (UTF-8 aware).  Random/high-entropy binaries fail all
+    three, so a packed file is never mistaken for a text file.
+    """
     head = data[:8192]
     if not head:
         return False
     nul = head.find(b"\x00")
     text_head = head if nul == -1 else head[:nul]
-    return len(text_head) >= 64 and _printable_ratio(text_head) >= 0.9
+    if len(text_head) < 64:
+        return False
+    if _has_binary_controls(text_head):
+        return False
+    return _printable_ratio(text_head) >= 0.9
 
 
 def _embedded_pe_in_text(data: bytes) -> int:
@@ -199,7 +230,8 @@ def _embedded_pe_in_text(data: bytes) -> int:
     while off != -1:
         if off > 0 and _is_pe(data, off):
             before = data[max(0, off - 512):off]
-            if b"\x00" not in before and _printable_ratio(before) >= 0.9:
+            if (b"\x00" not in before and not _has_binary_controls(before)
+                    and _printable_ratio(before) >= 0.9):
                 return off
         off = data.find(b"MZ", off + 1)
     return -1

@@ -8,6 +8,8 @@ read **once**, and every detection layer is run as its own "engine" —
     pattern   regex signature match in the file body
     behaviour what the file appears to do (static, never executed)
     url       web shield – URLs inside the file vs threat intel
+    indicators technique markers (LOLBins, persistence, evasion, …)
+    feeds     public threat-intel database (feeds build) – hashes, domains, IPs
     risk      suspicion engine – how suspicious it *looks* (0-100)
     entropy   Shannon-entropy heuristic (packed / encrypted)
     archive   contents of ZIP / TAR / GZIP, in memory
@@ -26,6 +28,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from . import feeds as feeds_mod
+from . import indicators as indicators_mod
 from .config import Config
 from .models import Finding, shannon_entropy
 from .signatures import SignatureDB
@@ -33,7 +37,7 @@ from .utils import md5_new
 
 #: The "engines", in report order.
 _ENGINES = ("hash", "pattern", "behaviour", "polyglot", "obfuscation",
-            "url", "risk", "entropy", "archive")
+            "indicators", "feeds", "url", "risk", "entropy", "archive")
 
 _SEV_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
 
@@ -171,6 +175,57 @@ def engine_report(path, scanner, config: Optional[Config] = None) -> Dict:
         layers["obfuscation"] = LayerVerdict(
             "obfuscation", "Obfuscation techniques", "clean", "info",
             ["disabled"])
+
+    # -- indicators (v2.8) ------------------------------------------------
+    if config.indicators_enabled:
+        ind = indicators_mod.analyze(str(p), content[:config.indicators_max_size],
+                                     filename=p.name)
+        layers["indicators"] = (
+            LayerVerdict("indicators", "Technique indicators", "flagged",
+                         _worst(ind), _findings_to_details(ind))
+            if ind else
+            LayerVerdict("indicators", "Technique indicators", "clean",
+                         "info"))
+    else:
+        layers["indicators"] = LayerVerdict(
+            "indicators", "Technique indicators", "clean", "info",
+            ["disabled"])
+
+    # -- feeds (public threat-intel database) ------------------------------
+    feed_db = feeds_mod.FeedDB(getattr(config, "feeds_dir",
+                                       "data/feeds"),
+                               enabled=getattr(config, "feeds_enabled", True))
+    if feed_db.enabled and feed_db.built:
+        f_findings: List[Finding] = []
+        digest_sha = hashlib.sha256(content).hexdigest() if content else ""
+        digest_md5 = md5_new()
+        if content:
+            digest_md5.update(content)
+            digest_md5 = digest_md5.hexdigest()
+        else:
+            digest_md5 = ""
+        hit = feed_db.lookup_hash(sha256=digest_sha, md5=digest_md5)
+        if hit is not None:
+            f_findings.append(feed_db.hash_finding(
+                str(p), hit, size=len(content or b""), sha256=digest_sha))
+        f_findings.extend(feed_db.audit_name(str(p)))
+        if getattr(config, "feeds_domains_enabled", True) and content:
+            f_findings.extend(feed_db.audit_content(
+                str(p), content[:getattr(config, "feeds_scan_bytes", 262144)],
+                window=getattr(config, "feeds_scan_bytes", 262144),
+                limit=getattr(config, "feeds_max_tokens", 2048),
+                max_findings=getattr(config, "feeds_max_findings", 5)))
+        layers["feeds"] = (
+            LayerVerdict("feeds", "Public threat-intel feeds", "flagged",
+                         _worst(f_findings),
+                         _findings_to_details(f_findings))
+            if f_findings else
+            LayerVerdict("feeds", "Public threat-intel feeds", "clean",
+                         "info"))
+    else:
+        layers["feeds"] = LayerVerdict(
+            "feeds", "Public threat-intel feeds", "clean", "info",
+            ["no feed database built"] if not feed_db.built else ["disabled"])
 
     # -- url (web shield) -------------------------------------------------
     if config.webshield_enabled:

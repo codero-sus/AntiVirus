@@ -43,6 +43,9 @@ from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
 from .behavior import analyze_file as behavior_analyze_file
 from .behavior import looks_executable as behavior_looks_executable
+from . import feeds as feeds_mod
+from . import indicators as indicators_mod
+from . import metrics as metrics_mod
 from .cache import ScanCache
 from .config import Config
 from . import obfuscation as obfuscation_mod
@@ -59,7 +62,9 @@ from .models import (  # noqa: F401  (re-exported for backwards compatibility)
     shannon_entropy_counts,
 )
 from .signatures import Signature, SignatureDB
-from .utils import md5_new
+from .prefilter import Prefilter, pattern_runs
+from .utils import (marker_text_ok, md5_new, sanitize_text,
+                    utf16_view)
 
 LogFn = Callable[[Path, str], None]
 
@@ -78,6 +83,8 @@ class ScanResult:
     files_skipped: int = 0
     files_cached: int = 0
     files_neutralized: int = 0
+    #: files whose deep analysis hit the `scan_file_timeout` budget (v2.8)
+    files_budget_skipped: int = 0
     bytes_scanned: int = 0
     errors: List[str] = field(default_factory=list)
     findings: List[Finding] = field(default_factory=list)
@@ -103,8 +110,12 @@ class ScanResult:
             return "info"
         return min(self.findings, key=lambda f: order.get(f.severity, 9)).severity
 
+    #: Report schema version (v2.8) – bumps when the JSON shape changes.
+    REPORT_VERSION = 2
+
     def to_dict(self) -> dict:
         return {
+            "report_version": self.REPORT_VERSION,
             "target": self.target,
             "started_at": self.started_at,
             "finished_at": self.finished_at,
@@ -113,6 +124,7 @@ class ScanResult:
             "files_skipped": self.files_skipped,
             "files_cached": self.files_cached,
             "files_neutralized": self.files_neutralized,
+            "files_budget_skipped": self.files_budget_skipped,
             "bytes_scanned": self.bytes_scanned,
             "errors": list(self.errors),
             "findings": [f.to_dict() for f in self.findings],
@@ -136,6 +148,7 @@ def walk_files(
     on_file: Optional[Callable[[Path, os.stat_result], None]] = None,
     exclude_patterns: Tuple[str, ...] = (),
     min_mtime: float = 0.0,
+    max_depth: int = 0,
 ) -> Iterator[Path]:
     """Walk *root* with ``os.scandir``, yielding regular files deterministically.
 
@@ -145,7 +158,8 @@ def walk_files(
     fetched stat so it never has to stat the file again.
     ``exclude_patterns`` are fnmatch globs matched against the file name and
     the path relative to *root*. ``min_mtime`` (a *--since* cutoff, unix
-    time) skips files not modified since then.
+    time) skips files not modified since then.  ``max_depth`` (0 = unlimited)
+    stops descending after that many directory levels below *root*.
     """
     exclude = set(exclude_dirs)
     patterns = [p for p in exclude_patterns if p]
@@ -179,9 +193,9 @@ def walk_files(
         if on_skip is not None:
             on_skip(p, reason)
 
-    stack: List[Path] = [Path(root)]
+    stack: List[Tuple[Path, int]] = [(Path(root), 0)]
     while stack:
-        current = stack.pop()
+        current, depth = stack.pop()
         try:
             entries = list(os.scandir(current))
         except OSError:
@@ -216,7 +230,11 @@ def walk_files(
             if on_file is not None:
                 on_file(p, st)
             yield p
-        stack.extend(reversed(sorted(dirs)))
+        if max_depth and depth >= max_depth:
+            for d in dirs:
+                _skip(d, "deeper than --max-depth")
+            continue
+        stack.extend((d, depth + 1) for d in reversed(sorted(dirs)))
 
 
 class Scanner:
@@ -234,10 +252,14 @@ class Scanner:
         #: counted as neutralized and produce no findings.
         self.neutralized: Optional[Dict[str, str]] = None
         self._patterns: List[Tuple[Signature, "re.Pattern[bytes]"]] = []
+        #: sig id -> pattern is literal text (so a match must sit in text)
+        self._texty: Dict[str, bool] = {}
+        self._prefilter = Prefilter()
         self._combined: Optional["re.Pattern[bytes]"] = None
         self._name_to_sig: Dict[str, Signature] = {}
         self._overlap = 64
-        self._cached_version: Optional[int] = None
+        #: (db.version, feed-pattern identity) the pattern set was built for.
+        self._cached_version: Optional[Tuple] = None
         #: Threat-intel DB for the web shield (lazy-loaded).
         self._intel: Optional[ThreatIntel] = None
         #: The engine's own config files (signature DB, threat intel).
@@ -247,6 +269,84 @@ class Scanner:
         #: Standing trust baseline (mutation detection), lazy-loaded.
         self._trust_cache: Optional[Dict[str, Dict]] = None
         self._trust_version: int = 0
+        #: User rules (v2.8) – lazy-loaded from config.user_rules_file.
+        self._user_rules: Optional[List[Signature]] = None
+        self._user_globs: Dict[str, str] = {}
+        self._user_rules_version: int = -1
+        self._glob_rules: List[Tuple[Signature, str]] = []
+        #: Public feed indexes (v2.9) – read-only, lazily memory-mapped per
+        #: bucket.  With no feeds built every lookup returns None and the
+        #: scanner behaves exactly like it did before this layer existed.
+        self._feeds: Optional[feeds_mod.FeedDB] = None
+        self._feed_patterns: Optional[List[Signature]] = None
+        self._feed_patterns_version: str = ""
+
+    # ----------------------------------------------------------------- feeds
+    def feeds(self) -> feeds_mod.FeedDB:
+        """The (lazily created) public-feed database."""
+        if self._feeds is None:
+            self._feeds = feeds_mod.FeedDB(
+                Path(self.config.feeds_dir),
+                enabled=bool(getattr(self.config, "feeds_enabled", True)))
+        return self._feeds
+
+    def _load_feed_patterns(self) -> List[Signature]:
+        """Feed-derived literal signatures (YARA strings, ClamAV .ndb)."""
+        db = self.feeds()
+        identity = db.identity()
+        if self._feed_patterns is not None and \
+                identity == self._feed_patterns_version:
+            return self._feed_patterns
+        signatures: List[Signature] = []
+        for entry in db.patterns():
+            try:
+                signature = Signature(
+                    id=str(entry["id"]), name=str(entry.get("name", "feed")),
+                    category="feed",
+                    pattern=str(entry["pattern"]),
+                    severity=str(entry.get("severity", "high")),
+                    description=str(entry.get("description", "")),
+                    source=str(entry.get("source", "feed")),
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+            signatures.append(signature)
+        self._feed_patterns = signatures
+        self._feed_patterns_version = identity
+        return signatures
+
+    def _load_user_rules(self) -> List[Signature]:
+        """User rules from ``config.user_rules_file`` (mtime-aware, cached).
+
+        A missing file simply means "no user rules".  Rules carrying a
+        file-name condition stay out of the merged alternation and are
+        evaluated per file against the name.
+        """
+        from . import rules as rules_mod
+        if not getattr(self.config, "user_rules_enabled", True):
+            if self._user_rules:
+                self._cached_version = None
+            self._user_rules, self._glob_rules = [], []
+            return self._user_rules
+        path = Path(self.config.user_rules_file)
+        try:
+            mtime = path.stat().st_mtime_ns if path.exists() else 0
+        except OSError:
+            mtime = 0
+        if self._user_rules is not None and mtime == self._user_rules_version:
+            return self._user_rules
+        if mtime:
+            sigs, globs = rules_mod.rules_with_globs(path)
+        else:
+            sigs, globs = [], {}
+        self._user_globs = globs
+        self._user_rules = [s for s in sigs
+                            if s.id not in globs and s.compiled is not None]
+        self._glob_rules = [(s, globs[s.id]) for s in sigs
+                            if s.id in globs and s.compiled is not None]
+        self._user_rules_version = mtime
+        self._cached_version = None  # merged patterns must be rebuilt
+        return self._user_rules
 
     def _trust_baseline(self) -> Dict[str, Dict]:
         """The standing trust baseline ({} when none is configured).
@@ -371,7 +471,8 @@ class Scanner:
             for _ in walk_files(path, self.config.exclude_dirs, protected,
                                 on_skip=_skipped, on_file=_record,
                                 exclude_patterns=self.config.exclude_patterns,
-                                min_mtime=self.config.since_ts):
+                                min_mtime=self.config.since_ts,
+                                max_depth=self.config.scan_max_depth):
                 pass
         else:
             result.errors.append(f"{path}: not a regular file or directory")
@@ -434,6 +535,12 @@ class Scanner:
         if len(result.findings) > 1:
             result.findings.sort(key=lambda f: (f.path, f.kind))
         result.finished_at = time.time()
+        # Cumulative metrics (v2.8): counters that survive across runs and
+        # feed `antivirus metrics`.  A metrics failure must never break a scan.
+        try:
+            metrics_mod.record_scan(self.config.metrics_file, result)
+        except Exception:
+            pass
         return result
 
     def _cache_profile(self) -> dict:
@@ -442,6 +549,13 @@ class Scanner:
         self._trust_baseline()  # load + refresh _trust_version
         return {
             "db_version": self.db.version,
+            "feeds": [self.feeds().identity(), cfg.feeds_enabled,
+                      cfg.feeds_domains_enabled],
+            "indicators_enabled": self.config.indicators_enabled,
+            "indicators_max_size": self.config.indicators_max_size,
+            "wide_patterns_enabled": self.config.wide_patterns_enabled,
+            "file_timeout": self.config.scan_file_timeout,
+            "user_rules_mtime": self._user_rules_version,
             "behavior": cfg.behavior_enabled,
             "fast": cfg.fast_mode,
             "archives": cfg.archives_enabled,
@@ -517,49 +631,56 @@ class Scanner:
 
     # ------------------------------------------------------------ internals
     def _sync_patterns(self) -> None:
-        """Rebuild the merged pattern regex when the signature DB changed."""
-        if self._cached_version == self.db.version:
+        """Rebuild the pattern set + literal prefilter when the DB changed.
+
+        v2.8: the old approach (one big alternation of every pattern) is
+        O(patterns) per byte in CPython's ``re`` and measured ~7 s/MiB with
+        100+ signatures.  Instead every pattern now carries a required
+        literal token; a memchr-backed ``bytes.find`` gate decides which
+        patterns are even worth testing on this buffer (see prefilter.py).
+        """
+        pattern_key = (self.db.version, self.feeds().identity())
+        if self._cached_version == pattern_key:
             return
         self._patterns = []
-        self._name_to_sig = {}
-        self._combined = None
-        for sig in self.db.list():
+        self._prefilter = Prefilter()
+        seen = set()
+        for sig in (self.db.list() + self._load_user_rules()
+                    + self._load_feed_patterns()):
             compiled = sig.compiled
-            if compiled is not None:
-                self._patterns.append((sig, compiled))
-        if self._patterns:
-            parts = []
-            for i, (sig, _rx) in enumerate(self._patterns):
-                name = f"av_sig_{i}"
-                self._name_to_sig[name] = sig
-                parts.append(f"(?P<{name}>{sig.pattern})")
-            try:
-                self._combined = re.compile("|".join(parts).encode("utf-8"))
-            except re.error:
-                self._combined = None  # fall back to per-pattern searches
-        self._overlap = max((len(s.pattern) for s, _ in self._patterns), default=0) * 3 + 64
-        self._cached_version = self.db.version
+            if compiled is None or sig.id in seen:
+                continue
+            seen.add(sig.id)
+            self._patterns.append((sig, compiled))
+            self._prefilter.add_patterns(sig.id, [sig.pattern])
+            # Signatures built from literal words (family names, note text,
+            # commands) must match inside readable text; binary/code
+            # signatures (hex escapes, byte windows) are exempt.
+            self._texty[sig.id] = bool(pattern_runs(sig.pattern))
+        self._overlap = max((len(s.pattern) for s, _ in self._patterns),
+                            default=0) * 3 + 64
+        self._cached_version = pattern_key
 
     def _match_patterns(self, buf: bytes) -> List[Signature]:
-        """Which signatures match *buf* – one combined pass per chunk."""
+        """Which signatures match *buf* (prefilter gate, then regex).
+
+        Text signatures additionally require the match to sit in readable
+        text (v2.8): three random letters inside a compressed blob are not
+        a family marker.  Binary signatures are exempt.
+        """
         hits: List[Signature] = []
-        if self._combined is not None:
-            for m in self._combined.finditer(buf):
-                name = m.lastgroup
-                sig = None
-                if name is not None and name in self._name_to_sig and m.group(name) is not None:
-                    sig = self._name_to_sig[name]
-                else:  # lastgroup may be an internal group of the user pattern
-                    for n, s in self._name_to_sig.items():
-                        if m.group(n) is not None:
-                            sig = s
-                            break
-                if sig is not None and sig not in hits:
-                    hits.append(sig)
-        else:
-            for sig, rx in self._patterns:
-                if rx.search(buf) and sig not in hits:
-                    hits.append(sig)
+        candidates = set(self._prefilter.candidates(buf))
+        for sig, rx in self._patterns:
+            if sig.id not in candidates:
+                continue
+            m = rx.search(buf)
+            if m is None:
+                continue
+            if (self._texty.get(sig.id, True)
+                    and not marker_text_ok(buf, m.start(), m.end())):
+                continue
+            if sig not in hits:
+                hits.append(sig)
         return hits
 
     def _scan_file(self, path: Path, result: ScanResult,
@@ -593,6 +714,19 @@ class Scanner:
         result.file_meta[str(path)] = {"sha256": sha256, "size": size}
         result.bytes_scanned += size
 
+        # Soft per-file analysis budget (v2.8): when --file-timeout is set and
+        # a file takes longer than that, the remaining *deep* layers are
+        # skipped for this file (it is counted in files_budget_skipped).
+        deadline = (time.monotonic() + self.config.scan_file_timeout
+                    if self.config.scan_file_timeout else None)
+        budget_hit = [False]
+
+        def _budget_ok() -> bool:
+            if deadline is None or time.monotonic() <= deadline:
+                return True
+            budget_hit[0] = True
+            return False
+
         # Already neutralized by the kill engine (its registry maps the
         # ciphertext's hash to a registry entry): the file is inert, so it
         # is counted but not re-flagged by any layer.
@@ -621,6 +755,22 @@ class Scanner:
             signature = self.db.by_sha256(sha256)
             if signature is None:
                 signature = self.db.by_md5(md5)
+            if signature is None:
+                for sig in self._load_user_rules():
+                    if (sig.sha256 and sig.sha256.lower() == sha256) or \
+                            (sig.md5 and sig.md5.lower() == md5):
+                        signature = sig
+                        break
+            if signature is None:
+                # Public feed hash sets (v2.9): millions of known-bad hashes,
+                # matched by an 8-byte digest lookup - only when feeds exist.
+                feed_hit = self.feeds().lookup_hash(sha256=sha256, md5=md5)
+                if feed_hit is not None:
+                    local.append(self.feeds().hash_finding(
+                        str(path), feed_hit, size=size, sha256=sha256))
+                    result.findings.extend(local)  # definite match – stop here
+                    result.scanned_paths[str(path)] = local
+                    return
             if signature is not None:
                 message = f"Matches signature '{signature.id}'"
                 if signature.description:
@@ -638,6 +788,17 @@ class Scanner:
                 result.scanned_paths[str(path)] = local
                 return
 
+        # Wide (UTF-16) pattern pass (v2.8): Windows scripts, registry
+        # exports and PowerShell -enc blobs are stored UTF-16; decode a view
+        # so the ASCII patterns can see them (no-op for other files).
+        if (self.config.wide_patterns_enabled and not partial and content):
+            wide = utf16_view(content)
+            if wide:
+                known = {s.id for s in pattern_hits}
+                for sig in self._match_patterns(wide):
+                    if sig.id not in known:
+                        pattern_hits.append(sig)
+
         # Layer 2 – pattern matches found in the same pass.
         for sig in pattern_hits:
             local.append(Finding(
@@ -650,6 +811,19 @@ class Scanner:
                 size=size,
             ))
 
+        # User rules with a file-name condition (v2.8): evaluated per file,
+        # because the merged alternation cannot know the file name.
+        if self._glob_rules and content and _budget_ok():
+            for sig, glob in self._glob_rules:
+                if fnmatch.fnmatch(path.name, glob) and sig.compiled is not None \
+                        and sig.compiled.search(content):
+                    local.append(Finding(
+                        path=str(path), kind="signature-pattern",
+                        name=sig.name, severity=sig.severity,
+                        message=(f"User rule '{sig.id}' matched "
+                                 f"(file name {glob})"),
+                        sha256=sha256, size=size))
+
         # Layer 2.5 – behavioural analysis (what the file appears to do).
         # Only files that look executable are examined; the content was
         # already buffered during the single read pass above.
@@ -658,6 +832,7 @@ class Scanner:
             self.config.behavior_enabled
             and not self.config.fast_mode
             and content is not None
+            and _budget_ok()
             and behavior_looks_executable(path, content)
         ):
             local.extend(behavior_analyze_file(path, st, content))
@@ -673,18 +848,46 @@ class Scanner:
 
         # Layer 2.56 – obfuscation techniques (v2.7): encoded payload
         # blobs, double encoding, junk code, packed PEs without imports.
-        if self.config.obfuscation_enabled and not self.config.fast_mode:
+        if self.config.obfuscation_enabled and not self.config.fast_mode \
+                and _budget_ok():
             head = content if content is not None else \
                 self._peek_bytes(path, 4 * 1024 * 1024)
             if head:
                 local.extend(obfuscation_mod.analyze(str(path), head))
 
+        # Layer 2.57 – indicator checks (v2.8): technique markers - LOLBins,
+        # persistence, evasion, credential access, C2, ransomware impact,
+        # macro/DDE/LNK delivery.  See antivirus/indicators.py.
+        if self.config.indicators_enabled and not self.config.fast_mode \
+                and _budget_ok():
+            limit = max(self.config.indicators_max_size, 1)
+            head = content if content is not None else self._peek_bytes(path, limit)
+            if head:
+                local.extend(indicators_mod.analyze(
+                    str(path), head[:limit], filename=path.name))
+
         # Layer 2.6 – web shield: URLs inside the file vs threat-intel (v2.4).
-        if self.config.webshield_enabled and not self.config.fast_mode:
+        if self.config.webshield_enabled and not self.config.fast_mode \
+                and _budget_ok():
             head = content if content is not None else \
                 self._peek_bytes(path, 262144)
             local.extend(webshield_mod.audit_bytes(
                 str(path), head, self.threat_intel()))
+
+        # Layer 2.62 – public feed IOCs (v2.9): domains/IPs inside the file
+        # that appear in the built feed indexes, plus feed-listed file names.
+        feeds = self.feeds()
+        if feeds.built and not self.config.fast_mode and _budget_ok():
+            local.extend(feeds.audit_name(str(path)))
+            if self.config.feeds_domains_enabled:
+                head = content if content is not None else \
+                    self._peek_bytes(path, max(self.config.feeds_scan_bytes, 1))
+                if head:
+                    local.extend(feeds.audit_content(
+                        str(path), head[:self.config.feeds_scan_bytes],
+                        window=self.config.feeds_scan_bytes,
+                        limit=self.config.feeds_max_tokens,
+                        max_findings=self.config.feeds_max_findings))
 
         # Layer 2.65 – suspicion engine: how suspicious does the file *look*,
         # independent of any signature match (v2.4).  This is what makes the
@@ -693,6 +896,7 @@ class Scanner:
             self.config.risk_enabled
             and not self.config.fast_mode
             and not local
+            and _budget_ok()
         ):
             head = content if content is not None else \
                 self._peek_bytes(path, 65536)
@@ -704,6 +908,7 @@ class Scanner:
         if (
             self.config.archives_enabled
             and size <= self.config.archive_max_size
+            and _budget_ok()
         ):
             head = content[:262] if content is not None else \
                 self._peek_bytes(path, 262)
@@ -713,6 +918,7 @@ class Scanner:
         if (
             not local
             and not self.config.fast_mode
+            and _budget_ok()
             and entropy is not None
             and entropy >= self.config.entropy_threshold
         ):
@@ -728,6 +934,12 @@ class Scanner:
                 sha256=sha256,
                 size=size,
             ))
+
+        if budget_hit[0]:
+            result.files_budget_skipped += 1
+            result.errors.append(
+                f"{path}: deep analysis skipped (per-file budget "
+                f"{self.config.scan_file_timeout:g}s)")
 
         # Backfill digests on findings produced by layers that don't set
         # them (behaviour / archives), so reports & exports carry the
@@ -746,8 +958,18 @@ class Scanner:
         if os.path.normpath(s) in self._self_files:
             return True
         if not os.path.isabs(s):
-            return os.path.normpath(
-                os.path.join(os.getcwd(), s)) in self._self_files
+            if os.path.normpath(os.path.join(os.getcwd(), s)) in self._self_files:
+                return True
+        # v2.9: everything under the feed database directory is generated
+        # data that *quotes* the indicators it indexes - scanning it would
+        # report the engine's own database as malicious.
+        try:
+            resolved = Path(s).resolve()
+            root = Path(self.config.feeds_dir).resolve()
+            if resolved == root or root in resolved.parents:
+                return True
+        except (OSError, RuntimeError):
+            pass
         return False
 
     # ----------------------------------------------------------- in-memory
@@ -787,7 +1009,14 @@ class Scanner:
             ))
             return local
 
-        for sig in self._match_patterns(data):
+        pattern_hits = self._match_patterns(data)
+        if cfg.wide_patterns_enabled:
+            wide = utf16_view(data)
+            if wide:
+                known = {s.id for s in pattern_hits}
+                pattern_hits.extend(s for s in self._match_patterns(wide)
+                                    if s.id not in known)
+        for sig in pattern_hits:
             local.append(Finding(
                 path=name, kind="signature-pattern", name=sig.name,
                 severity=sig.severity,
@@ -808,11 +1037,27 @@ class Scanner:
             local.extend(polyglot_mod.analyze(name, data))
         if cfg.obfuscation_enabled and not cfg.fast_mode:
             local.extend(obfuscation_mod.analyze(name, data))
+        # Indicator checks (v2.8) – same technique table as on disk.
+        if cfg.indicators_enabled and not cfg.fast_mode:
+            limit = max(cfg.indicators_max_size, 1)
+            local.extend(indicators_mod.analyze(name, data[:limit],
+                                                filename=p.name))
 
         # Web shield + suspicion engine (v2.4) – same layers as on disk.
         if cfg.webshield_enabled and not cfg.fast_mode:
             local.extend(webshield_mod.audit_bytes(name, data,
                                                    self.threat_intel()))
+
+        # Public feed IOCs (v2.9) – archive members are analysed the same
+        # way as files on disk, and never written anywhere.
+        feeds = self.feeds()
+        if feeds.built and not cfg.fast_mode:
+            local.extend(feeds.audit_name(name))
+            if cfg.feeds_domains_enabled:
+                local.extend(feeds.audit_content(
+                    name, data[:cfg.feeds_scan_bytes],
+                    window=cfg.feeds_scan_bytes, limit=cfg.feeds_max_tokens,
+                    max_findings=cfg.feeds_max_findings))
         if cfg.risk_enabled and not cfg.fast_mode and not local:
             f = self._risk_finding(name, p, None, data, sha256, len(data), cfg)
             if f is not None:

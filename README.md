@@ -16,6 +16,15 @@ watches folders for new/changed files, and writes JSON + text reports.
   1. *Hash* — SHA-256 (plus MD5) of each file vs. the signature database
   2. *Pattern* — regular expressions matched against raw file bytes
      (catches renamed/wrapped variants)
+- **Public threat-intel database** (`feeds`) — millions of indicators from
+  vetted public sources (blocklists, hash sets, rule strings), converted into
+  compact local indexes: 22 MB on disk for 2.8 M indicators, matched by
+  binary search. Licence-aware, provenance-tracked, and built by you rather
+  than shipped — see [Public threat-intel feeds](#public-threat-intel-feeds).
+- **Technique indicators** (`indicators`) — 89 static checks for how a file
+  behaves, independent of any specific malware: LOLBins, persistence,
+  defence evasion, credential access, C2, ransomware impact, Office macros
+  and file-name tricks. `antivirus indicators --category evasion` lists them.
 - **Behavioural detection** (static — nothing is ever executed):
   * *Python* — AST analysis: `eval`/`exec` on non-constant input,
     `subprocess(..., shell=True)`, `os.system`, sockets to hardcoded
@@ -972,11 +981,110 @@ free core. Where the commercial engines genuinely lead: **real-world
 malware coverage** (huge continuously-updated signature + cloud + ML) and
 scale. `antivirus compare` says all of this plainly.
 
+## Public threat-intel feeds
+
+A signature list that ships inside a repository can only ever be small. Real
+coverage comes from the *public* blocklists, hash sets and rule collections
+that security teams publish and maintain — so this tool **builds a database
+from them on your machine** instead of pretending to ship one.
+
+```bash
+python3 -m antivirus feeds list          # 12 vetted sources + licences
+python3 -m antivirus feeds build         # ~25 s → 2.8 M indicators, 22 MB
+python3 -m antivirus feeds stats         # what is in the database
+python3 -m antivirus feeds audit         # provenance + licence report
+python3 -m antivirus feeds verify        # indexes consistent + sorted
+python3 -m antivirus scan .              # the feeds layer now contributes
+python3 -m antivirus feeds clear         # remove the database
+```
+
+Measured on the default build (2026-10-15): **2,817,300 indicators** from
+9 sources in **25 seconds**, stored as **22.6 MB** of sorted index files in
+`data/feeds/` (git-ignored — generated data is never committed). A scan that
+uses it costs about **+0.25 s (≈3 %)** on a full repository scan.
+
+### Where the data comes from
+
+| Source | What it is | Licence | Redistribution |
+| --- | --- | --- | --- |
+| `blocklistproject-malware` | 2.6 M malware distribution domains | MIT | shipped-as-code |
+| `blocklistproject-phishing` | phishing domains | MIT | shipped-as-code |
+| `blocklistproject-abuse` | abuse / C2 domains | MIT | shipped-as-code |
+| `blocklistproject-ransomware` | ransomware C2 domains | MIT | shipped-as-code |
+| `blocklistproject-fraud` | fraud domains | MIT | shipped-as-code |
+| `blocklistproject-malware-ip` / `-abuse-ip` | malware / abuse IPs | MIT | shipped-as-code |
+| `mandiant-hashes` | red-team tool hashes (MD5/SHA1/SHA256) | BSD-2-Clause | shipped-as-code |
+| `mandiant-yara` | red-team tool YARA **string literals** | BSD-2-Clause | shipped-as-code |
+| `signature-base-hashes` | evil hash IOCs | DRL 1.1 | runtime-only (`--all`) |
+| `signature-base-c2` / `-filenames` | C2 IOCs, malware file names | DRL 1.1 | runtime-only (`--all`) |
+
+*Redistribution* is the important column: every source is usable, but sources
+whose licence does not allow shipping their data inside an MIT project are
+`runtime-only` — they are only downloaded when you ask for them (`feeds build
+--all`), and even then they land in your git-ignored `data/feeds/`, never in
+this repository. `feeds audit` prints the licence mix of whatever you built.
+
+### What converts — and what honestly does not
+
+Converting a feed faithfully matters more than converting it completely:
+
+* **Hashes** (MD5/SHA1/SHA256) and **domains/IPs** convert exactly.
+* **ClamAV databases** (`.hdb`, `.hsb`, `.ndb`, `.cvd`, `.cld`) can be imported
+  from your own copy with `feeds import-clamav FILE` — including the official
+  `.cvd` containers (512-byte header + gzip + tar). ClamAV's own database is
+  licensed for *use*, not redistribution, so it is never downloaded or shipped
+  here. Logic signatures (`.ldb`) and PE-*section* hashes (`.mdb`) cannot be
+  represented by this engine and are **counted as skipped**, not mangled.
+* **YARA rules** are converted to their plain string literals only, and only
+  when the literal is meaningful *without* the rule's `condition:` logic.
+  A rule's logic is not implemented here, so a bare `ExitProcess` from a rule
+  would fire on every Windows binary — such strings are rejected.
+
+Two guard rails keep the database honest:
+
+1. **Prefilter gate** — a converted pattern must contain a literal run the
+   scanner can find with `memchr`, otherwise it would be tested against every
+   byte of every file. Ungated conversions are dropped and counted.
+2. **Benign-corpus gate** — every converted pattern is matched against the
+   bundled known-clean samples; anything that fires on a file known to be
+   innocent is discarded (`pattern-benign-match` in the build report).
+
+Feed hits appear as their own engine layer (`feeds`) with the source and
+licence in the finding, e.g.:
+
+```
+python3 -m antivirus engine suspicious.py
+  feeds   Public threat-intel feeds   flagged   high
+          [high] Feed-listed domain – blocklistproject: 'malware-c2.example.com'
+          is listed by blocklistproject (MIT)
+```
+
+Domains found in file *content* are only reported when they are used like a
+network address (`http://…`, `www.…`, `host:8080`, `host/path`, a hosts-file
+line) or are specific enough (≥12 characters with a hyphen or three labels).
+Public blocklists contain machine-generated junk such as `subprocess.run` and
+`s.id` — `.run` and `.id` are real TLDs — and matching those in source code
+would be a false positive, so context is required.
+
+## What's new in v2.8
+
+* **89 technique indicators** (`antivirus indicators`, `IND-…` ids, 8
+  categories) — a new detection layer that reports *how* a file behaves.
+* **User rules** (`antivirus rules add/remove/list/test/import`) — YARA-lite
+  patterns and file-name globs, kept separate from the bundled database.
+* **Machine-readable output** — `scan --sarif report.sarif` (SARIF 2.1.0) and
+  `scan --html report.html` (self-contained), plus `--fail-on`/`--quiet`.
+* **Cumulative metrics** (`antivirus metrics`, `--format prometheus`) and
+  `antivirus history`, `doctor`, `strings`, `entropy`, `completion`,
+  `version`, `explain`.
+* **~100× faster pattern matching** — a literal prefilter (`antivirus/prefilter.py`)
+  replaces the merged-alternation approach that cost 6.8 s/MiB.
+
 ## Command reference
 
 | Command | Description |
 | --- | --- |
-| `scan TARGET [--action detect\|quarantine\|kill\|delete] [--threads N] [--no-behavior] [--fast] [--no-cache] [--no-archives] [--exclude GLOB] [--since DURATION] [--baseline FILE] [--json]` | Scan a file or directory tree (`--threads`: auto, N, or 1; `--fast`: hash+pattern only; `--exclude` repeatable; `--since 30m/2h/1d`: only recently modified files; `--baseline`: integrity check vs a manifest; `kill`: obfuscate in place, key/IV to the registry) |
+| `scan TARGET [--action detect\|quarantine\|kill\|delete] [--threads N] [--no-behavior] [--fast] [--no-cache] [--no-archives] [--exclude GLOB] [--since DURATION] [--baseline FILE] [--fail-on LEVEL] [--sarif FILE] [--html FILE] [--quiet] [--no-feeds] [--json]` | Scan a file or directory tree (`--threads`: auto, N, or 1; `--fast`: hash+pattern only; `--exclude` repeatable; `--since 30m/2h/1d`: only recently modified files; `--baseline`: integrity check vs a manifest; `kill`: obfuscate in place, key/IV to the registry) |
 | `monitor TARGET [--action ...] [--interval 2] [--no-behavior] [--no-archives] [--exclude GLOB] [--since DURATION] [--json]` | Watch a directory, scan new/changed files (`--json`: one JSON object per event; actions include `kill`) |
 | `guard start [TARGET] [--action …] [--interval 5] [--initial] [--state-dir DIR]` | Start the background guard: auto-scan new/changed files, detached, lightweight |
 | `guard stop` / `guard status` / `guard log [--lines N]` | Stop / inspect / tail the background guard |
@@ -987,9 +1095,19 @@ scale. `antivirus compare` says all of this plainly.
 | `firewall monitor [--interval 5]` | Watch for new suspicious connections |
 | `benchmark [--samples DIR] [--json]` | Run the labelled sample corpus: recall + false positives |
 | `perf [--files N] [--keep-corpus] [--json]` | Measured throughput: cold vs warm (files/s, MB/s), cache speedup, per-file p50/p99 |
-| `engine FILE [--json]` | VirusTotal-style per-layer engine report + "detected by N of M" consensus |
+| `engine FILE [--json]` | VirusTotal-style per-layer engine report + "detected by N of M" consensus (11 layers) |
+| `feeds list` | Vetted public feed sources with licence + redistribution class |
+| `feeds build [--source ID]… [--all] [--limit N] [--max-patterns N] [--json]` | Fetch, convert and index public feeds into `data/feeds/` (default: licence-safe sources only) |
+| `feeds import-clamav FILE` | Import a local ClamAV database (`.hdb`/`.hsb`/`.ndb`/`.cvd`/`.cld`) |
+| `feeds stats` / `feeds audit` / `feeds verify` / `feeds clear` | Inspect / provenance + licence report / consistency check / delete the feed database |
+| `indicators [--category C] [--show ID] [--json]` | List the 89 technique-indicator checks |
+| `rules list\|add\|remove\|test\|import` | Manage user detection rules (patterns + file-name globs) |
+| `sarif -o FILE` / `html -o FILE` | Scan and write a SARIF 2.1.0 / self-contained HTML report |
+| `strings FILE [--min N] [--utf16] [--grep S]` / `entropy FILE` | Extract strings / measure entropy |
+| `metrics [--format prometheus] [--reset]` / `history [--limit N]` | Cumulative counters / past scans |
+| `doctor [--json]` / `completion bash\|zsh\|fish` / `version [--json]` / `explain TOPIC` | Health check, shell completion, inventory, glossary |
 | `compare [--no-perf] [--perf-files N] [--json]` | Honest feature + performance comparison vs AVG / Avast / Malwarebytes / VirusTotal |
-| `realworld [--corpus DIR] [--rebuild] [--json]` | Score the sourced real-world IOC pack (20 named families, inert corpus): per-family detection + false positives |
+| `realworld [--corpus DIR] [--rebuild] [--json]` | Score the sourced real-world IOC pack (99 named families, inert corpus): per-family detection + false positives |
 | `hash FILE… [--json]` | Print SHA-256 / MD5 / SHA-1 digests + size of each file |
 | `behavior analyze FILE [--json]` | Show what one file appears to do (static behavioural analysis) |
 | `pe analyze FILE [--json]` | Full static PE dissection ("debug report") + red-flag indicators |
@@ -1197,6 +1315,13 @@ antivirus/
 ├── risk.py          # suspicion engine: 0-100 risk score per file
 ├── webshield.py     # web shield: URL extraction + reputation scoring
 ├── firewall.py      # live connection-table audit (no root needed)
+├── indicators.py    # 89 technique-indicator checks (LOLBins, persistence, …)
+├── prefilter.py     # literal-token gate that makes pattern matching ~100x faster
+├── feeds.py         # public threat-intel feeds → compact local indexes (v2.9)
+├── rules.py         # user-defined rules (patterns + file-name globs)
+├── metrics.py       # cumulative counters + Prometheus rendering
+├── exporters.py     # SARIF 2.1.0 + self-contained HTML report writers
+├── extra_cli.py     # v2.8/v2.9 commands (indicators, rules, feeds, doctor, …)
 ├── benchmark.py     # labelled-corpus detection benchmark
 ├── engine.py        # VirusTotal-style per-layer engine report (consensus)
 ├── perf.py          # measured throughput benchmark (cold/warm + latency)
@@ -1208,7 +1333,9 @@ antivirus/
 └── utils.py         # shared helpers
 data/
 ├── signatures.json    # bundled signature database (EICAR test string)
-└── threat_intel.json  # bundled threat intel (blocklist domains/IPs/ports)
+├── threat_intel.json  # bundled threat intel (blocklist domains/IPs/ports)
+├── user_rules.json    # your own rules (created by `antivirus rules`)
+└── feeds/             # built public-feed database (git-ignored, generated)
 samples/
 ├── eicar-test.txt     # the standard 68-byte harmless AV test string
 ├── clean.txt

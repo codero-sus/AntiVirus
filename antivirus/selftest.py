@@ -20,7 +20,7 @@ from typing import List, Optional
 from .config import Config
 from .quarantine import Quarantine
 from .scanner import Scanner
-from .signatures import Signature, SignatureDB
+from .signatures import VALID_SEVERITIES, Signature, SignatureDB
 from .utils import md5_new
 
 EICAR = b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"
@@ -665,19 +665,34 @@ def run_selftest(signatures_file: Optional[str] = None) -> int:
         eng_file = workdir / "eicar-engine.txt"
         eng_file.write_bytes(EICAR)
         eng_report = engine_mod.engine_report(eng_file, scanner, config)
-        check("engine: EICAR flagged by >=2 of 9 layers, consensus present",
+        check("engine: EICAR flagged by >=2 of 11 layers, consensus present",
               eng_report["engines_detected"] >= 2
               and eng_report["overall_severity"] == "critical"
-              and len(eng_report["layers"]) == 9
-              and "of 9" in eng_report["consensus"],
+              and len(eng_report["layers"]) == 11
+              and "of 11" in eng_report["consensus"],
               str(eng_report.get("consensus")))
 
         clean_file = workdir / "clean-engine.txt"
         clean_file.write_text("totally ordinary text\n")
         clean_report = engine_mod.engine_report(clean_file, scanner, config)
-        check("engine: clean file reported by 0 of 9 engines",
+        check("engine: clean file reported by 0 of 11 engines",
               clean_report["engines_detected"] == 0
               and clean_report["overall_severity"] == "clean")
+
+        # -- public feed database (v2.9) -------------------------------------
+        from . import feeds as feeds_mod
+        from pathlib import Path as _Path
+
+        feed_db = feeds_mod.FeedDB(_Path(config.feeds_dir))
+        feed_stats = feed_db.stats()
+        check("feeds: database readable, lookups safe when empty",
+              isinstance(feed_stats, dict)
+              and feed_db.lookup_domain("no-such-token.invalid") is None
+              and feed_db.lookup_hash(sha256="0" * 64) is None,
+              (f"{feed_stats['tokens']:,} indicators, "
+               f"{feed_stats['patterns']:,} patterns"
+               if feed_stats["built"] else
+               "no database built (run `antivirus feeds build`)"))
 
         perf_result = perf_mod.run(config=config, files_per_tier=20,
                                    keep_corpus=False)
@@ -713,6 +728,89 @@ def run_selftest(signatures_file: Optional[str] = None) -> int:
               rw["families_detected"] == rw["families_pattern"]
               and rw["clean_false_positives"] == 0,
               realworld_mod.verdict_line(rw))
+
+        # -- indicators + rules + metrics + exports (v2.8) -------------------
+        from . import exporters as exporters_mod
+        from . import indicators as indicators_mod
+        from . import metrics as metrics_mod
+        from . import rules as rules_mod
+
+        check("indicators: table loads with valid ids and severities",
+              len(indicators_mod.CHECKS) >= 50
+              and all(i.severity in VALID_SEVERITIES
+                      and i.category in indicators_mod.CATEGORY_TITLES
+                      for i in indicators_mod.CHECKS),
+              f"{len(indicators_mod.CHECKS)} checks")
+
+        script = workdir / "indicator-check.ps1"
+        script.write_text("vssadmin delete shadows /all /quiet\n"
+                          "Set-MpPreference -DisableRealtimeMonitoring $true\n")
+        found_inds = indicators_mod.analyze(str(script), script.read_bytes(),
+                                            filename=script.name)
+        found_ids = {f.message.rsplit("[", 1)[-1].rstrip("]") for f in found_inds}
+        check("indicators: shadow-copy + defender markers flagged",
+              {"IND-EVADE-SHADOWCOPY", "IND-EVADE-DEFENDER"} <= found_ids,
+              ", ".join(sorted(found_ids)) or "no matches")
+
+        clean_ind = indicators_mod.analyze("ok.txt",
+                                           b"ordinary text about backups\n")
+        check("indicators: ordinary text produces no findings",
+              not clean_ind, f"{len(clean_ind)} findings")
+
+        utf16_script = workdir / "wide.ps1"
+        utf16_script.write_bytes("vssadmin delete shadows /all".encode("utf-16-le"))
+        wide_hits = indicators_mod.analyze(str(utf16_script),
+                                           utf16_script.read_bytes())
+        check("indicators: UTF-16 (wide) markers are visible",
+              any("SHADOWCOPY" in f.message for f in wide_hits),
+              f"{len(wide_hits)} findings")
+
+        rules_path = workdir / "user_rules.json"
+        rules_mod.add_rule(rules_path, "USER-SELFTEST",
+                           r"(?i:selftest-marker-xyz)", "high")
+        rule_hits = rules_mod.test_rule(r"(?i:selftest-marker-xyz)",
+                                        b"prefix selftest-marker-xyz suffix")
+        check("rules: user rule matches and is validated",
+              len(rule_hits) == 1
+              and rules_mod.summary(rules_path)["count"] == 1,
+              f"{len(rule_hits)} hit(s)")
+
+        bad_rule_ok, bad_rule_msg = rules_mod.validate("USER-X", "(", "high")
+        check("rules: invalid regex is rejected",
+              not bad_rule_ok and "regex" in bad_rule_msg, bad_rule_msg)
+
+        metrics_path = workdir / "metrics.json"
+        metrics_mod.record_scan(metrics_path, scanner.scan_path(clean_file))
+        mdata = metrics_mod.summary(metrics_mod.load(metrics_path))
+        check("metrics: counters recorded and rendered for Prometheus",
+              mdata["scans"] == 1 and mdata["files_scanned"] >= 1
+              and "antivirus_scans 1" in metrics_mod.render_prometheus(
+                  metrics_mod.load(metrics_path)),
+              f"scans={mdata['scans']} files={mdata['files_scanned']}")
+
+        sarif = exporters_mod.to_sarif({"target": "x", "findings": []},
+                                       base=workdir)
+        html_text = exporters_mod.render_html(
+            {"target": "x", "findings": [
+                {"path": "a.txt", "kind": "indicator", "name": "Test",
+                 "severity": "high", "message": "<b>escaped?</b>", "sha256": "ab",
+                 "size": 3}], "files_scanned": 1}, base=workdir)
+        check("exports: SARIF 2.1.0 + escaped HTML render",
+              sarif["version"] == "2.1.0" and "runs" in sarif
+              and "&lt;b&gt;" in html_text and "<b>escaped?</b>" not in html_text,
+              f"sarif runs={len(sarif.get('runs', []))}")
+
+        from .cache import ScanCache
+        from .models import Finding as _Finding
+
+        cap_cache = ScanCache(workdir / "cap.json", {}, max_entries=3)
+        for i in range(5):
+            cap_cache.put(f"file{i}", 1, 1,
+                          [_Finding(path=f"file{i}", kind="k", name="n",
+                                    severity="low", message="m")])
+        check("cache: entry cap evicts oldest entries",
+              len(cap_cache.entries) == 3 and cap_cache.evicted == 2,
+              f"{len(cap_cache.entries)} kept, {cap_cache.evicted} evicted")
 
         # -- rescue disk (v2.0) ------------------------------------------------
         from .rescue import (

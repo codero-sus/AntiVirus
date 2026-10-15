@@ -30,10 +30,18 @@ _CACHE_VERSION = 1
 class ScanCache:
     """In-memory cache with a JSON on-disk backing file."""
 
-    def __init__(self, path: Path, profile: dict) -> None:
+    #: Hard cap on entries; the oldest (insertion-order) entries are
+    #: evicted first so a long-lived cache cannot grow without bound.
+    DEFAULT_MAX_ENTRIES = 250_000
+
+    def __init__(self, path: Path, profile: dict,
+                 max_entries: Optional[int] = None) -> None:
         self.path = Path(path)
         self.profile = profile
+        self.max_entries = (int(max_entries) if max_entries
+                            else self.DEFAULT_MAX_ENTRIES)
         self.entries: Dict[str, Tuple[int, int, List[List[str]]]] = {}
+        self.evicted = 0
 
     # ------------------------------------------------------------------ load
     @classmethod
@@ -76,6 +84,17 @@ class ScanCache:
         self.entries[path] = (int(size), int(mtime_ns),
                               [[f.kind, f.name, f.severity, f.message]
                                for f in findings])
+        self.enforce_cap()
+
+    def enforce_cap(self) -> int:
+        """Drop the oldest entries above the cap; returns the number kept."""
+        overflow = len(self.entries) - self.max_entries
+        if overflow <= 0:
+            return len(self.entries)
+        for key in list(self.entries)[:overflow]:
+            del self.entries[key]
+            self.evicted += 1
+        return len(self.entries)
 
     # ------------------------------------------------------------------- save
     def save(self) -> bool:

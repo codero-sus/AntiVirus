@@ -80,6 +80,53 @@ class Config:
     polyglot_enabled: bool = True
     obfuscation_enabled: bool = True
 
+    # Indicator checks (v2.8): technique markers (LOLBins, persistence,
+    # evasion, credential access, C2, ransomware impact, macros) — see
+    # antivirus/indicators.py.  `antivirus indicators` lists them all.
+    indicators_enabled: bool = True
+    indicators_max_size: int = 2 * 1024 * 1024   # inspect at most this much
+
+    # Wide (UTF-16) pattern matching (v2.8): pattern signatures and
+    # indicators also run against the decoded UTF-16 view of a file, so
+    # Windows command lines / registry dumps / PowerShell -enc blobs are
+    # visible to ASCII patterns.
+    wide_patterns_enabled: bool = True
+
+    # Scan limits (v2.8).
+    #: Maximum directory depth (0 = unlimited); deeper files are skipped.
+    scan_max_depth: int = 0
+    #: Soft per-file analysis budget in seconds (0 = unlimited).  When
+    #: exceeded, the remaining *deep* layers (behaviour, archives, …) are
+    #: skipped for that file and it is counted in `files_budget_skipped`.
+    scan_file_timeout: float = 0.0
+
+    # Scan cache size cap (entries); oldest entries are evicted first.
+    cache_max_entries: int = 250_000
+
+    # Cumulative counters (metrics) live next to the scan cache.
+    metrics_file: Path = Path(".av-cache/metrics.json")
+
+    #: User-defined detection rules (v2.8) – same schema as the signature
+    #: database, managed by `antivirus rules`.  See antivirus/rules.py.
+    user_rules_file: Path = Path("data/user_rules.json")
+    #: Disable user rules entirely (`scan --no-rules` / `rules` off).
+    user_rules_enabled: bool = True
+
+    # Public threat-intel feeds (v2.9) – blocklists, hash sets and rule
+    # strings fetched from trusted public sources and converted into compact
+    # local indexes by `antivirus feeds build`.  See antivirus/feeds.py.
+    feeds_enabled: bool = True
+    #: Where the built indexes live (git-ignored: it is generated data).
+    feeds_dir: Path = Path("data/feeds")
+    #: Match feed-listed domains/IPs found inside scanned files.
+    feeds_domains_enabled: bool = True
+    #: Only this much of a file is searched for domains/IPs (bytes).
+    feeds_scan_bytes: int = 262144
+    #: Upper bound on extracted domain/IP candidates per file.
+    feeds_max_tokens: int = 2048
+    #: Upper bound on feed findings reported per file.
+    feeds_max_findings: int = 5
+
     # Scan cache: unchanged files (same size + mtime + same engine profile)
     # reuse their previous verdict without being read from disk.
     cache_enabled: bool = True
@@ -103,7 +150,8 @@ class Config:
         base = base.resolve()
         for name in ("quarantine_dir", "report_dir", "signatures_file",
                      "cache_dir", "baseline_dir", "registry_dir",
-                     "trust_baseline_file"):
+                     "trust_baseline_file", "metrics_file",
+                     "user_rules_file", "feeds_dir"):
             p = Path(getattr(self, name))
             if not p.is_absolute():
                 setattr(self, name, base / p)

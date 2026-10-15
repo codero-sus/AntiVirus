@@ -95,9 +95,17 @@ def summarize(result: ScanResult, notes: Dict[str, str]) -> str:
 
 
 def open_in_file_manager(path: Path) -> bool:
-    """Best-effort: open a directory with the platform file manager."""
+    """Best-effort: open a directory with the platform file manager.
+
+    Safety: *only* directories are ever handed to the shell.  ``os.startfile``
+    on Windows **executes** a file, so passing a scan target or a finding here
+    would launch the very sample the tool flagged.  Anything that is not a
+    directory is refused (a file's parent is still opened, as before).
+    """
     path = Path(path)
     if not path.exists():
+        return False
+    if not path.is_dir():
         return False
     try:
         if sys.platform.startswith("win"):

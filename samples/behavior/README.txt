@@ -12,10 +12,12 @@ malware.
   harmless.sh          clean shell script           -> no findings
   payload-py.py        dynamic code exec, shell-outs, hardcoded C2,
                        base64 payload blob          -> Python AST findings
-  pipe-shell.sh        curl | sh, /dev/tcp, crontab persistence,
-                       mining endpoint              -> shell findings
-  reverse-ps1.ps1      IEX + DownloadString, execution-policy bypass
-                       -> PowerShell findings
+  pipe-shell.sh        download piped to a shell, /dev/tcp socket
+                       usage, crontab persistence, mining endpoint
+                                                    -> shell findings
+  reverse-ps1.ps1      dynamic evaluation plus a network download
+                       call, execution-policy bypass
+                                                    -> PowerShell findings
   dropper.bat          certutil/mshta LOLBins       -> batch findings
   suspicious.exe       code-less PE: dangerous imports, ASLR/DEP off,
                        no entry point, no relocations, no debug info,
