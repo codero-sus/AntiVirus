@@ -22,7 +22,7 @@ watches folders for new/changed files, and writes JSON + text reports.
   by binary search. Licence-aware, provenance-tracked, guarded against the
   false positives aggregated feeds are full of, and built by you rather than
   shipped — see [Public threat-intel feeds](#public-threat-intel-feeds).
-- **Technique indicators** (`indicators`) — 507 static checks for how a file
+- **Technique indicators** (`indicators`) — 542 static checks for how a file
   behaves, independent of any specific malware: LOLBins, persistence,
   defence evasion, credential access, C2, ransomware impact, Office macros
   and file-name tricks. `antivirus indicators --category evasion` lists them,
@@ -1164,7 +1164,7 @@ python3 -m antivirus matrix          # checks per tactic, severity mix, top tags
 python3 -m antivirus matrix --tag lolbin
 ```
 
-507 checks across 8 tactics; the table is generated from the library, and the
+542 checks across 8 tactics; the table is generated from the library, and the
 self test asserts that **no check is unmapped** to a tactic.
 
 ### YARA export (`antivirus yara`)
@@ -1202,6 +1202,30 @@ EICAR string, and does not match random data.
   described above.
 * **Tests**: 350 unit tests (was 293) plus 84 self-test checks, covering the
   new parsers, the allowlist, YARA conversion and the FP harness.
+
+## What's new in v3.4
+
+* **35 further checks** (507 → **542**) after the same duplicate rule deleted
+  13 more candidate rows that a shipped check already caught (`URLDownloadToFile`,
+  `VbaProject.OTM`, `ssh -R`, `socat EXEC`, `mstsc /shadow`, `netexec`,
+  `ntlmrelayx`, `conhost --headless`, …).
+* New coverage this round: ICMP/SSH/relay tunnels, telegram bot tokens and
+  public drop hosts, IMDS credential endpoints (AWS role keys and Azure
+  managed-identity tokens), Cisco type-7 secrets, AD database copies,
+  destructive cloud/container calls (`az group delete`, `gsutil rm -r`,
+  `kubectl delete namespace`, `docker volume rm`, `rsync --delete`),
+  Office marks (Ole10Native payloads, `INCLUDEPICTURE`, XXE in OOXML),
+  kernel/boot tamper (`nointegritychecks on`, `LsaCfgFlags 0`, ETW session
+  stop), Linux execution (gdb call, `ptrace`, eBPF probes, `systemd-run`),
+  and developer-environment persistence (docker runtimes, VS Code
+  extensions, Jupyter startup, `/var/spool/cron`, GitHub Actions workflows).
+* The unit tests caught a false positive in this round: the "archive piped
+  into a socket" pattern was loose enough to match a random 300 KB blob
+  (which also suppressed the entropy heuristic for that file). The pattern
+  now requires the compressor's stream flag and an actual pipe; 32 MB of
+  random data produces zero findings again.
+* Library totals: **542 checks** (execution 138, persistence 120,
+  credential 90, evasion 76, exfil 36, lateral 33, impact 33, office 16).
 
 ## What's new in v3.3
 
@@ -1310,7 +1334,7 @@ EICAR string, and does not match random data.
 | `feeds build [--source ID]… [--all] [--limit N] [--max-patterns N] [--json]` | Fetch, convert and index public feeds into `data/feeds/` (default: licence-safe sources only) |
 | `feeds import-clamav FILE` | Import a local ClamAV database (`.hdb`/`.hsb`/`.ndb`/`.cvd`/`.cld`) |
 | `feeds stats` / `feeds audit` / `feeds verify` / `feeds clear` | Inspect / provenance + licence report / consistency check / delete the feed database |
-| `indicators [--category C] [--show ID] [--dump-samples DIR] [--json]` | List the 507 technique-indicator checks (`--show` prints the check's trigger sample) |
+| `indicators [--category C] [--show ID] [--dump-samples DIR] [--json]` | List the 542 technique-indicator checks (`--show` prints the check's trigger sample) |
 | `matrix [--tag TAG] [--json]` | ATT&CK coverage view: checks per tactic, severity mix, top tags |
 | `allowlist list\|add\|remove\|clear\|check\|export\|import\|from-findings\|audit` | False-positive allowlist (hashes, names, paths, domains), audited and counted |
 | `fpcheck [--blobs N] [--size KiB] [--min-severity S] [--json]` | False-positive audit: random blobs + realistic clean corpus; exits non-zero on a hit |
