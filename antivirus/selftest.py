@@ -784,6 +784,26 @@ def run_selftest(signatures_file: Optional[str] = None) -> int:
               f"{tactic_map['total']} checks in "
               f"{sum(1 for t in tactic_map['tactics'] if t['checks'])} tactic(s)")
 
+        # -- technique table part two (v3.1) --------------------------------
+        from . import techniques as tech_mod
+
+        table_failures = []
+        for row in tech_mod.ROWS:
+            fname, text = tech_mod._sample_of(row)
+            names = {f.name for f in ind_mod.analyze(
+                fname, text.encode(), filename=fname)}
+            if row[1] not in names:
+                table_failures.append(row[0])
+        check("techniques: every new check fires on its own trigger sample",
+              not table_failures and len(tech_mod.ROWS) >= 40,
+              f"{len(tech_mod.ROWS)} rows, failed: {table_failures[:3]}")
+
+        dup_ids = {c.id for c in ind_mod.CHECKS}
+        check("techniques: no duplicate ids after folding the table in",
+              len(dup_ids) == len(ind_mod.CHECKS)
+              and len(ind_mod.sample_for("IND2-EXEC-LOLBAS-MAVINJECT") or ()) == 2,
+              f"{len(ind_mod.CHECKS)} checks")
+
         perf_result = perf_mod.run(config=config, files_per_tier=20,
                                    keep_corpus=False)
         check("perf: warm scan served from cache, speedup > 1",

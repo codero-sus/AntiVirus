@@ -5390,7 +5390,9 @@ class IndicatorLibraryTests(unittest.TestCase):
         ids = [check.id for check in indicators.CHECKS]
         self.assertEqual(len(ids), len(set(ids)))
         for check_id in ids:
-            self.assertTrue(check_id.startswith("IND-"), check_id)
+            # v3.1 rows live in techniques.py and carry an IND2- prefix, but
+            # they are the same kind of check: namespaced and unique
+            self.assertTrue(check_id.startswith(("IND-", "IND2-")), check_id)
 
     def test_every_pattern_compiles_and_does_not_match_empty(self):
         import re as re_mod

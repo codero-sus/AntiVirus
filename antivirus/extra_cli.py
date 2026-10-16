@@ -73,6 +73,22 @@ def cmd_indicators(args) -> int:
                 print(f"    {pat}")
         if ind.tags:
             print(f"  tags:     {', '.join(ind.tags)}")
+        sample = ind_mod.sample_for(ind.id)
+        if sample is not None:
+            file_name, text = sample
+            print(f"  sample:   {file_name} (the text this check is tested with)")
+            for line in text.splitlines() or [""]:
+                print(f"    | {line}")
+        return 0
+
+    if getattr(args, "dump_samples", None):
+        from . import techniques as tech_mod
+
+        target = Path(args.dump_samples)
+        written = tech_mod.dump_samples(target)
+        print(paint(f"wrote {len(written)} trigger sample(s) to {target}", BOLD))
+        print("  these are inert marker strings used by the tests and by "
+              "`indicators --show`")
         return 0
 
     checks = ind_mod.list_checks(getattr(args, "category", None))

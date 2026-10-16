@@ -2002,6 +2002,21 @@ _BATCH_4: Tuple[Indicator, ...] = (
 
 CHECKS = CHECKS + _BATCH_4
 
+# --------------------------------------------------------------------------
+# Part two (v3.1): the rows in ``techniques.py``.  They are kept in their own
+# module so this table stays readable, but they are the same kind of check -
+# built by the same ``_i()`` helper, scanned by the same engine, exported by
+# the same YARA/ATT&CK code.
+# --------------------------------------------------------------------------
+from . import techniques as _techniques  # noqa: E402  (table extension)
+
+CHECKS = CHECKS + _techniques.rows_as_indicators(_i)
+
+
+def sample_for(check_id: str):
+    """Trigger sample for a check from the v3.1 table (``None`` otherwise)."""
+    return _techniques.sample_for(check_id)
+
 
 # --------------------------------------------------------------------------
 # Fast path: per-check compiled regexes + a literal-token gate.

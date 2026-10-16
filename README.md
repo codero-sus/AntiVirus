@@ -22,7 +22,7 @@ watches folders for new/changed files, and writes JSON + text reports.
   by binary search. Licence-aware, provenance-tracked, guarded against the
   false positives aggregated feeds are full of, and built by you rather than
   shipped — see [Public threat-intel feeds](#public-threat-intel-feeds).
-- **Technique indicators** (`indicators`) — 301 static checks for how a file
+- **Technique indicators** (`indicators`) — 356 static checks for how a file
   behaves, independent of any specific malware: LOLBins, persistence,
   defence evasion, credential access, C2, ransomware impact, Office macros
   and file-name tricks. `antivirus indicators --category evasion` lists them,
@@ -1145,7 +1145,7 @@ python3 -m antivirus matrix          # checks per tactic, severity mix, top tags
 python3 -m antivirus matrix --tag lolbin
 ```
 
-301 checks across 8 tactics; the table is generated from the library, and the
+356 checks across 8 tactics; the table is generated from the library, and the
 self test asserts that **no check is unmapped** to a tactic.
 
 ### YARA export (`antivirus yara`)
@@ -1174,15 +1174,35 @@ EICAR string, and does not match random data.
 * **ATT&CK matrix** — `antivirus matrix` groups all 301 checks by tactic.
 * **YARA export** — `antivirus yara` converts this detection content into a
   portable ruleset (532 rules, compiled with yara-python 4.5.4).
-* **Indicator library: 89 → 301 checks** (execution 68, evasion 66,
+* **Indicator library: 89 → 356 checks** (execution 68, evasion 66,
   persistence 46, credential 32, exfil 27, lateral 25, impact 25, Office 12),
   each with a description and tags.
 * **Feed database: 9 → 23 sources, 2.8 M → 4.8 M indicators**, five new
   parsers (adblock, URL-hosts, IP-with-count, TweetFeed CSV, wildcard
   domains), tiered severities, and the trusted-host + private-address guards
   described above.
-* **Tests**: 339 unit tests (was 293) plus 82 self-test checks, covering the
+* **Tests**: 350 unit tests (was 293) plus 84 self-test checks, covering the
   new parsers, the allowlist, YARA conversion and the FP harness.
+
+## What's new in v3.1
+
+* **Technique table, part two** (`antivirus/techniques.py`) — 55 more checks
+  in the same format as the first 301, covering modern signed-binary abuse
+  (mavinject, xwizard, wsreset, sqlps, `wsl bash -c`, dllhost, csc,
+  aspnet_compiler, cl_loaddll, makecab, rasphone), the MSDT/`search-ms`
+  protocol handlers, Linux and container execution (`nsenter`, `unshare`,
+  `/dev/shm`, compile-on-host, mounted `docker.sock`), sandbox/anti-debug
+  evasion (uptime, cursor, foreground window, hardware breakpoints,
+  self-checksum, hook scanning), hand-written AMSI/ETW patching, and
+  injection primitives (APC queue, section mapping, thread hijack, atom
+  bombing).
+* **Trigger samples are part of the data.**  Each row carries the snippet it
+  must detect; `antivirus indicators --show ID` prints it,
+  `--dump-samples DIR` exports the whole corpus, and
+  `tests/test_techniques.py` fails if a check stops firing on its own sample,
+  matches empty text, or merely restates an existing check.
+* Library totals: **356 checks** (execution 126, evasion 66, persistence 46,
+  credential 32, exfil 27, lateral 25, impact 25, office 12).
 
 ## What's new in v2.8
 
@@ -1219,7 +1239,7 @@ EICAR string, and does not match random data.
 | `feeds build [--source ID]… [--all] [--limit N] [--max-patterns N] [--json]` | Fetch, convert and index public feeds into `data/feeds/` (default: licence-safe sources only) |
 | `feeds import-clamav FILE` | Import a local ClamAV database (`.hdb`/`.hsb`/`.ndb`/`.cvd`/`.cld`) |
 | `feeds stats` / `feeds audit` / `feeds verify` / `feeds clear` | Inspect / provenance + licence report / consistency check / delete the feed database |
-| `indicators [--category C] [--show ID] [--json]` | List the 301 technique-indicator checks |
+| `indicators [--category C] [--show ID] [--dump-samples DIR] [--json]` | List the 356 technique-indicator checks (`--show` prints the check's trigger sample) |
 | `matrix [--tag TAG] [--json]` | ATT&CK coverage view: checks per tactic, severity mix, top tags |
 | `allowlist list\|add\|remove\|clear\|check\|export\|import\|from-findings\|audit` | False-positive allowlist (hashes, names, paths, domains), audited and counted |
 | `fpcheck [--blobs N] [--size KiB] [--min-severity S] [--json]` | False-positive audit: random blobs + realistic clean corpus; exits non-zero on a hit |

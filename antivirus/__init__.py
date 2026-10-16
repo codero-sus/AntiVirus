@@ -75,7 +75,15 @@ Features
   skipped and counted, never approximated
 * ATT&CK coverage view (v3.0): `antivirus matrix` groups every indicator by
   tactic with severity mix, top tags and gaps
-* Technique indicators (v2.8): 301 static checks (LOLBins, persistence,
+* Technique table, part two (v3.1): 55 more checks - modern LOLBins
+  (mavinject, xwizard, wsreset, sqlps, wsl, dllhost, csc, aspnet_compiler),
+  MSDT/search-ms URI handlers, Linux and container execution (nsenter,
+  /dev/shm, compile-on-host, docker.sock), sandbox and anti-debug evasion,
+  AMSI/ETW patching by hand, and injection primitives (APC, section mapping,
+  thread hijack).  Every row carries a trigger sample: `indicators --show ID`
+  prints it, `indicators --dump-samples DIR` exports the corpus, and the test
+  suite proves each check fires on its own sample
+* Technique indicators (v2.8): 356 static checks (LOLBins, persistence,
   evasion, credential access, C2, ransomware impact, Office macros,
   file-name tricks) - `antivirus indicators`
 * User rules (v2.8): YARA-lite patterns and file-name globs managed with
@@ -112,7 +120,7 @@ Everything is standard library only (Tkinter/curses are optional and used
 only by their respective front-ends).
 """
 
-__version__ = "3.0.0"
+__version__ = "3.1.0"
 
 from .api import (  # noqa: E402
     Antivirus,

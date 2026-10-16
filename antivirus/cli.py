@@ -2368,6 +2368,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--show", default=None, metavar="ID",
                    help="explain one check by id")
     p.add_argument("--json", action="store_true", help="machine readable")
+    p.add_argument("--dump-samples", default=None, metavar="DIR",
+                   help="write the trigger sample for every v3.1 check")
 
     p = sub.add_parser("rules", help="user-defined detection rules (YARA-lite)")
     rsub2 = p.add_subparsers(dest="raction", required=True)
