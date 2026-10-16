@@ -22,7 +22,7 @@ watches folders for new/changed files, and writes JSON + text reports.
   by binary search. Licence-aware, provenance-tracked, guarded against the
   false positives aggregated feeds are full of, and built by you rather than
   shipped — see [Public threat-intel feeds](#public-threat-intel-feeds).
-- **Technique indicators** (`indicators`) — 452 static checks for how a file
+- **Technique indicators** (`indicators`) — 507 static checks for how a file
   behaves, independent of any specific malware: LOLBins, persistence,
   defence evasion, credential access, C2, ransomware impact, Office macros
   and file-name tricks. `antivirus indicators --category evasion` lists them,
@@ -1138,6 +1138,25 @@ result: **0 false positives in 457 clean files**. This is the gate every new
 check has to pass; it is how the loopback-URL and packaging-marker false
 positives in this release were found and fixed.
 
+### Prefilter soundness (`antivirus/prefilter.py`)
+
+Every pattern is gated by the literal runs it cannot match without, so the
+scanner runs regexes only for plausible files. That gate has to be a
+*necessary* condition: a token list that is wrong silently deletes
+detections. It used to be derived by scanning the pattern text for long
+literal runs, which is wrong as soon as an alternation has a short-literal
+branch - ``gh[psouhr]_[A-Za-z0-9]{20,}|github_pat_...`` only yielded
+``github_pat_``, so every ``ghp_``-style token was gated out, and
+``id_(?:rsa|ed25519|ecdsa)`` only yielded the two long spellings, so
+``id_rsa`` was skipped. The extractor now walks the parsed pattern: a
+sequence contributes its weakest required member, an alternation contributes
+the union of its branches *only when every branch has a token*, optional
+parts and negative lookarounds contribute nothing, and positive lookaheads
+do. Six shipped patterns that could previously be skipped were repaired this
+way, `prefilter.sample_strings()` builds a matching witness per pattern so
+the property can be tested, and `tests/test_prefilter.py` plus a self-test
+check fail if any check is ever gated out of a buffer it matches.
+
 ### ATT&CK coverage (`antivirus matrix`)
 
 ```bash
@@ -1145,7 +1164,7 @@ python3 -m antivirus matrix          # checks per tactic, severity mix, top tags
 python3 -m antivirus matrix --tag lolbin
 ```
 
-452 checks across 8 tactics; the table is generated from the library, and the
+507 checks across 8 tactics; the table is generated from the library, and the
 self test asserts that **no check is unmapped** to a tactic.
 
 ### YARA export (`antivirus yara`)
@@ -1183,6 +1202,28 @@ EICAR string, and does not match random data.
   described above.
 * **Tests**: 350 unit tests (was 293) plus 84 self-test checks, covering the
   new parsers, the allowlist, YARA conversion and the FP harness.
+
+## What's new in v3.3
+
+* **55 further checks** (452 → **507**): the prefilter fix described below
+  also repaired the gate for several of them, and the duplicate rule deleted
+  26 more rows that only restated a shipped check (`installutil`, `pnputil`,
+  `Set-MpPreference`, `DDEAUTO`, `xllAutoOpen`, `at`, `.git/hooks`,
+  systemd timers, onion addresses, …).
+* **Silent-miss bug in the literal prefilter, fixed.** Long literal runs were
+  collected from the raw pattern text, so an alternation whose short branch
+  had no long run lost its guarantee: `ghp_…` tokens, `id_rsa`, `dnscat`,
+  `ftp -s:`, `RUN+=`, and UNC admin shares could be gated out of a buffer
+  they match. The extractor now walks the parsed pattern and returns a token
+  set that *every* match must contain (union across alternation branches, and
+  no gate at all when a branch guarantees nothing). Six shipped patterns were
+  repaired, and a new test plus a self-test check fail if any check is ever
+  skipped again.
+* **`prefilter.sample_strings()`** builds a matching witness string for a
+  pattern, which is what makes that soundness property testable.
+* Library totals: **507 checks** (execution 131, persistence 115,
+  credential 86, evasion 73, exfil 33, lateral 29, impact 28, office 12),
+  357 unit tests and 86 self-test checks.
 
 ## What's new in v3.2
 
@@ -1269,7 +1310,7 @@ EICAR string, and does not match random data.
 | `feeds build [--source ID]… [--all] [--limit N] [--max-patterns N] [--json]` | Fetch, convert and index public feeds into `data/feeds/` (default: licence-safe sources only) |
 | `feeds import-clamav FILE` | Import a local ClamAV database (`.hdb`/`.hsb`/`.ndb`/`.cvd`/`.cld`) |
 | `feeds stats` / `feeds audit` / `feeds verify` / `feeds clear` | Inspect / provenance + licence report / consistency check / delete the feed database |
-| `indicators [--category C] [--show ID] [--dump-samples DIR] [--json]` | List the 452 technique-indicator checks (`--show` prints the check's trigger sample) |
+| `indicators [--category C] [--show ID] [--dump-samples DIR] [--json]` | List the 507 technique-indicator checks (`--show` prints the check's trigger sample) |
 | `matrix [--tag TAG] [--json]` | ATT&CK coverage view: checks per tactic, severity mix, top tags |
 | `allowlist list\|add\|remove\|clear\|check\|export\|import\|from-findings\|audit` | False-positive allowlist (hashes, names, paths, domains), audited and counted |
 | `fpcheck [--blobs N] [--size KiB] [--min-severity S] [--json]` | False-positive audit: random blobs + realistic clean corpus; exits non-zero on a hit |

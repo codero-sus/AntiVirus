@@ -25,6 +25,8 @@ case-sensitive simply get a superset of candidates.
 """
 from __future__ import annotations
 
+import re
+
 from typing import Dict, Iterable, List, Sequence, Tuple
 
 #: Shortest literal run considered worth a token.
@@ -37,19 +39,190 @@ _SAFE = set("abcdefghijklmnopqrstuvwxyz"
 
 
 def pattern_runs(pattern: str, min_len: int = DEFAULT_MIN_LEN) -> List[str]:
-    """Literal runs of at least *min_len* characters inside *pattern*.
+    """Literal runs that **every** match of *pattern* must contain.
+
+    The result is a disjunction: a match implies at least one of the returned
+    tokens is present in the buffer, which is what makes gating safe.  A
+    pattern with no such token returns ``[]`` and is therefore never gated
+    out.
+
+    Structure matters, not just characters.  ``ghp_[A-Za-z0-9]{20,}`` has a
+    literal run of only three characters, so in ``gh[psouhr]_…|github_pat_…``
+    the first branch guarantees *nothing* — scanning the whole pattern for
+    long runs used to yield only ``github_pat_`` and silently skip every
+    ``ghp_``-style token.  The extractor therefore walks the parsed pattern:
+
+    * a sequence yields the best requirement of its members (a match has to
+      satisfy all of them),
+    * an alternation yields the union of its branches, but only when *every*
+      branch guarantees a token,
+    * optional parts (``{0,n}``, ``?``, ``*``) and negative lookarounds
+      guarantee nothing, while positive lookaheads do,
+    * case-insensitive patterns get a superset of candidates, so their tokens
+      are compared lower-cased.
 
     Understands escapes (``\\.`` → ``.``), scoped-flag groups (``(?i:…)``),
     named groups, character classes and non-literal escapes (``\\d``,
-    ``\\x41``, ``\\b``); a run stops at any regex metacharacter.  Runs are
-    returned lower-cased.  When nothing reaches *min_len*, the longest run of
-    at least 3 characters is returned instead (short but still distinctive
-    markers such as ``IEX``).
+    ``\\x41``, ``\\b``).  When nothing reaches *min_len*, runs of at least 3
+    characters are used instead (short but still distinctive markers such as
+    ``IEX``).
     """
-    runs = _runs(pattern, min_len)
-    if not runs and min_len > 3:
-        runs = _runs(pattern, 3)
-    return runs
+    parsed = _parse(pattern)
+    if parsed is not None:
+        runs = _sequence_runs(parsed, min_len)
+        if not runs and min_len > 3:
+            runs = _sequence_runs(parsed, 3)
+        return runs
+    # parsing unavailable: fall back to the textual scan, but keep it sound
+    # for alternations - every branch has to produce a token of its own
+    branches = _split_top_level(pattern)
+    if len(branches) > 1:
+        collected: List[str] = []
+        for branch in branches:
+            inner = _runs(branch, min_len) or _runs(branch, 3)
+            if not inner:
+                return []
+            collected.extend(inner)
+        return collected
+    return _runs(pattern, min_len) or _runs(pattern, 3)
+
+
+def _parse(pattern: str):
+    """Parse *pattern* with the stdlib regex parser, or return ``None``."""
+    for module_name in ("re._parser", "sre_parse"):
+        try:
+            module = __import__(module_name, fromlist=["parse"])
+            return module.parse(pattern, 0)
+        except Exception:                      # pragma: no cover - defensive
+            continue
+    return None                            # pragma: no cover - defensive
+
+
+def _split_top_level(pattern: str) -> List[str]:
+    """Split *pattern* on ``|`` outside character classes (fallback path)."""
+    out: List[str] = []
+    current: List[str] = []
+    in_class = False
+    i, n = 0, len(pattern)
+    while i < n:
+        ch = pattern[i]
+        if ch == "\\" and i + 1 < n:
+            current.append(pattern[i:i + 2])
+            i += 2
+            continue
+        if in_class:
+            if ch == "]":
+                in_class = False
+            current.append(ch)
+            i += 1
+            continue
+        if ch == "[":
+            in_class = True
+            current.append(ch)
+            i += 1
+            continue
+        if ch == "|":
+            out.append("".join(current))
+            current = []
+            i += 1
+            continue
+        current.append(ch)
+        i += 1
+    out.append("".join(current))
+    return out
+
+
+def _op_name(op) -> str:
+    """Name of a parsed opcode.
+
+    The stdlib constants are small integers whose values collide across the
+    ``AT``/``OPCODES`` enumerations, so names - not values - decide what a
+    node is.
+    """
+    name = getattr(op, "name", None)
+    if isinstance(name, str):
+        return name
+    for module_name in ("re._constants", "sre_constants"):
+        try:
+            module = __import__(module_name, fromlist=["LITERAL"])
+        except Exception:                      # pragma: no cover - defensive
+            continue
+        for attr in dir(module):
+            if attr.isupper() and getattr(module, attr) is op:
+                return attr
+    return ""
+
+
+def _sequence_runs(items, min_len: int) -> List[str]:
+    """Best guaranteed token set for a parsed pattern sequence."""
+    best: List[str] = []
+    index, total = 0, len(items)
+    while index < total:
+        op, value = items[index]
+        if _op_name(op) == "LITERAL":
+            # merge adjacent literals: "github_pat_" is one run, not eleven
+            chars = []
+            while (index < total
+                   and _op_name(items[index][0]) == "LITERAL"):
+                chars.append(chr(items[index][1]))
+                index += 1
+            if len(chars) >= min_len:
+                best = ["".join(chars).lower()]
+            continue
+        index += 1
+        runs = _node_runs(op, value, min_len)
+        if runs and _stronger(runs, best):
+            best = runs
+    return best
+
+
+def _strength(tokens: Sequence[str]) -> Tuple[int, int]:
+    """Gate strength: the shortest token is the weakest link."""
+    if not tokens:
+        return (0, 0)
+    lengths = [len(token) for token in tokens]
+    return (min(lengths), sum(lengths))
+
+
+def _stronger(candidate: Sequence[str], current: Sequence[str]) -> bool:
+    """True when *candidate* gates at least as tightly as *current*."""
+    return _strength(candidate) > _strength(current)
+
+
+def _node_runs(op, value, min_len: int) -> List[str]:
+    """Guaranteed tokens for one parsed node (``[]`` = none)."""
+    name = _op_name(op)
+    if name in ("LITERAL", "NOT_LITERAL", "IN", "ANY", "CATEGORY", "AT",
+                "GROUPREF"):
+        return []
+    if name in ("MAX_REPEAT", "MIN_REPEAT", "POSSESSIVE_REPEAT", "SUBPATTERN",
+                "GROUP", "ASSERT", "ASSERT_NOT"):
+        if name in ("MAX_REPEAT", "MIN_REPEAT", "POSSESSIVE_REPEAT"):
+            low, _high, inner = value
+            if low == 0:                       # optional: guarantees nothing
+                return []
+            return _sequence_runs(inner, min_len)
+        if name in ("ASSERT", "ASSERT_NOT"):
+            _direction, inner = value
+            if name == "ASSERT_NOT":           # negative: guarantees nothing
+                return []
+            return _sequence_runs(inner, min_len)
+        if name == "SUBPATTERN":
+            return _sequence_runs(value[-1], min_len)
+        return _sequence_runs(value, min_len)
+    if name == "BRANCH":
+        _marker, branches = value
+        collected: List[str] = []
+        for branch in branches:
+            runs = _sequence_runs(branch, min_len)
+            if not runs:                       # a branch with no token means
+                return []                      # the whole alternation is ungated
+            collected.extend(runs)
+        return collected
+    return []
+
+
+
 
 
 def _runs(pattern: str, min_len: int) -> List[str]:
@@ -134,6 +307,76 @@ def _runs(pattern: str, min_len: int) -> List[str]:
         i += 1
     flush()
     return runs
+
+
+
+
+#: How many branch combinations are generated per pattern.
+WITNESS_LIMIT = 6
+#: How many repetitions of a repeated element a witness contains.
+REPEAT_CAP = 3
+
+
+def _node_samples(op, value):
+    """Witness strings for one parsed node (may be empty)."""
+    name = _op_name(op)
+    if name == "LITERAL":
+        return [chr(value)]
+    if name == "NOT_LITERAL":
+        return ["a"] if value != ord("a") else ["b"]
+    if name == "IN":
+        for entry in value:
+            if _op_name(entry[0]) == "LITERAL":
+                char = chr(entry[1])
+                return [char]
+        return ["a"]
+    if name in ("ANY", "CATEGORY", "GROUPREF"):
+        return ["a"]
+    if name == "AT":
+        return [""]
+    if name == "BRANCH":
+        _marker, branches = value
+        out = []
+        for branch in branches:
+            out.extend(_sequence_samples(branch))
+        return out or [""]
+    if name == "SUBPATTERN":
+        return _sequence_samples(value[-1]) or [""]
+    if name in ("MAX_REPEAT", "MIN_REPEAT", "POSSESSIVE_REPEAT"):
+        low, _high, inner = value
+        piece = _sequence_samples(inner) or [""]
+        count = min(low, REPEAT_CAP)
+        return [piece[0] * count] if count else [""]
+    if name in ("ASSERT", "ASSERT_NOT"):
+        return [""]
+    return [""]
+
+
+def _sequence_samples(items, limit: int = WITNESS_LIMIT):
+    """One witness string per combination of alternation branches."""
+    out = [""]
+    for op, value in items:
+        pieces = _node_samples(op, value)
+        out = [head + piece for head in out for piece in pieces][:limit]
+        if not out:
+            return []
+    return out
+
+
+def sample_strings(pattern: str, limit: int = WITNESS_LIMIT):
+    """Strings that *pattern* is expected to match (best effort).
+
+Built by walking the parsed pattern and taking one value per
+alternative, so callers can check what a pattern really requires
+of the bytes it claims to match.
+"""
+    parsed = _parse(pattern)
+    if parsed is None:                         # pragma: no cover - defensive
+        return []
+    out = [witness for witness in _sequence_samples(parsed, limit)
+           if witness and re.search(pattern, witness, re.IGNORECASE)]
+    return list(dict.fromkeys(out))[:limit]
+
 
 
 class Prefilter:

@@ -804,6 +804,37 @@ def run_selftest(signatures_file: Optional[str] = None) -> int:
               and len(ind_mod.sample_for("IND2-EXEC-LOLBAS-MAVINJECT") or ()) == 2,
               f"{len(ind_mod.CHECKS)} checks")
 
+        coverage_failures = []
+        for row in tech_mod.ROWS:
+            fname, text = tech_mod._sample_of(row)
+            others = {f.name for f in ind_mod.analyze(
+                fname, text.encode(), filename=fname) if f.name != row[1]}
+            if others:
+                coverage_failures.append((row[0], sorted(others)[:2]))
+        check("techniques: every new check adds coverage, none restates",
+              not coverage_failures,
+              f"{len(tech_mod.ROWS)} rows, duplicates: {coverage_failures[:3]}")
+
+        # -- prefilter soundness (v3.2) -------------------------------------
+        from . import prefilter as pf_mod
+
+        gate_failures = []
+        witnesses_checked = 0
+        for ind in ind_mod.CHECKS:
+            for pattern in ind.patterns or ():
+                tokens = pf_mod.pattern_runs(pattern)
+                if not tokens:                 # ungated: always tested
+                    continue
+                for sample in pf_mod.sample_strings(pattern):
+                    witnesses_checked += 1
+                    if not any(token in sample.lower() for token in tokens):
+                        gate_failures.append((ind.id, pattern, sample))
+                        break
+        check("prefilter: no check is gated out of a buffer it matches",
+              not gate_failures and witnesses_checked > 20,
+              f"{witnesses_checked} witness string(s), failures: "
+              f"{gate_failures[:2]}")
+
         perf_result = perf_mod.run(config=config, files_per_tier=20,
                                    keep_corpus=False)
         check("perf: warm scan served from cache, speedup > 1",
