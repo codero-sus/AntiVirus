@@ -22,7 +22,7 @@ watches folders for new/changed files, and writes JSON + text reports.
   by binary search. Licence-aware, provenance-tracked, guarded against the
   false positives aggregated feeds are full of, and built by you rather than
   shipped — see [Public threat-intel feeds](#public-threat-intel-feeds).
-- **Technique indicators** (`indicators`) — 542 static checks for how a file
+- **Technique indicators** (`indicators`) — 575 static checks for how a file
   behaves, independent of any specific malware: LOLBins, persistence,
   defence evasion, credential access, C2, ransomware impact, Office macros
   and file-name tricks. `antivirus indicators --category evasion` lists them,
@@ -1164,7 +1164,7 @@ python3 -m antivirus matrix          # checks per tactic, severity mix, top tags
 python3 -m antivirus matrix --tag lolbin
 ```
 
-542 checks across 8 tactics; the table is generated from the library, and the
+575 checks across 8 tactics; the table is generated from the library, and the
 self test asserts that **no check is unmapped** to a tactic.
 
 ### YARA export (`antivirus yara`)
@@ -1202,6 +1202,27 @@ EICAR string, and does not match random data.
   described above.
 * **Tests**: 350 unit tests (was 293) plus 84 self-test checks, covering the
   new parsers, the allowlist, YARA conversion and the FP harness.
+
+## What's new in v3.5
+
+* **33 further checks** (542 → **575**) after the duplicate rule deleted five
+  more candidate rows (`rundll32 javascript:`, the amsi.dll patch,
+  `CryptUnprotectData`, and one Azure row that a sibling already covered).
+* New coverage: package-manager abuse (`dotnet tool install --add-source`,
+  `nuget sources add`, `gem install --source`, `gradle --init-script`,
+  `deno run https://…`, `bun add <url>`), webshell primitives
+  (`Runtime.getRuntime().exec`, `Process.Start(Request…)`), interpreter
+  escapes (`awk system()`, `find -exec`, `tar --checkpoint-action`),
+  filename evasion (U+202E override, double extension, NTFS alternate data
+  streams), credential APIs (`CredRead`, an AWS key id literal, PEM private
+  key blocks), the X/Twitter API as a channel, storage destruction
+  (`rm --no-preserve-root`, `zfs destroy -r`, `lvremove -f`,
+  `mdadm --zero-superblock`, forced reboot) and cloud/Office persistence
+  (lambda layers, Azure webjobs, `gcloud functions deploy`, IIS
+  `applicationInitialization`, the Excel `OPEN` key).
+* Library totals: **575 checks** (execution 150, persistence 125,
+  credential 94, evasion 82, exfil 37, lateral 33, impact 38, office 16),
+  357 unit tests, 86 self-test checks, 32 MB of random data with 0 findings.
 
 ## What's new in v3.4
 
@@ -1334,7 +1355,7 @@ EICAR string, and does not match random data.
 | `feeds build [--source ID]… [--all] [--limit N] [--max-patterns N] [--json]` | Fetch, convert and index public feeds into `data/feeds/` (default: licence-safe sources only) |
 | `feeds import-clamav FILE` | Import a local ClamAV database (`.hdb`/`.hsb`/`.ndb`/`.cvd`/`.cld`) |
 | `feeds stats` / `feeds audit` / `feeds verify` / `feeds clear` | Inspect / provenance + licence report / consistency check / delete the feed database |
-| `indicators [--category C] [--show ID] [--dump-samples DIR] [--json]` | List the 542 technique-indicator checks (`--show` prints the check's trigger sample) |
+| `indicators [--category C] [--show ID] [--dump-samples DIR] [--json]` | List the 575 technique-indicator checks (`--show` prints the check's trigger sample) |
 | `matrix [--tag TAG] [--json]` | ATT&CK coverage view: checks per tactic, severity mix, top tags |
 | `allowlist list\|add\|remove\|clear\|check\|export\|import\|from-findings\|audit` | False-positive allowlist (hashes, names, paths, domains), audited and counted |
 | `fpcheck [--blobs N] [--size KiB] [--min-severity S] [--json]` | False-positive audit: random blobs + realistic clean corpus; exits non-zero on a hit |
