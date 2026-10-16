@@ -120,7 +120,7 @@ Everything is standard library only (Tkinter/curses are optional and used
 only by their respective front-ends).
 """
 
-__version__ = "3.1.0"
+__version__ = "3.2.0"
 
 from .api import (  # noqa: E402
     Antivirus,

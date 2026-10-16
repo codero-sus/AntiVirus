@@ -55,7 +55,9 @@ class TechniqueRowTests(unittest.TestCase):
             self.assertTrue(file_name, check_id)
             self.assertGreater(len(text), 5, check_id)
             for pattern in patterns:
-                compiled = re.compile(pattern)      # must compile
+                # the library compiles every pattern with re.IGNORECASE, so
+                # the syntax/firing checks must use the same flag
+                compiled = re.compile(pattern, re.IGNORECASE)
                 self.assertIsNone(compiled.search(""),
                                   f"{check_id}: matches empty text")
                 self.assertIsNotNone(compiled.search(text),
@@ -67,6 +69,22 @@ class TechniqueRowTests(unittest.TestCase):
             file_name, text = techniques._sample_of(row)
             names = {f.name for f in _scan(file_name, text)}
             self.assertIn(name, names, f"{check_id} did not fire")
+
+    def test_every_row_adds_coverage_over_the_rest_of_the_library(self):
+        """No row may be a synonym: nothing else may fire on its own sample.
+
+        If a shipped check - or a sibling row - already catches a row's
+        trigger sample, that row is duplicate coverage.  Those rows are
+        deleted rather than counted as new improvements.
+        """
+        duplicate = {}
+        for row in techniques.ROWS:
+            file_name, text = techniques._sample_of(row)
+            others = {f.name for f in _scan(file_name, text) if f.name != row[1]}
+            if others:
+                duplicate[row[0]] = sorted(others)
+        self.assertEqual(duplicate, {},
+                         f"rows that add no coverage: {duplicate}")
 
     def test_samples_do_not_mass_flag_other_checks(self):
         """Samples are small; more than a handful of hits means a loose check."""

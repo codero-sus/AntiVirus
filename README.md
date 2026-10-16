@@ -22,7 +22,7 @@ watches folders for new/changed files, and writes JSON + text reports.
   by binary search. Licence-aware, provenance-tracked, guarded against the
   false positives aggregated feeds are full of, and built by you rather than
   shipped — see [Public threat-intel feeds](#public-threat-intel-feeds).
-- **Technique indicators** (`indicators`) — 356 static checks for how a file
+- **Technique indicators** (`indicators`) — 452 static checks for how a file
   behaves, independent of any specific malware: LOLBins, persistence,
   defence evasion, credential access, C2, ransomware impact, Office macros
   and file-name tricks. `antivirus indicators --category evasion` lists them,
@@ -1145,7 +1145,7 @@ python3 -m antivirus matrix          # checks per tactic, severity mix, top tags
 python3 -m antivirus matrix --tag lolbin
 ```
 
-356 checks across 8 tactics; the table is generated from the library, and the
+452 checks across 8 tactics; the table is generated from the library, and the
 self test asserts that **no check is unmapped** to a tactic.
 
 ### YARA export (`antivirus yara`)
@@ -1183,6 +1183,36 @@ EICAR string, and does not match random data.
   described above.
 * **Tests**: 350 unit tests (was 293) plus 84 self-test checks, covering the
   new parsers, the allowlist, YARA conversion and the FP harness.
+
+## What's new in v3.2
+
+* **Technique table, part three** — 96 further checks (356 → **452**), aimed at
+  the parts of the kill chain the first two rounds under-covered: 67
+  persistence rows (AppCertDlls, KnownDLLs, App Paths, Winlogon notify,
+  SafeBoot shell, hidden scheduled tasks, shim databases, IIS modules and
+  ISAPI filters, Exchange transport agents, task COM handlers, RDP startup
+  programs, D-Bus/XDG/systemd units, `PROMPT_COMMAND`, `PYTHONSTARTUP`,
+  VS Code folder-open tasks, `build.rs`, cloud-init, k8s DaemonSets and
+  CronJobs, docker restart policies, AWS/GCP/Azure hooks, CI runners,
+  `mofcomp`, GPO immediate tasks, MSSQL/Oracle/PostgreSQL/MySQL jobs) and 29
+  credential rows that the shipped checks did not already catch (WDigest,
+  `CachedLogonsCount`, KeePass, Bitwarden, `DPAPI_SYSTEM`, DSRM, gMSA, LAPS
+  attributes, autologon, AWS/Azure/GCP key material, cluster and registry
+  secrets, WSL `/proc/<pid>/mem`, PAM harvesting, WebCache).
+* **Duplicate rows are deleted, not counted.** `tests/test_techniques.py` now
+  refuses to ship a row whose own trigger sample is *also* caught by another
+  check — during this round that rule deleted 27 rows that only restated an
+  existing check (`xp_cmdshell`, `@reboot`, `vaultcmd`, `MiniDumpWriteDump`,
+  `GetAsyncKeyState`, `secretsdump.py`, …). The count above is what survived.
+* **False positive found and fixed by the harness.** The new `.env` reader
+  check flagged a benign `app.py` because `.env` is a substring of
+  `os.environ`; the pattern now needs a word boundary, and the reverse order
+  needs a file-read verb. `fpcheck` is clean again (457 files, 0 hits).
+* The cloud-init check used to require its two keywords on one line; it now
+  spans the real multi-line YAML shape of a `#cloud-config` payload.
+* Library totals: **452 checks** (persistence 113, execution 112,
+  credential 72, evasion 66, exfil 27, lateral 25, impact 25, office 12),
+  351 unit tests and 84 self-test checks.
 
 ## What's new in v3.1
 
@@ -1239,7 +1269,7 @@ EICAR string, and does not match random data.
 | `feeds build [--source ID]… [--all] [--limit N] [--max-patterns N] [--json]` | Fetch, convert and index public feeds into `data/feeds/` (default: licence-safe sources only) |
 | `feeds import-clamav FILE` | Import a local ClamAV database (`.hdb`/`.hsb`/`.ndb`/`.cvd`/`.cld`) |
 | `feeds stats` / `feeds audit` / `feeds verify` / `feeds clear` | Inspect / provenance + licence report / consistency check / delete the feed database |
-| `indicators [--category C] [--show ID] [--dump-samples DIR] [--json]` | List the 356 technique-indicator checks (`--show` prints the check's trigger sample) |
+| `indicators [--category C] [--show ID] [--dump-samples DIR] [--json]` | List the 452 technique-indicator checks (`--show` prints the check's trigger sample) |
 | `matrix [--tag TAG] [--json]` | ATT&CK coverage view: checks per tactic, severity mix, top tags |
 | `allowlist list\|add\|remove\|clear\|check\|export\|import\|from-findings\|audit` | False-positive allowlist (hashes, names, paths, domains), audited and counted |
 | `fpcheck [--blobs N] [--size KiB] [--min-severity S] [--json]` | False-positive audit: random blobs + realistic clean corpus; exits non-zero on a hit |
