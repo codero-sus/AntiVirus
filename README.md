@@ -22,7 +22,7 @@ watches folders for new/changed files, and writes JSON + text reports.
   by binary search. Licence-aware, provenance-tracked, guarded against the
   false positives aggregated feeds are full of, and built by you rather than
   shipped — see [Public threat-intel feeds](#public-threat-intel-feeds).
-- **Technique indicators** (`indicators`) — 575 static checks for how a file
+- **Technique indicators** (`indicators`) — 603 static checks for how a file
   behaves, independent of any specific malware: LOLBins, persistence,
   defence evasion, credential access, C2, ransomware impact, Office macros
   and file-name tricks. `antivirus indicators --category evasion` lists them,
@@ -1164,7 +1164,7 @@ python3 -m antivirus matrix          # checks per tactic, severity mix, top tags
 python3 -m antivirus matrix --tag lolbin
 ```
 
-575 checks across 8 tactics; the table is generated from the library, and the
+603 checks across 8 tactics; the table is generated from the library, and the
 self test asserts that **no check is unmapped** to a tactic.
 
 ### YARA export (`antivirus yara`)
@@ -1202,6 +1202,27 @@ EICAR string, and does not match random data.
   described above.
 * **Tests**: 350 unit tests (was 293) plus 84 self-test checks, covering the
   new parsers, the allowlist, YARA conversion and the FP harness.
+
+## What's new in v3.6
+
+* **28 further checks** (575 → **603**); six more candidate rows were deleted
+  by the duplicate rule (`sp_OACreate`, the WSL `[boot]` command, a Word
+  add-in key, and three rows whose patterns were mis-escaped).
+* New coverage: script-runtime droppers (`ADODB.Stream`,
+  `Scripting.FileSystemObject`), cmd caret obfuscation, `runas /savecred`,
+  `wmic` remote XSL stylesheets, database engine abuse (`load_extension`,
+  `INTO DUMPFILE`, Oracle `CREATE JAVA SOURCE`), remote container/CI contexts
+  (`docker build <url>`, `kubectl apply -f <url>`), anti-forensic file
+  handling (`attrib +h +s`, `chattr -i`, `ThreatDefaultAction Allow`,
+  `Clear-RecycleBin`), credential material (PGP private keys, LSA secrets
+  path, SAM hive copies, `ImpersonateLoggedOnUser`), cloud exfiltration
+  channels (gists, S3 `put_object`, Azure SAS URLs, presigned S3 URLs),
+  storage destruction (S3 lifecycle expiry, `DROP TABLE`, `Remove-WebSite`)
+  and persistence (USB `autorun.inf`, a PAM `pam_permit.so` backdoor).
+* Library totals: **603 checks** (execution 160, persistence 127,
+  credential 98, evasion 87, exfil 41, lateral 33, impact 41, office 16),
+  357 unit tests, 86 self-test checks, 187-file FP audit clean, 32 MB of
+  random data with 0 findings.
 
 ## What's new in v3.5
 
@@ -1355,7 +1376,7 @@ EICAR string, and does not match random data.
 | `feeds build [--source ID]… [--all] [--limit N] [--max-patterns N] [--json]` | Fetch, convert and index public feeds into `data/feeds/` (default: licence-safe sources only) |
 | `feeds import-clamav FILE` | Import a local ClamAV database (`.hdb`/`.hsb`/`.ndb`/`.cvd`/`.cld`) |
 | `feeds stats` / `feeds audit` / `feeds verify` / `feeds clear` | Inspect / provenance + licence report / consistency check / delete the feed database |
-| `indicators [--category C] [--show ID] [--dump-samples DIR] [--json]` | List the 575 technique-indicator checks (`--show` prints the check's trigger sample) |
+| `indicators [--category C] [--show ID] [--dump-samples DIR] [--json]` | List the 603 technique-indicator checks (`--show` prints the check's trigger sample) |
 | `matrix [--tag TAG] [--json]` | ATT&CK coverage view: checks per tactic, severity mix, top tags |
 | `allowlist list\|add\|remove\|clear\|check\|export\|import\|from-findings\|audit` | False-positive allowlist (hashes, names, paths, domains), audited and counted |
 | `fpcheck [--blobs N] [--size KiB] [--min-severity S] [--json]` | False-positive audit: random blobs + realistic clean corpus; exits non-zero on a hit |
