@@ -26,6 +26,7 @@ from __future__ import annotations
 import fnmatch
 import gzip
 import hashlib
+import errno
 import io
 import json
 import os
@@ -134,6 +135,13 @@ class ScanResult:
             "findings": [f.to_dict() for f in self.findings],
             "clean": self.clean,
         }
+
+
+def _snapshot_key(st: os.stat_result) -> Tuple[int, int, int, int, int]:
+    """Fields that identify a stable file object and content-size snapshot."""
+    return (st.st_dev, st.st_ino, st.st_size,
+            getattr(st, "st_mtime_ns", int(st.st_mtime * 1_000_000_000)),
+            getattr(st, "st_ctime_ns", int(st.st_ctime * 1_000_000_000)))
 
 
 def _is_under(path: Path, dirs: Tuple[Path, ...]) -> bool:
@@ -769,7 +777,7 @@ class Scanner:
 
         try:
             sha256, md5, partial, pattern_hits, entropy, content = \
-                self._stream_file(path, size)
+                self._stream_file(path, size, expected_stat=st)
         except OSError as exc:
             result.errors.append(f"{path}: {exc}")
             return
@@ -1326,8 +1334,9 @@ class Scanner:
                                     inner[: cfg.archive_entry_max]))
         return out
 
-    def _stream_file(self, path: Path, size: int):
-        """Read the file **once**, computing everything in one pass.
+    def _stream_file(self, path: Path, size: int,
+                     expected_stat: Optional[os.stat_result] = None):
+        """Read one stable regular-file snapshot in a single streaming pass.
 
         Returns ``(sha256, md5, partial, pattern_hits, entropy_or_None,
         content_or_None)`` – *content* is kept in memory only for files up
@@ -1347,29 +1356,46 @@ class Scanner:
         overlap = self._overlap
         content = b""
         read = 0
-        with open(path, "rb") as fh:
-            while read < size:
-                chunk = fh.read(cfg.hash_chunk_size)
-                if not chunk:
-                    break
-                read += len(chunk)
-                sha.update(chunk)
-                md5.update(chunk)
-                if buffer_content:
-                    content += chunk
-                if remaining:
-                    buf = tail + chunk
-                    matched = self._match_patterns(buf)
-                    if matched:
-                        for sig in matched:
-                            if sig not in hits:
-                                hits.append(sig)
-                        remaining = [pr for pr in remaining if pr[0] not in hits]
-                    tail = buf[-overlap:] if remaining else b""
-                if counts is not None and sampled < cfg.entropy_sample_size:
-                    take = chunk[: cfg.entropy_sample_size - sampled]
-                    counts.update(take)
-                    sampled += len(take)
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+        # O_NOFOLLOW closes the lstat/open symlink-swap window where supported.
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(path, flags)
+        try:
+            with os.fdopen(fd, "rb") as fh:
+                fd = -1  # fdopen owns it from here
+                before = os.fstat(fh.fileno())
+                if not stat.S_ISREG(before.st_mode):
+                    raise OSError(errno.EINVAL, "not a regular file", str(path))
+                if expected_stat is not None and _snapshot_key(before) != _snapshot_key(expected_stat):
+                    raise OSError(errno.EBUSY, "file changed before scanning", str(path))
+                while read < size:
+                    chunk = fh.read(cfg.hash_chunk_size)
+                    if not chunk:
+                        break
+                    read += len(chunk)
+                    sha.update(chunk)
+                    md5.update(chunk)
+                    if buffer_content:
+                        content += chunk
+                    if remaining:
+                        buf = tail + chunk
+                        matched = self._match_patterns(buf)
+                        if matched:
+                            for sig in matched:
+                                if sig not in hits:
+                                    hits.append(sig)
+                            remaining = [pr for pr in remaining if pr[0] not in hits]
+                        tail = buf[-overlap:] if remaining else b""
+                    if counts is not None and sampled < cfg.entropy_sample_size:
+                        take = chunk[: cfg.entropy_sample_size - sampled]
+                        counts.update(take)
+                        sampled += len(take)
+                after = os.fstat(fh.fileno())
+                if _snapshot_key(before) != _snapshot_key(after) or read != size:
+                    raise OSError(errno.EBUSY, "file changed during scanning", str(path))
+        finally:
+            if fd >= 0:
+                os.close(fd)
         entropy = None
         if counts is not None and sampled >= _MIN_ENTROPY_SAMPLE:
             entropy = shannon_entropy_counts(counts, sampled)

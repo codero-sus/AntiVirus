@@ -484,7 +484,7 @@ CHECKS: Tuple[Indicator, ...] = (
     _i("IND-LATERAL-ADMIN-SHARE", "Admin share access",
        "lateral", "high",
        "Accesses C$/ADMIN$/IPC$ (remote copy or execution).",
-       r"\\\\[^\s\"'<>|]{1,80}\\?(?:c|admin|ipc)\$"),
+     '\\\\[A-Za-z0-9][A-Za-z0-9._-]{0,60}\\\\(?:c|admin|ipc)\\$'),
     _i("IND-LATERAL-PSEXEC", "PsExec-style remote execution",
        "lateral", "medium",
        "PsExec or its service (PSEXESVC) – remote command execution.",
@@ -1656,7 +1656,7 @@ _BATCH_4: Tuple[Indicator, ...] = (
        "lateral", "high",
        "UNC path into an administrative share (C$, ADMIN$, IPC$) — copying "
        "to or executing from another host.",
-       r"\\\\[A-Za-z0-9._-]{2,60}\\(?:[A-Za-z]\$|ADMIN\$|IPC\$)",
+     '\\\\[A-Za-z0-9][A-Za-z0-9._-]{2,59}\\\\(?:ADMIN\\$|IPC\\$|NETLOGON\\$|SYSVOL\\$?)|\\\\[A-Za-z0-9][A-Za-z0-9._-]{2,59}\\\\[A-Za-z]\\$(?:[\\\\\\s"\'<>|]|$)',
        tags=("smb", "lateral")),
     _i("IND-LATERAL-WINRS", "WinRS remote shell",
        "lateral", "high",

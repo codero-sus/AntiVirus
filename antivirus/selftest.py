@@ -811,6 +811,16 @@ def run_selftest(signatures_file: Optional[str] = None) -> int:
                 fname, text.encode(), filename=fname) if f.name != row[1]}
             if others:
                 coverage_failures.append((row[0], sorted(others)[:2]))
+        import time as _time
+
+        _blob = b"#!/bin/sh\n" + b"a" * (4 * 1024 * 1024)
+        _t0 = _time.monotonic()
+        ind_mod.analyze("big.sh", _blob, filename="big.sh")
+        _elapsed = _time.monotonic() - _t0
+        check("techniques: 4 MB uniform file scanned before a timeout "
+              "(no runaway pattern)",
+              _elapsed < 10.0, f"{_elapsed:.2f}s")
+
         check("techniques: every new check adds coverage, none restates",
               not coverage_failures,
               f"{len(tech_mod.ROWS)} rows, duplicates: {coverage_failures[:3]}")

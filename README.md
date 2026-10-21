@@ -18,11 +18,11 @@ watches folders for new/changed files, and writes JSON + text reports.
      (catches renamed/wrapped variants)
 - **Public threat-intel database** (`feeds`) — millions of indicators from
   vetted public sources (blocklists, hash sets, rule strings), converted into
-  compact, tiered local indexes: ~39 MB on disk for 4.8 M indicators, matched
+  compact, tiered local indexes: ~39 MB on disk for 5.0 M indicators, matched
   by binary search. Licence-aware, provenance-tracked, guarded against the
   false positives aggregated feeds are full of, and built by you rather than
   shipped — see [Public threat-intel feeds](#public-threat-intel-feeds).
-- **Technique indicators** (`indicators`) — 603 static checks for how a file
+- **Technique indicators** (`indicators`) — 652 static checks for how a file
   behaves, independent of any specific malware: LOLBins, persistence,
   defence evasion, credential access, C2, ransomware impact, Office macros
   and file-name tricks. `antivirus indicators --category evasion` lists them,
@@ -32,7 +32,8 @@ watches folders for new/changed files, and writes JSON + text reports.
   measures the whole indicator library against random data and realistic
   clean files so a bad check cannot ship unnoticed.
 - **Portable rules** — `antivirus yara --out rules.yar` exports the same
-  detection content as a YARA ruleset (532 rules, verified with
+  detection content as a YARA ruleset (879 rules with the feed database, 650
+  without, verified with
   `yara-python`), for the tooling that speaks nothing else.
 - **Behavioural detection** (static — nothing is ever executed):
   * *Python* — AST analysis: `eval`/`exec` on non-constant input,
@@ -999,7 +1000,7 @@ from them on your machine** instead of pretending to ship one.
 
 ```bash
 python3 -m antivirus feeds list          # 23 vetted sources + licences
-python3 -m antivirus feeds build         # ~49 s → 4.8 M indicators, 39 MB
+python3 -m antivirus feeds build         # ~55 s → 5.0 M indicators, 39 MB
 python3 -m antivirus feeds build --all   # include runtime-only licences
 python3 -m antivirus feeds stats         # what is in the database
 python3 -m antivirus feeds audit         # provenance + licence report
@@ -1008,8 +1009,8 @@ python3 -m antivirus scan .              # the feeds layer now contributes
 python3 -m antivirus feeds clear         # remove the database
 ```
 
-Measured on a full build (2026-10-15): **4,826,602 indicators** from
-**23 sources** in **49 seconds**, stored as **~39 MB** of sorted index files
+Measured on a full build (2026-10-16): **5,009,797 indicators** from
+**23 sources** in **55 seconds**, stored as **~39 MB** of sorted index files
 in `data/feeds/` (git-ignored — generated data is never committed). A scan
 that uses it costs about **+0.5 s** on a full repository scan.
 
@@ -1164,13 +1165,13 @@ python3 -m antivirus matrix          # checks per tactic, severity mix, top tags
 python3 -m antivirus matrix --tag lolbin
 ```
 
-603 checks across 8 tactics; the table is generated from the library, and the
+652 checks across 8 tactics; the table is generated from the library, and the
 self test asserts that **no check is unmapped** to a tactic.
 
 ### YARA export (`antivirus yara`)
 
 ```bash
-python3 -m antivirus yara --out av-rules.yar          # 532 rules
+python3 -m antivirus yara --out av-rules.yar          # 879 rules
 python3 -m antivirus yara --min-severity high --no-feeds
 python3 -m antivirus yara --out r.yar --verify         # needs yara-python
 ```
@@ -1202,6 +1203,51 @@ EICAR string, and does not match random data.
   described above.
 * **Tests**: 350 unit tests (was 293) plus 84 self-test checks, covering the
   new parsers, the allowlist, YARA conversion and the FP harness.
+
+## What's new in v3.8
+
+* **Race-resistant file reads**: scanning now opens files without following
+  symlinks where the OS supports it, checks that the opened descriptor is the
+  same regular file observed during directory traversal, and verifies its
+  device/inode/size/timestamps stayed stable throughout the streaming pass.
+  Replaced, truncated, or concurrently modified files are reported as scan
+  errors rather than receiving a potentially misleading verdict. Regression
+  tests cover stable reads and replacement between traversal and open. The
+  full suite passes: 360 unit tests; self-test 87/87; FP audit clean.
+
+## What's new in v3.7
+
+* **49 further checks** (603 → **652**) from three candidate batches
+  (23 + 29 + 25 rows); the duplicate rule then deleted 31 of them, because a
+  shipped check or a sibling row already fired on their trigger sample.
+* New coverage: Windows and Linux persistence (`netsh interface portproxy`,
+  PAM `pam_exec.so`, `AuthorizedKeysCommand`, `LoadModule` from a staged
+  path, `modules-load.d`, macOS `/etc/periodic`, `Browser Helper Objects`,
+  GPO `scripts.ini` startup entries, `kernel.core_pattern`, `ld.so.conf.d`,
+  `~/.config/autostart`), execution (`pcalua`, `certreq`, `csc.exe`,
+  ClickOnce `deploymentProvider`, `ieexec`), credential material
+  (`cmdkey /add`, UID-0 `/etc/passwd` entries, `~/.docker/config.json`,
+  `~/.git-credentials`, npm `_authToken`, `msDS-KeyCredentialLink`),
+  evasion (`UseLogonCredential`, `testsigning on`, `RunAsPPL`, accessibility
+  binary swap, `auditpol /clear`, `iptables -F`, `sysmon -u`), lateral
+  movement (`sc \\host create`, remote `reg add`, DCOM
+  `MMC20.Application`, RDP `tscon`, AD CS abuse, coercion),
+  C2/exfiltration (`python -m http.server` staging) and impact
+  (`chmod -R 000`, `openssl enc`, `gpg --encrypt`).
+* The two duplicate-coverage tests stay green for every row: no row
+  restates an existing check by id/name, and **nothing else in the library
+  fires on a row's sample** (`test_every_row_adds_coverage_over_the_rest_of_the_library`).
+* **A runaway-pattern guard**: an unbounded wildcard run
+  (`[^\n:]{2,}::0:0:`) re-scanned the same bytes from every offset and made
+  a multi-megabyte scan effectively hang.  The quantifier is bounded now
+  and both the unit suite and the self test scan a 4 MB file of one
+  repeated character and fail if it takes more than 10 s.
+* Library totals: **652 checks** (execution 163, persistence 151,
+  credential 103, evasion 93, exfil 42, lateral 38, impact 45, office 17),
+  358 unit tests, 87 self-test checks, 187-file FP audit clean, 32 MB of
+  random data with 0 findings, YARA export of 879 rules compiled and
+  matched against EICAR with yara-python 4.5.4 (0 matches on 16 MB of
+  random data).
 
 ## What's new in v3.6
 
@@ -1376,7 +1422,7 @@ EICAR string, and does not match random data.
 | `feeds build [--source ID]… [--all] [--limit N] [--max-patterns N] [--json]` | Fetch, convert and index public feeds into `data/feeds/` (default: licence-safe sources only) |
 | `feeds import-clamav FILE` | Import a local ClamAV database (`.hdb`/`.hsb`/`.ndb`/`.cvd`/`.cld`) |
 | `feeds stats` / `feeds audit` / `feeds verify` / `feeds clear` | Inspect / provenance + licence report / consistency check / delete the feed database |
-| `indicators [--category C] [--show ID] [--dump-samples DIR] [--json]` | List the 603 technique-indicator checks (`--show` prints the check's trigger sample) |
+| `indicators [--category C] [--show ID] [--dump-samples DIR] [--json]` | List the 652 technique-indicator checks (`--show` prints the check's trigger sample) |
 | `matrix [--tag TAG] [--json]` | ATT&CK coverage view: checks per tactic, severity mix, top tags |
 | `allowlist list\|add\|remove\|clear\|check\|export\|import\|from-findings\|audit` | False-positive allowlist (hashes, names, paths, domains), audited and counted |
 | `fpcheck [--blobs N] [--size KiB] [--min-severity S] [--json]` | False-positive audit: random blobs + realistic clean corpus; exits non-zero on a hit |

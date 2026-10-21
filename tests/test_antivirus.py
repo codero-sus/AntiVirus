@@ -64,6 +64,24 @@ class ScannerTests(unittest.TestCase):
         self.addCleanup(lambda: shutil.rmtree(path, ignore_errors=True))
         self.app = App(path)
 
+    def test_stream_scan_rejects_file_replaced_after_walk(self):
+        path = self.app.config.quarantine_dir.parent / "snapshot.bin"
+        path.write_bytes(b"first version")
+        expected = path.lstat()
+        path.write_bytes(b"replacement is longer")
+        with self.assertRaises(OSError):
+            self.app.scanner._stream_file(path, expected.st_size,
+                                          expected_stat=expected)
+
+    def test_stream_scan_reads_stable_regular_file(self):
+        path = self.app.config.quarantine_dir.parent / "stable.bin"
+        path.write_bytes(b"stable file contents")
+        expected = path.lstat()
+        digest, _, partial, _, _, _ = self.app.scanner._stream_file(
+            path, expected.st_size, expected_stat=expected)
+        self.assertEqual(digest, hashlib.sha256(path.read_bytes()).hexdigest())
+        self.assertFalse(partial)
+
     def test_detects_eicar_by_hash(self):
         f = self.app.config.quarantine_dir.parent / "eicar.txt"
         f.write_bytes(EICAR)

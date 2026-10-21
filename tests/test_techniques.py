@@ -63,6 +63,23 @@ class TechniqueRowTests(unittest.TestCase):
                 self.assertIsNotNone(compiled.search(text),
                                      f"{check_id}: sample does not match")
 
+    def test_library_scans_a_large_uniform_file_quickly(self):
+        """An unbounded wildcard run makes the whole library quadratic.
+
+        A pattern such as ``[^\\n:]{2,}::0:0:`` re-scans the same run of bytes
+        from every starting offset, so a multi-megabyte file of one character
+        is the cheapest way to catch it before it reaches a scan of a real
+        binary.  The bounds below are deliberately loose (the 8 MB scan takes
+        seconds, not minutes) so the check only fires on a real regression.
+        """
+        import time
+
+        blob = b"#!/bin/sh\n" + b"a" * (4 * 1024 * 1024)
+        started = time.monotonic()
+        indicators.analyze("big.sh", blob, filename="big.sh")
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 10.0, f"4 MB uniform file took {elapsed:.1f}s")
+
     def test_every_row_fires_on_its_own_sample(self):
         for row in techniques.ROWS:
             check_id, name = row[0], row[1]
