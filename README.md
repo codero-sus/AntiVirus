@@ -22,7 +22,7 @@ watches folders for new/changed files, and writes JSON + text reports.
   by binary search. Licence-aware, provenance-tracked, guarded against the
   false positives aggregated feeds are full of, and built by you rather than
   shipped — see [Public threat-intel feeds](#public-threat-intel-feeds).
-- **Technique indicators** (`indicators`) — 652 static checks for how a file
+- **Technique indicators** (`indicators`) — 796 static checks for how a file
   behaves, independent of any specific malware: LOLBins, persistence,
   defence evasion, credential access, C2, ransomware impact, Office macros
   and file-name tricks. `antivirus indicators --category evasion` lists them,
@@ -1165,7 +1165,7 @@ python3 -m antivirus matrix          # checks per tactic, severity mix, top tags
 python3 -m antivirus matrix --tag lolbin
 ```
 
-652 checks across 8 tactics; the table is generated from the library, and the
+796 checks across 8 tactics; the table is generated from the library, and the
 self test asserts that **no check is unmapped** to a tactic.
 
 ### YARA export (`antivirus yara`)
@@ -1203,6 +1203,24 @@ EICAR string, and does not match random data.
   described above.
 * **Tests**: 350 unit tests (was 293) plus 84 self-test checks, covering the
   new parsers, the allowlist, YARA conversion and the FP harness.
+
+## What's new in v3.9
+
+* **A much larger static behavior library: 796 checks across 8 tactics**
+  (up from 652), including 144 new, individually sample-tested checks. Every
+  candidate was checked against the existing and sibling library; rows that
+  failed to fire on their sample or added duplicate coverage were discarded.
+* New coverage spans Windows native process injection and persistence
+  (WNF, RunOnceEx, LSA packages, Winlogon, network providers), Linux
+  namespaces/eBPF/systemd/NSS/PAM, macOS launchd and privacy controls,
+  Kubernetes and cloud control-plane abuse, credential stores and metadata
+  tokens, remote administration, staged uploads, disk/recovery destruction,
+  and Office/XLL/VBA execution.
+* Current tactic totals: execution 208, persistence 180, credential 115,
+  evasion 110, impact 56, exfiltration 55, lateral movement 48, and Office 24.
+  This is static analysis only: samples are inert, no payload is run, and
+  checks are behavior indicators rather than claims of universal malware
+  detection.
 
 ## What's new in v3.8
 
@@ -1422,7 +1440,7 @@ EICAR string, and does not match random data.
 | `feeds build [--source ID]… [--all] [--limit N] [--max-patterns N] [--json]` | Fetch, convert and index public feeds into `data/feeds/` (default: licence-safe sources only) |
 | `feeds import-clamav FILE` | Import a local ClamAV database (`.hdb`/`.hsb`/`.ndb`/`.cvd`/`.cld`) |
 | `feeds stats` / `feeds audit` / `feeds verify` / `feeds clear` | Inspect / provenance + licence report / consistency check / delete the feed database |
-| `indicators [--category C] [--show ID] [--dump-samples DIR] [--json]` | List the 652 technique-indicator checks (`--show` prints the check's trigger sample) |
+| `indicators [--category C] [--show ID] [--dump-samples DIR] [--json]` | List the 796 technique-indicator checks (`--show` prints the check's trigger sample) |
 | `matrix [--tag TAG] [--json]` | ATT&CK coverage view: checks per tactic, severity mix, top tags |
 | `allowlist list\|add\|remove\|clear\|check\|export\|import\|from-findings\|audit` | False-positive allowlist (hashes, names, paths, domains), audited and counted |
 | `fpcheck [--blobs N] [--size KiB] [--min-severity S] [--json]` | False-positive audit: random blobs + realistic clean corpus; exits non-zero on a hit |
